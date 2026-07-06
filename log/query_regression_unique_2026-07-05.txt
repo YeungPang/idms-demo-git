@@ -1,0 +1,170 @@
+﻿How much did the registration of Aphotonix GmbH cost?
+List documents related to registration of Aphotonix GmbH with titles and file names
+Um welche Tankstellen handelt es sich auf der Tankrechnung an Yeung Pang vom April?
+What companies do B. Pang hold shares?
+Wie lautet das Statutendatum im Handelsregisterauszug der Aphotonix GmbH?
+What is the total amount due on invoice 112479923 for APHOTONIX GmbH?
+Which document mentioned Benjamin Pang? Please return the file name with the full path.
+Show me the document concerning Chung Yeung Pang
+who own Aphtonix GmbH
+Show me the documents concerning Chung Yeung Pang.
+Show me the note concerning Chung Yeung Pang
+What companies does B. Pang hold shares?
+What is the Statute date in the Handelsregisterauszug of Aphotonix GmbH?
+Was ist der EORI-Nr. von Aphotonix GmbH?
+who are the shareholders of Aphtonix GmbH
+Who own Seveco AG?
+Was ist der email fÃ¼r Kontakt fÃ¼r EORI-Ansprechpartner von Aphotonix GmbH?
+What companies does Chung Yeung Pang hold shares?
+shareholders of Aphtonix GmbH
+Show me all the themes of documents containing Chung Yeung Pang.
+Show me the address of Chung Yeung Pang
+Show me the full information of Chung Yeung Pang
+Show me the full personal information of Chung Yeung Pang
+Show me the full profile of Chung Yeung Pang
+Show me the node for the profile of Chung Yeung Pang
+Show me the note titles and file names of all documents that have description of Chung Yeung Pang
+Werr ist der EORI-Ansprechpartner von Aphotonix GmbH?
+What are the name and email address of the contact person for the EORI registration from Aphotonix GmbH?
+What companies do Benjamin Kin Sing Pang hold shares?
+What companies do Chung Yeung Pang hold shares?
+What companies does B. Pang hold shares in?
+What companies does Mr. Pang hold shares?
+What day was Aphotonix GmbH registered?
+What is the address of Seveco AG?
+What is the total amount of travelling expenses of Seveco from April to May
+What is the total capital of Aphotonix GmbH?
+When was Aphotonix GmbH found?
+When was Aphotonix GmbH registered?
+Who are the shareholders of Aphotonix GmbH and how many shares each one holds?
+who own Aphotonix GmbH
+Wie lauten der Name und die E-Mail-Adresse des Kontakt fÃ¼r EORI-Ansprechpartner von Aphotonix GmbH?
+Wie lautet die Adresse der Aphotonix GmbH?
+How much did the registration of Aphotonix GmbH cost ?
+What is the exact registered address of Seveco AG?
+In the Budget for Inaugural Forum, what was the Total expenditure of Catering?
+Show me the note cocerning Chung Yeung Pang
+Show me the note concerning Chung Yeung Pang please
+Show me the note concerning Chung Yeung Pang?
+Show me the note related to Chung Yeung Pang
+Was ist der EORI-Nr. von Aphotonix GmbH please
+Was ist der EORI-Nr. von Apotonix GmbH?
+Was ist der EORI-Nr. zu Aphotonix GmbH?
+What amount is listed as Total Amount Due for invoice 112479923?
+What companies do B. Pang hold shares ?
+What companies do KÃ¤thi Pang associated with?
+What companies does B. Pang hold shares please
+What copanies does B. Pang hold shares?
+What is the plain address of Seveco AG?
+What is the Statute date in the Handelsregisterauszug of Aphotonix GmbH please
+What is the Sttute date in the Handelsregisterauszug of Aphotonix GmbH?
+Which document mentioned Benjamin Pang? Please return the file name including the full path.
+Which document mentioned Benjamin Pang? Please return the file name with the full path please
+Which document mentioned Benjamin Pang? Please return the file name with the full path?
+Which doument mentioned Benjamin Pang? Please return the file name with the full path.
+How much did the registration of Aphotonix GmbH totally cost?
+How much was the registration cost for Aphotonix GmbH?
+There are so many duplicates in object_relationship table. For example, objects 14 to 13 have relationships shareholder_and_president, shareholder, president_of, and shareholder_of. Basically shareholder and shareholder_of are the same and shareholder_and_president should be considered as two relationships which are also in the table.  In inserting entries to the object_relationship table, we can always string _of. We should also check for duplicates since same relationship can often appear in m...[truncated]
+Um welche Tankstellen handelt es sich auf der Tankrechnung an Yeung Pang im April 2026?
+What is the exact full registered address of Seveco AG?
+What is the exact registration number of AG?
+What is the total amount including VAT of travelling expenses of Seveco AG from April to May
+What is the total amount of travelling expenses of Seveco AG from April to May
+Who are the shareholders of APHOTONIX GmbH?
+Do we still do a lot of embedding calls for each query or including the cache, a lot of them are eliminated? How many embedding calls in average for a query now?
+Do we still do a lot of embedding calls for each query or with the cache, a lot of them are eliminated? How many embedding calls in average for a query now please
+Do we still do a lot of emedding calls for each query or with the cache, a lot of them are eliminated? How many embedding calls in average for a query now?
+Find documents related to registration of Aphotonix GmbH and tell me the amount.
+How many documents are related to travelling expenses of Seveco AG?
+How much was the registration cost for Aphotonix GmbH in related documents?
+I came across the following error: Error: duplicate key value violates unique constraint "uq_document_doc_path_nonnull" DETAIL: Key (doc_path)=(gs://idms-prot-bucket-aphotonix/ingest/20260608_192457_idms-upload-f4ifhajc.pdf) already exists please
+I came across the following error: Error: duplicate key value violates unique constraint "uq_document_doc_path_nonnull" DETAIL: Key (doc_path)=(gs://idms-prot-bucket-aphotonix/ingest/20260608_192457_idms-upload-f4ifhajc.pdf) already exists.
+I came across the following error: Error: duplicate key value violates unique constraint "uq_document_doc_path_nonnull" DETAIL: Key (doc_path)=(gs://idms-prot-bucket-aphotonix/ingest/20260608_192457_idms-upload-f4ifhajc.pdf) already exists?
+I came across the folowing error: Error: duplicate key value violates unique constraint "uq_document_doc_path_nonnull" DETAIL: Key (doc_path)=(gs://idms-prot-bucket-aphotonix/ingest/20260608_192457_idms-upload-f4ifhajc.pdf) already exists.
+I run into error 429 again. Are our falback with openrouter not working?
+I run into error 429 again. Are our fallback including openrouter not working?
+I run into error 429 again. Are our fallback with openrouter not working please
+I run into error 429 again. Are our fallback with openrouter not working?
+In the Budget for Inaugural Forum, what was the Balance of Funds?
+In the Budget for Inaugural Forum, what was the budget for Mobile App-Maintenance in April 2023?
+In the Budget for Inaugural Forum, what was the budget for Mobile App-Maintenance in July 2023?
+In the Budget for Inaugural Forum, what was the Total expenditure of Transportation?
+Query "What day was Aphotonix GmbH registered?" could not return the day of registration which should be in the Handelstregisterauszug
+Query "What day was Aphotonix GmbH registered?" could not return the day of registration which should be in the Handelstregisterauszug please
+Query "What day was Aphotonix GmbH registered?" could not return the day of registration which should be in the Handelstregisterauszug?
+Query "What day was Apotonix GmbH registered?" could not return the day of registration which should be in the Handelstregisterauszug
+Show me the documents concerning Chung Yeung Pang
+Show me the file that laser system is mentioned.
+Um welche Tankstellen handelt es sich auf der Tankrechnung an Seveco vom April?
+Was it trying to insert a new document? It should not
+Was it trying to insert a new document? It should not please
+Was it trying to insert a new document? It should not?
+We should not just tie to the keword address. It must work for any attribute name and some of them unforeseen. Are the entities not extracted by spacy in which case the please should not appear as part of the entity. Somehow there is still problem in entity extraction.
+We should not just tie to the keyword address. It must work for any attribute name and some of them unforeseen. Are the entities not extracted by spacy in which case the please should not appear as part of the entity. Somehow there is still problem in entity extraction please
+We should not just tie to the keyword address. It must work for any attribute name and some of them unforeseen. Are the entities not extracted by spacy in which case the please should not appear as part of the entity. Somehow there is still problem in entity extraction?
+Welche Art von Benzin hat Yeung Pang im April getankt?
+What are the name and email address of the customs contact person for Seeded Alpine Client a5cb126e GmbH?
+What are the name and email address of the customs contact person for Seeded Alpine Client ce814aa7 GmbH?
+What are the name and email address of the VAT contact person for Seeded VAT Client 1a200423 GmbH?
+What are the name and email address of the VAT contact person for Seeded VAT Client 60ea414b GmbH?
+What companies do Benjamin Pang associated with?
+What companies do C.Y. Pang associated with?
+What companies do Chung Yeung Pang associated with?
+What company is responsible for the customs application for Seeded Alpine Client 073bf698 GmbH?
+What company is responsible for the customs application for Seeded Alpine Client 20e8c0a3 GmbH?
+What company is responsible for the customs application for Seeded Alpine Client 5568dd14 GmbH?
+What company is responsible for the customs application for Seeded Alpine Client a5cb126e GmbH?
+What company is responsible for the customs application for Seeded Alpine Client a89a0d08 GmbH?
+What company is responsible for the customs application for Seeded Alpine Client ce814aa7 GmbH?
+What company is responsible for the customs application for Seeded Customs Client 1a200423 GmbH?
+What company is responsible for the customs application for Seeded Customs Client 2a81de76 GmbH?
+What company is responsible for the customs application for Seeded Customs Client 60ea414b GmbH?
+What is the address of Chung Yeung Pang?
+What is the amount due in documents related to Aphotonix GmbH registration?
+What is the current (last) full address of Seveco AG?
+What is the current address of Seveco AG?
+What is the eori no of Aphotonix GmbH?
+What is the EORI number of Aphotonix GmbH?
+What is the exact registration date of Seveco AG in Zug?
+What is the exact registration date of Seveco AG?
+What is the registration cost for Aphotonix GmbH based on related documents?
+What was the registration amount for Aphotonix GmbH?
+When I choose a file in the client, I got a full path "C:\fakepath\2025-09-25-aphotonix_registrater_invoice.jpg" including a fakepath instead of the real path.
+When I choose a file in the client, I got a full path "C:\fakepath\2025-09-25-aphotonix_registrater_invoice.jpg" with a faepath instead of the real path.
+When I choose a file in the client, I got a full path "C:\fakepath\2025-09-25-aphotonix_registrater_invoice.jpg" with a fakepath instead of the real path please
+When I choose a file in the client, I got a full path "C:\fakepath\2025-09-25-aphotonix_registrater_invoice.jpg" with a fakepath instead of the real path.
+When I choose a file in the client, I got a full path "C:\fakepath\2025-09-25-aphotonix_registrater_invoice.jpg" with a fakepath instead of the real path?
+Which company handled the VAT registration for Seeded VAT Client 1a200423 GmbH?
+Which company handled the VAT registration for Seeded VAT Client 60ea414b GmbH?
+Who own Aphotonix GmbH?
+Wie lauten der Name und die E-Mail-Adresse der Kontaktperson fÃ¼r EORI-Angelegenheiten bei der Aphotonix GmbH?
+Wie lautet die Adresse von Yeung Pang?
+Do we still do a lot of embedding calls for each query or with the cache, a lot of them are eliminated? How many embedding calls in average for a query now?
+How much did the registration of Aphotonix GmbH cost in total now?
+How much did the registration of Aphotonix GmbH cost in total?
+How much did the registration of Aphotonix GmbH cost now
+There are so many dulicates in object_relationship table. For example, objects 14 to 13 have relationships shareholder_and_president, shareholder, president_of, and shareholder_of. Basically shareholder and shareholder_of are the same and shareholder_and_president should be considered as two relationships which are also in the table.  In inserting entries to the object_relationship table, we can always string _of. We should also check for duplicates since same relationship can often appear in mu...[truncated]
+There are so many dulicates in object_relationship table. For example, objects 14 to 13 have relationships shareholder_and_president, shareholder, president_of, and shareholder_of. Basically shareholder and shareholder_of are the same and shareholder_and_president should be considered as two relationships which are also in the table.  In inserting entries to the object_relationship table, we can always string _of. We should also check for duplicates since same relationship can often appear in multiple files and notes. Sometimes the wording may not be the same and thus we need to make sure that no two entries of relationships with the same semantics. Can we manage that?
+There are so many duplicates in object_relationship table. For example, objects 14 to 13 have relationships shareholder_and_president, shareholder, president_of, and shareholder_of. Basically shareholder and shareholder_of are the same and shareholder_and_president should be considered as two relationships which are also in the table.  In inserting entries to the object_relationship table, we can always string _of. We should also check for duplicates since same relationship can often appear in multiple files and notes. Sometimes the wording may not be the same and thus we need to make sure that no two entries of relationships including the same semantics. Can we manage that?
+There are so many duplicates in object_relationship table. For example, objects 14 to 13 have relationships shareholder_and_president, shareholder, president_of, and shareholder_of. Basically shareholder and shareholder_of are the same and shareholder_and_president should be considered as two relationships which are also in the table.  In inserting entries to the object_relationship table, we can always string _of. We should also check for duplicates since same relationship can often appear in multiple files and notes. Sometimes the wording may not be the same and thus we need to make sure that no two entries of relationships with the same semantics. Can we manage that please
+There are so many duplicates in object_relationship table. For example, objects 14 to 13 have relationships shareholder_and_president, shareholder, president_of, and shareholder_of. Basically shareholder and shareholder_of are the same and shareholder_and_president should be considered as two relationships which are also in the table.  In inserting entries to the object_relationship table, we can always string _of. We should also check for duplicates since same relationship can often appear in multiple files and notes. Sometimes the wording may not be the same and thus we need to make sure that no two entries of relationships with the same semantics. Can we manage that?
+We should not just tie to the keyword address. It must work for any attribute name and some of them unforeseen. Are the entities not extracted by spacy in which case the please should not appear as part of the entity. Somehow there is still problem in entity extraction.
+What are the name and email address of the customs contact person for Seeded Alpine Client 073bf698 GmbH?
+What are the name and email address of the customs contact person for Seeded Alpine Client 20e8c0a3 GmbH?
+What are the name and email address of the customs contact person for Seeded Alpine Client 5568dd14 GmbH?
+What are the name and email address of the customs contact person for Seeded Alpine Client a89a0d08 GmbH?
+What are the name and email address of the customs contact person for Seeded Customs Client 1a200423 GmbH?
+What are the name and email address of the customs contact person for Seeded Customs Client 2a81de76 GmbH?
+What are the name and email address of the customs contact person for Seeded Customs Client 60ea414b GmbH?
+What is the address of Sirius AG?
+What is the exact address of Seveco AG?
+What is the exact due date of invoice from Seveco AG to Aromatex International AG?
+What is the exact full address of Seveco AG?
+What is the exact process contact person of Seveco AG for EORI?
+What is the exact publication organ of Seveco AG?
+What is the exact purpose of Seveco AG?
+What is the exact tr date of Seveco AG?
+What is the total amount of travelling expenses of Seveco AG including VAT from April to May
+Who appointed whom to vote in the general meeting of Sirius Group AG
+Who own Seveco AG
+Wie lauten der Name und die E-Mail-Adresse des Kontakt fÃ¼r EORI-Ansprechpartner von Aphotonix GmbH??

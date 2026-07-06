@@ -1,0 +1,411 @@
+{
+  "generated_at_utc": "20260705T184709Z",
+  "base_url": "http://127.0.0.1:8000",
+  "max_steps": 4,
+  "query_file": "C:\\Project\\WebTech\\python\\IDMS-Demo\\log\\query_regression_golden_40_2026-07-05.txt",
+  "total": 40,
+  "passed": 40,
+  "failed": 0,
+  "results": [
+    {
+      "index": 1,
+      "query": "﻿Show me all the themes of documents containing Chung Yeung Pang.",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 24632,
+      "answer_source": "criteria_docs_sql",
+      "answer": "[source: criteria_docs_sql] Here are the matching documents:\n- Kondakdaten.pdf (document; matched: Chung Yeung Pang)\n- aphotonix_registration_extract (document; matched: Chung Yeung Pang)\n- seveco_hr.pdf (document; matched: Chung Yeung Pang)\n- sirius_proxy.pdf (document; matched: Chung Yeung Pang)\n- 7466735_DEB073783 (document; matched: Chung Yeung Pang)\n- Rechnung_7457131_DEB073783.pdf (document; matched: Chung Yeung Pang)\n- rechnung_7479585_deb073783.pdf (document; matched: Chung Yeung Pang)",
+      "error": ""
+    },
+    {
+      "index": 2,
+      "query": "Show me the address of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 7522,
+      "answer_source": "sql_exact_composite",
+      "answer": "[source: sql_exact_composite] Chung Yeung Pang -> address: Alte Aescherstrasse 36, 5615 Fahrwangen.",
+      "error": ""
+    },
+    {
+      "index": 3,
+      "query": "Show me the full information of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 14238,
+      "answer_source": "sql_profile_composite",
+      "answer": "[source: sql_profile_composite] Chung Yeung Pang -> birth place: Mönchaltorf; address: Alte Aescherstrasse 36, 5615 Fahrwangen; email: chung.yeung.pang@gmail.com; phone: 076 399 20 19; legal name: Pang, Chung Yeung.",
+      "error": ""
+    },
+    {
+      "index": 4,
+      "query": "Show me the full personal information of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 18018,
+      "answer_source": "sql_profile_composite",
+      "answer": "[source: sql_profile_composite] Chung Yeung Pang -> birth place: Mönchaltorf; address: Alte Aescherstrasse 36, 5615 Fahrwangen; email: chung.yeung.pang@gmail.com; phone: 076 399 20 19; legal name: Pang, Chung Yeung.",
+      "error": ""
+    },
+    {
+      "index": 5,
+      "query": "Show me the full profile of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 12921,
+      "answer_source": "sql_profile_composite",
+      "answer": "[source: sql_profile_composite] Chung Yeung Pang -> birth place: Mönchaltorf; address: Alte Aescherstrasse 36, 5615 Fahrwangen; email: chung.yeung.pang@gmail.com; phone: 076 399 20 19; legal name: Pang, Chung Yeung.",
+      "error": ""
+    },
+    {
+      "index": 6,
+      "query": "Show me the node for the profile of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 24184,
+      "answer_source": "table_cell_grounded",
+      "answer": "[source: table_cell_grounded] I accept the minutes of the previous annual general meeting in I will follow the recommendations of the board of directors: 000 (document: sirius_proxy.pdf).",
+      "error": ""
+    },
+    {
+      "index": 7,
+      "query": "Was ist der EORI-Nr. von Apotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 20300,
+      "answer_source": "qdrant",
+      "answer": "[source: qdrant] The EORI number of Apotonix GmbH is DE892284377081981. This information was retrieved from the document \"German-EORI.pdf\".",
+      "error": ""
+    },
+    {
+      "index": 8,
+      "query": "Query \"What day was Apotonix GmbH registered?\" could not return the day of registration which should be in the Handelstregisterauszug",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 2278,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] trade register date for Zug is 23.09.2025.",
+      "error": ""
+    },
+    {
+      "index": 9,
+      "query": "List documents related to registration of Aphotonix GmbH with titles and file names",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 17133,
+      "answer_source": "criteria_docs_sql",
+      "answer": "[source: criteria_docs_sql] Here are the matching documents:\n- 2025-09-25-aphotonix_registrater_invoice.jpg (file: 2025-09-25-aphotonix_registrater_invoice.jpg; path: 2025-09-25-aphotonix_registrater_invoice.jpg)\n- German-EORI.pdf (file: German-EORI.pdf; path: German-EORI.pdf)\n- Kondakdaten.pdf (file: Kondakdaten.pdf; path: Kondakdaten.pdf)\n- aphotonix_registration_extract (file: aphotonix_registration_extract; path: Aphotonix_registration.pdf)",
+      "error": ""
+    },
+    {
+      "index": 10,
+      "query": "Which document mentioned Benjamin Pang? Please return the file name with the full path.",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 9140,
+      "answer_source": "sql_exact_composite",
+      "answer": "[source: sql_exact_composite] Benjamin Pang -> filename with full path: {'file_name': 'Aphotonix_registration.pdf', 'full_path': 'C:\\\\Project\\\\WebTech\\\\python\\\\IDMS-Demo\\\\generated\\\\markdown\\\\Aphotonix_registration.md'}; file name: Aphotonix_registration.pdf; full path: C:\\Project\\WebTech\\python\\IDMS-Demo\\generated\\markdown\\Aphotonix_registration.md.",
+      "error": ""
+    },
+    {
+      "index": 11,
+      "query": "Show me the document concerning Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 15385,
+      "answer_source": "criteria_docs_sql",
+      "answer": "[source: criteria_docs_sql] Here are the matching documents:\n- Kondakdaten.pdf (document; matched: Chung Yeung Pang)\n- aphotonix_registration_extract (document; matched: Chung Yeung Pang)\n- seveco_hr.pdf (document; matched: Chung Yeung Pang)\n- sirius_proxy.pdf (document; matched: Chung Yeung Pang)\n- 7466735_DEB073783 (document; matched: Chung Yeung Pang)\n- Rechnung_7457131_DEB073783.pdf (document; matched: Chung Yeung Pang)\n- rechnung_7479585_deb073783.pdf (document; matched: Chung Yeung Pang)",
+      "error": ""
+    },
+    {
+      "index": 12,
+      "query": "Show me the documents concerning Chung Yeung Pang.",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 14846,
+      "answer_source": "criteria_docs_sql",
+      "answer": "[source: criteria_docs_sql] Here are the matching documents:\n- Kondakdaten.pdf (document; matched: Chung Yeung Pang)\n- aphotonix_registration_extract (document; matched: Chung Yeung Pang)\n- seveco_hr.pdf (document; matched: Chung Yeung Pang)\n- sirius_proxy.pdf (document; matched: Chung Yeung Pang)\n- 7466735_DEB073783 (document; matched: Chung Yeung Pang)\n- Rechnung_7457131_DEB073783.pdf (document; matched: Chung Yeung Pang)\n- rechnung_7479585_deb073783.pdf (document; matched: Chung Yeung Pang)",
+      "error": ""
+    },
+    {
+      "index": 13,
+      "query": "Show me the note concerning Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 15729,
+      "answer_source": "criteria_semantic_qdrant",
+      "answer": "[source: criteria_semantic_qdrant] Here are the matching notes:\n- Chung Yeung Pang (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Käthi Johanna Pang Gerber (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- APhotonix GmbH (company; file: Kondakdaten.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Annual General Meeting (meeting; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Jannik Pfister (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Sirius Group AG (organization; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Benjamin Kin Sing Pang (person; file: Aphotonix_registration.pdf; matched: chung, pang, yeung)\n- Abacor Revisionsgeseilschaft (company; file: seveco_hr.pdf; matched: chung, pang, yeung)",
+      "error": ""
+    },
+    {
+      "index": 14,
+      "query": "Show me the note titles and file names of all documents that have description of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 18368,
+      "answer_source": "criteria_docs_sql",
+      "answer": "[source: criteria_docs_sql] Here are the matching notes:\n- Kondakdaten.pdf (file: Kondakdaten.pdf; path: Kondakdaten.pdf)\n- aphotonix_registration_extract (file: aphotonix_registration_extract; path: Aphotonix_registration.pdf)\n- seveco_hr.pdf (file: seveco_hr.pdf; path: seveco_hr.pdf)\n- sirius_proxy.pdf (file: sirius_proxy.pdf; path: sirius_proxy.pdf)\n- 7466735_DEB073783 (file: 7466735_DEB073783; path: Rechnung_7466735_DEB073783.pdf)\n- Rechnung_7457131_DEB073783.pdf (file: Rechnung_7457131_DEB073783.pdf; path: Rechnung_7457131_DEB073783.pdf)\n- rechnung_7479585_deb073783.pdf (file: rechnung_7479585_deb073783.pdf; path: Rechnung_7479585_DEB073783.pdf)",
+      "error": ""
+    },
+    {
+      "index": 15,
+      "query": "Show me the note cocerning Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 24849,
+      "answer_source": "not_found",
+      "answer": "[source: not_found] I found the following notes concerning Chung Yeung Pang:\n\n*   **Note 1:** \"Chung Yeung Pang is a key contact for the upcoming project.\" (Matched on: Chung Yeung Pang)\n*   **Note 2:** \"Follow up with Chung Yeung Pang regarding the contract details.\" (Matched on: Chung Yeung Pang)\n\nThese results are from Qdrant-guided SQL.",
+      "error": ""
+    },
+    {
+      "index": 16,
+      "query": "Show me the note concerning Chung Yeung Pang please",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 15901,
+      "answer_source": "criteria_semantic_qdrant",
+      "answer": "[source: criteria_semantic_qdrant] Here are the matching notes:\n- Chung Yeung Pang (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Käthi Johanna Pang Gerber (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- APhotonix GmbH (company; file: Kondakdaten.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Annual General Meeting (meeting; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Jannik Pfister (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Sirius Group AG (organization; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Benjamin Kin Sing Pang (person; file: Aphotonix_registration.pdf; matched: chung, pang, yeung)\n- Abacor Revisionsgeseilschaft (company; file: seveco_hr.pdf; matched: chung, pang, yeung)",
+      "error": ""
+    },
+    {
+      "index": 17,
+      "query": "How much did the registration of Aphotonix GmbH cost?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 16553,
+      "answer_source": "criteria_contextual_llm",
+      "answer": "[source: criteria_contextual_llm] The total amount due is 706.20 CHF.",
+      "error": ""
+    },
+    {
+      "index": 18,
+      "query": "Um welche Tankstellen handelt es sich auf der Tankrechnung an Yeung Pang vom April?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 13434,
+      "answer_source": "markdown_table",
+      "answer": "[source: markdown_table] Auf der Tankrechnung an Yeung Pang sind folgende Tankstellen aufgeführt: TS Sarmenstorf.",
+      "error": ""
+    },
+    {
+      "index": 19,
+      "query": "What is the total amount due on invoice 112479923 for APHOTONIX GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 16244,
+      "answer_source": "criteria_contextual_llm",
+      "answer": "[source: criteria_contextual_llm] The total amount due on invoice 112479923 for APHOTONIX GmbH is CHF 706.20.",
+      "error": ""
+    },
+    {
+      "index": 20,
+      "query": "What is the total amount of travelling expenses of Seveco from April to May",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 9021,
+      "answer_source": "sql_aggregate",
+      "answer": "[source: sql_aggregate] Total travelling expenses for Seveco from 2026-04-01 to 2026-05-31 is 182.98 CHF.",
+      "error": ""
+    },
+    {
+      "index": 21,
+      "query": "What is the total capital of Aphotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 12425,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] Total capital for APhotonix GmbH is 20000.00 CHF.",
+      "error": ""
+    },
+    {
+      "index": 22,
+      "query": "How much did the registration of Aphotonix GmbH cost ?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 20783,
+      "answer_source": "criteria_contextual_llm",
+      "answer": "[source: criteria_contextual_llm] The total amount due is 706.20 CHF.",
+      "error": ""
+    },
+    {
+      "index": 23,
+      "query": "In the Budget for Inaugural Forum, what was the Total expenditure of Catering?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 11199,
+      "answer_source": "table_cell_grounded",
+      "answer": "[source: table_cell_grounded] Catering in Expenditure Cumulative<br/>Total expenditure<br/>(as at 31/3/2023) ($): 1,737 (document: Paper 23-11 Annex C_Forum Account.pdf).",
+      "error": ""
+    },
+    {
+      "index": 24,
+      "query": "What amount is listed as Total Amount Due for invoice 112479923?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 19948,
+      "answer_source": "criteria_contextual_llm",
+      "answer": "[source: criteria_contextual_llm] The total amount due is 706.20 CHF.",
+      "error": ""
+    },
+    {
+      "index": 25,
+      "query": "Wie lautet das Statutendatum im Handelsregisterauszug der Aphotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 15196,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] statutendatum für APhotonix GmbH über in_commercial_register_excerpt von Aphotonix GmbH ist 2025-09-12.",
+      "error": ""
+    },
+    {
+      "index": 26,
+      "query": "What is the Statute date in the Handelsregisterauszug of Aphotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 25228,
+      "answer_source": "table_grounding_required",
+      "answer": "[source: table_grounding_required] I did not find a grounded table-cell match for this request and stopped fallback to avoid an ungrounded answer. Requested row='Statute date', column='the Handelsregisterauszug of Aphotonix GmbH'.",
+      "error": ""
+    },
+    {
+      "index": 27,
+      "query": "Was ist der EORI-Nr. von Aphotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 3455,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] eori no für APhotonix GmbH ist DE892284377081981.",
+      "error": ""
+    },
+    {
+      "index": 28,
+      "query": "Was ist der email fÃ¼r Kontakt fÃ¼r EORI-Ansprechpartner von Aphotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 6881,
+      "answer_source": "sql_exact_composite",
+      "answer": "[source: sql_exact_composite] APhotonix GmbH -> kontakt-email: services@ynoves.ch; eori-ansprechpartner: Daniel Trottmann; ansprechpartner: Daniel Trottmann.",
+      "error": ""
+    },
+    {
+      "index": 29,
+      "query": "Werr ist der EORI-Ansprechpartner von Aphotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 5760,
+      "answer_source": "sql_exact_composite",
+      "answer": "[source: sql_exact_composite] APhotonix GmbH -> ansprechpartner: Daniel Trottmann; eori-ansprechpartner: Daniel Trottmann.",
+      "error": ""
+    },
+    {
+      "index": 30,
+      "query": "What are the name and email address of the contact person for the EORI registration from Aphotonix GmbH?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 7082,
+      "answer_source": "sql_exact_composite",
+      "answer": "[source: sql_exact_composite] APhotonix GmbH -> contact email: services@ynoves.ch; contact person: Daniel Trottmann.",
+      "error": ""
+    },
+    {
+      "index": 31,
+      "query": "What day was Aphotonix GmbH registered?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 1587,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] trade register date for APhotonix GmbH is 2025-09-23.",
+      "error": ""
+    },
+    {
+      "index": 32,
+      "query": "When was Aphotonix GmbH found?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 17638,
+      "answer_source": "semantic_llm_fallback",
+      "answer": "[source: semantic_llm_fallback] founding date for Aphotonix GmbH is 2025-09-23.",
+      "error": ""
+    },
+    {
+      "index": 33,
+      "query": "What companies do B. Pang hold shares?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 17199,
+      "answer_source": "qdrant",
+      "answer": "[source: qdrant] B. Pang holds shares in Aphotonix GmbH.\n\n(Retrieval from Discovery)",
+      "error": ""
+    },
+    {
+      "index": 34,
+      "query": "who own Aphtonix GmbH",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 5327,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] Shareholders of APhotonix GmbH: Benjamin Kin Sing Pang (Gesellschafter und Geschäftsführer), Chung Yeung Pang (Gesellschafter und Vorsitzender der Geschäftsführung), Hung Mun Sun (Gesellschafter und Geschäftsführer).",
+      "error": ""
+    },
+    {
+      "index": 35,
+      "query": "What companies does B. Pang hold shares?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 20639,
+      "answer_source": "qdrant",
+      "answer": "[source: qdrant] B. Pang holds shares in APHOTONIX GmbH. This information was retrieved from Discovery.",
+      "error": ""
+    },
+    {
+      "index": 36,
+      "query": "who are the shareholders of Aphtonix GmbH",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 5914,
+      "answer_source": "sql_exact_composite",
+      "answer": "[source: sql_exact_composite] Shareholders of APhotonix GmbH: Benjamin Kin Sing Pang (Gesellschafter und Geschäftsführer), Chung Yeung Pang (Gesellschafter und Vorsitzender der Geschäftsführung), Hung Mun Sun (Gesellschafter und Geschäftsführer).",
+      "error": ""
+    },
+    {
+      "index": 37,
+      "query": "Who own Seveco AG?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 4585,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] No explicit ownership evidence found for Seveco AG. Governance roles found: Chung Yeung Pang (Mitglied, Einzelunterschrift), Käthi Johanna Pang Gerber (Direktorin, Einzelunterschrift).",
+      "error": ""
+    },
+    {
+      "index": 38,
+      "query": "What companies does Chung Yeung Pang hold shares?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 21956,
+      "answer_source": "qdrant",
+      "answer": "[source: qdrant] Chung Yeung Pang holds shares in the following companies:\n\n*   **Aphotonix GmbH** (from registration_extract)\n*   **Sirius Group AG** (from proxy_form)\n*   **Seveco AG** (from document)",
+      "error": ""
+    },
+    {
+      "index": 39,
+      "query": "shareholders of Aphtonix GmbH",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 13978,
+      "answer_source": "sql_exact",
+      "answer": "[source: sql_exact] Shareholders of APhotonix GmbH: Benjamin Kin Sing Pang, Chung Yeung Pang, Hung Mun Sun.",
+      "error": ""
+    },
+    {
+      "index": 40,
+      "query": "What companies do Benjamin Kin Sing Pang hold shares?",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 19775,
+      "answer_source": "qdrant",
+      "answer": "[source: qdrant] Benjamin Kin Sing Pang holds shares in APHOTONIX GmbH.\n\nThis information was retrieved from Discovery.",
+      "error": ""
+    }
+  ]
+}

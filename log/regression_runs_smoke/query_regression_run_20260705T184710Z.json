@@ -1,0 +1,61 @@
+{
+  "generated_at_utc": "20260705T184710Z",
+  "base_url": "http://127.0.0.1:8000",
+  "max_steps": 4,
+  "query_file": "C:\\Project\\WebTech\\python\\IDMS-Demo\\log\\query_regression_smoke5.txt",
+  "total": 5,
+  "passed": 5,
+  "failed": 0,
+  "results": [
+    {
+      "index": 1,
+      "query": "﻿Show me all the themes of documents containing Chung Yeung Pang.",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 22,
+      "answer_source": "criteria_docs_sql",
+      "answer": "[source: criteria_docs_sql] Here are the matching documents:\n- Kondakdaten.pdf (document; matched: Chung Yeung Pang)\n- aphotonix_registration_extract (document; matched: Chung Yeung Pang)\n- seveco_hr.pdf (document; matched: Chung Yeung Pang)\n- sirius_proxy.pdf (document; matched: Chung Yeung Pang)\n- 7466735_DEB073783 (document; matched: Chung Yeung Pang)\n- Rechnung_7457131_DEB073783.pdf (document; matched: Chung Yeung Pang)\n- rechnung_7479585_deb073783.pdf (document; matched: Chung Yeung Pang)",
+      "error": ""
+    },
+    {
+      "index": 2,
+      "query": "Show me the address of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 28,
+      "answer_source": "sql_exact_composite",
+      "answer": "[source: sql_exact_composite] Chung Yeung Pang -> address: Alte Aescherstrasse 36, 5615 Fahrwangen.",
+      "error": ""
+    },
+    {
+      "index": 3,
+      "query": "Show me the full information of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 14,
+      "answer_source": "sql_profile_composite",
+      "answer": "[source: sql_profile_composite] Chung Yeung Pang -> birth place: Mönchaltorf; address: Alte Aescherstrasse 36, 5615 Fahrwangen; email: chung.yeung.pang@gmail.com; phone: 076 399 20 19; legal name: Pang, Chung Yeung.",
+      "error": ""
+    },
+    {
+      "index": 4,
+      "query": "Show me the full personal information of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 2,
+      "answer_source": "sql_profile_composite",
+      "answer": "[source: sql_profile_composite] Chung Yeung Pang -> birth place: Mönchaltorf; address: Alte Aescherstrasse 36, 5615 Fahrwangen; email: chung.yeung.pang@gmail.com; phone: 076 399 20 19; legal name: Pang, Chung Yeung.",
+      "error": ""
+    },
+    {
+      "index": 5,
+      "query": "Show me the full profile of Chung Yeung Pang",
+      "ok": true,
+      "status_code": 200,
+      "duration_ms": 3,
+      "answer_source": "sql_profile_composite",
+      "answer": "[source: sql_profile_composite] Chung Yeung Pang -> birth place: Mönchaltorf; address: Alte Aescherstrasse 36, 5615 Fahrwangen; email: chung.yeung.pang@gmail.com; phone: 076 399 20 19; legal name: Pang, Chung Yeung.",
+      "error": ""
+    }
+  ]
+}

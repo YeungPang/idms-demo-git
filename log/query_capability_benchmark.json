@@ -1,0 +1,385 @@
+{
+  "generated_at": "2026-07-04T18:52:47.064926",
+  "totals": {
+    "seed_count": 5,
+    "variant_count": 20,
+    "success_count": 15,
+    "valid_answer_count": 15
+  },
+  "kpis": {
+    "availability": 0.75,
+    "avg_valid_answer_rate": 0.6933,
+    "avg_intent_stability": 1.0,
+    "robustness_score": 0.7927,
+    "projected_future_coverage": 0.5313,
+    "projected_coverage_ci95_lower": 0.5313,
+    "availability_ci95_lower": 0.5313
+  },
+  "by_bucket": {
+    "document_retrieval": {
+      "seed_count": 2,
+      "avg_success_rate": 0.9,
+      "avg_valid_answer_rate": 0.9,
+      "avg_intent_stability": 1.0
+    },
+    "registration_numbers_dates": {
+      "seed_count": 2,
+      "avg_success_rate": 0.6667,
+      "avg_valid_answer_rate": 0.6667,
+      "avg_intent_stability": 1.0
+    },
+    "relationship_lookup": {
+      "seed_count": 1,
+      "avg_success_rate": 0.3333,
+      "avg_valid_answer_rate": 0.3333,
+      "avg_intent_stability": 1.0
+    }
+  },
+  "by_language": {
+    "de": {
+      "seed_count": 1,
+      "avg_success_rate": 1.0,
+      "avg_valid_answer_rate": 1.0,
+      "avg_intent_stability": 1.0
+    },
+    "en": {
+      "seed_count": 4,
+      "avg_success_rate": 0.6167,
+      "avg_valid_answer_rate": 0.6167,
+      "avg_intent_stability": 1.0
+    }
+  },
+  "seed_reports": [
+    {
+      "seed": "Was ist der EORI-Nr. von Aphotonix GmbH?",
+      "bucket": "registration_numbers_dates",
+      "language": "de",
+      "variant_count": 4,
+      "success_count": 4,
+      "failure_count": 0,
+      "valid_answer_count": 4,
+      "success_rate": 1.0,
+      "valid_answer_rate": 1.0,
+      "intent_stability": 1.0,
+      "dominant_intent": "attribute_lookup",
+      "source_distribution": {
+        "sql_exact": 3,
+        "qdrant": 1
+      },
+      "elapsed_ms_p50": 3289,
+      "elapsed_ms_p95": 3305,
+      "rows": [
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 15,
+          "answer": "[source: sql_exact] eori no for APhotonix GmbH is DE892284377081981.",
+          "answer_len": 68,
+          "answer_source": "sql_exact",
+          "intent": "attribute_lookup",
+          "confidence": 0.9,
+          "entity_name": "APhotonix GmbH",
+          "attribute_name": "eori_no",
+          "query": "Was ist der EORI-Nr. von Aphotonix GmbH?"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 3305,
+          "answer": "[source: sql_exact] eori no for APhotonix GmbH is DE892284377081981.",
+          "answer_len": 68,
+          "answer_source": "sql_exact",
+          "intent": "attribute_lookup",
+          "confidence": 0.9,
+          "entity_name": "APhotonix GmbH",
+          "attribute_name": "eori_no",
+          "query": "Was ist der EORI-Nr. von Aphotonix GmbH please"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 3273,
+          "answer": "[source: sql_exact] eori no for APhotonix GmbH is DE892284377081981.",
+          "answer_len": 68,
+          "answer_source": "sql_exact",
+          "intent": "attribute_lookup",
+          "confidence": 0.9,
+          "entity_name": "APhotonix GmbH",
+          "attribute_name": "eori-nr_zu",
+          "query": "Was ist der EORI-Nr. zu Aphotonix GmbH?"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 15320,
+          "answer": "[source: qdrant] The EORI number for APHOTONIX GmbH is DE892284377081981. This information was retrieved from the document \"German-EORI.pdf\" (Discovery).",
+          "answer_len": 153,
+          "answer_source": "qdrant",
+          "intent": "attribute_lookup",
+          "confidence": 0.9,
+          "entity_name": "EORI-Nr",
+          "attribute_name": "der",
+          "query": "Was ist der EORI-Nr. von Apotonix GmbH?"
+        }
+      ]
+    },
+    {
+      "seed": "Which document mentioned Benjamin Pang? Please return the file name with the full path.",
+      "bucket": "document_retrieval",
+      "language": "en",
+      "variant_count": 5,
+      "success_count": 5,
+      "failure_count": 0,
+      "valid_answer_count": 5,
+      "success_rate": 1.0,
+      "valid_answer_rate": 1.0,
+      "intent_stability": 1.0,
+      "dominant_intent": "attribute_lookup",
+      "source_distribution": {
+        "sql_exact_composite": 5
+      },
+      "elapsed_ms_p50": 8888,
+      "elapsed_ms_p95": 9075,
+      "rows": [
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 14,
+          "answer": "[source: sql_exact_composite] Benjamin Pang -> filename with full path: {'file_name': 'Kondakdaten.pdf', 'full_path': 'Kondakdaten.pdf'}; file name: Kondakdaten.pdf; full path: Kondakdaten.pdf.",
+          "answer_len": 193,
+          "answer_source": "sql_exact_composite",
+          "intent": "attribute_lookup",
+          "confidence": 0.91,
+          "entity_name": "Benjamin Pang",
+          "attribute_name": "document_file_info",
+          "query": "Which document mentioned Benjamin Pang? Please return the file name with the full path."
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 9075,
+          "answer": "[source: sql_exact_composite] Benjamin Pang -> filename with full path: {'file_name': 'Kondakdaten.pdf', 'full_path': 'Kondakdaten.pdf'}; file name: Kondakdaten.pdf; full path: Kondakdaten.pdf.",
+          "answer_len": 193,
+          "answer_source": "sql_exact_composite",
+          "intent": "attribute_lookup",
+          "confidence": 0.91,
+          "entity_name": "Benjamin Pang",
+          "attribute_name": "document_file_info",
+          "query": "Which document mentioned Benjamin Pang? Please return the file name with the full path?"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 9449,
+          "answer": "[source: sql_exact_composite] Benjamin Pang -> filename with full path: {'file_name': 'Kondakdaten.pdf', 'full_path': 'Kondakdaten.pdf'}; file name: Kondakdaten.pdf; full path: Kondakdaten.pdf.",
+          "answer_len": 193,
+          "answer_source": "sql_exact_composite",
+          "intent": "attribute_lookup",
+          "confidence": 0.91,
+          "entity_name": "Benjamin Pang",
+          "attribute_name": "document_file_info",
+          "query": "Which document mentioned Benjamin Pang? Please return the file name with the full path please"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 8877,
+          "answer": "[source: sql_exact_composite] Benjamin Pang -> filename with full path: {'file_name': 'Kondakdaten.pdf', 'full_path': 'Kondakdaten.pdf'}; file name: Kondakdaten.pdf; full path: Kondakdaten.pdf.",
+          "answer_len": 193,
+          "answer_source": "sql_exact_composite",
+          "intent": "attribute_lookup",
+          "confidence": 0.91,
+          "entity_name": "Benjamin Pang",
+          "attribute_name": "document_file_info",
+          "query": "Which document mentioned Benjamin Pang? Please return the file name including the full path."
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 8888,
+          "answer": "[source: sql_exact_composite] Benjamin Pang -> filename with full path: {'file_name': 'Kondakdaten.pdf', 'full_path': 'Kondakdaten.pdf'}; file name: Kondakdaten.pdf; full path: Kondakdaten.pdf.",
+          "answer_len": 193,
+          "answer_source": "sql_exact_composite",
+          "intent": "attribute_lookup",
+          "confidence": 0.91,
+          "entity_name": "Benjamin Pang",
+          "attribute_name": "document_file_info",
+          "query": "Which doument mentioned Benjamin Pang? Please return the file name with the full path."
+        }
+      ]
+    },
+    {
+      "seed": "Show me the note concerning Chung Yeung Pang",
+      "bucket": "document_retrieval",
+      "language": "en",
+      "variant_count": 5,
+      "success_count": 4,
+      "failure_count": 1,
+      "valid_answer_count": 4,
+      "success_rate": 0.8,
+      "valid_answer_rate": 0.8,
+      "intent_stability": 1.0,
+      "dominant_intent": "criteria_lookup",
+      "source_distribution": {
+        "criteria_semantic_qdrant": 4
+      },
+      "elapsed_ms_p50": 16733,
+      "elapsed_ms_p95": 17420,
+      "rows": [
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 21,
+          "answer": "[source: criteria_semantic_qdrant] Here are the matching notes:\n- Chung Yeung Pang (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Käthi Johanna Pang Gerber (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- APhotonix GmbH (company; file: Kondakdaten.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Annual General Meeting (meeting; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Jannik Pfister (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Sirius Group AG (organization; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Benjamin Kin Sing Pang (person; file: Aphotonix_registration.pdf; matched: chung, pang, yeung)\n- Abacor Revisionsgeseilschaft (company; file: seveco_hr.pdf; matched: chung, pang, yeung)",
+          "answer_len": 862,
+          "answer_source": "criteria_semantic_qdrant",
+          "intent": "criteria_lookup",
+          "confidence": 0.94,
+          "entity_name": "Chung Yeung Pang",
+          "attribute_name": null,
+          "query": "Show me the note concerning Chung Yeung Pang"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 17420,
+          "answer": "[source: criteria_semantic_qdrant] Here are the matching notes:\n- Chung Yeung Pang (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Käthi Johanna Pang Gerber (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- APhotonix GmbH (company; file: Kondakdaten.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Annual General Meeting (meeting; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Jannik Pfister (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Sirius Group AG (organization; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Benjamin Kin Sing Pang (person; file: Aphotonix_registration.pdf; matched: chung, pang, yeung)\n- Abacor Revisionsgeseilschaft (company; file: seveco_hr.pdf; matched: chung, pang, yeung)",
+          "answer_len": 862,
+          "answer_source": "criteria_semantic_qdrant",
+          "intent": "criteria_lookup",
+          "confidence": 0.94,
+          "entity_name": "Chung Yeung Pang",
+          "attribute_name": null,
+          "query": "Show me the note concerning Chung Yeung Pang?"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 16733,
+          "answer": "[source: criteria_semantic_qdrant] Here are the matching notes:\n- Chung Yeung Pang (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Käthi Johanna Pang Gerber (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- APhotonix GmbH (company; file: Kondakdaten.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Annual General Meeting (meeting; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Jannik Pfister (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Sirius Group AG (organization; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Benjamin Kin Sing Pang (person; file: Aphotonix_registration.pdf; matched: chung, pang, yeung)\n- Abacor Revisionsgeseilschaft (company; file: seveco_hr.pdf; matched: chung, pang, yeung)",
+          "answer_len": 862,
+          "answer_source": "criteria_semantic_qdrant",
+          "intent": "criteria_lookup",
+          "confidence": 0.94,
+          "entity_name": "Chung Yeung Pang",
+          "attribute_name": null,
+          "query": "Show me the note concerning Chung Yeung Pang please"
+        },
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 14699,
+          "answer": "[source: criteria_semantic_qdrant] Here are the matching notes:\n- Chung Yeung Pang (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Käthi Johanna Pang Gerber (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- APhotonix GmbH (company; file: Kondakdaten.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Annual General Meeting (meeting; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Jannik Pfister (person; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Sirius Group AG (organization; file: sirius_proxy.pdf; matched: chung, chung yeung pang, pang, yeung)\n- Benjamin Kin Sing Pang (person; file: Aphotonix_registration.pdf; matched: chung, pang, yeung)\n- Abacor Revisionsgeseilschaft (company; file: seveco_hr.pdf; matched: chung, pang, yeung)",
+          "answer_len": 862,
+          "answer_source": "criteria_semantic_qdrant",
+          "intent": "criteria_lookup",
+          "confidence": 0.94,
+          "entity_name": "Chung Yeung Pang",
+          "attribute_name": null,
+          "query": "Show me the note related to Chung Yeung Pang"
+        },
+        {
+          "ok": false,
+          "http_status": null,
+          "elapsed_ms": 20008,
+          "error": "HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out. (read timeout=20)",
+          "query": "Show me the note cocerning Chung Yeung Pang"
+        }
+      ]
+    },
+    {
+      "seed": "What is the Statute date in the Handelsregisterauszug of Aphotonix GmbH?",
+      "bucket": "registration_numbers_dates",
+      "language": "en",
+      "variant_count": 3,
+      "success_count": 1,
+      "failure_count": 2,
+      "valid_answer_count": 1,
+      "success_rate": 0.3333333333333333,
+      "valid_answer_rate": 0.3333333333333333,
+      "intent_stability": 1.0,
+      "dominant_intent": "attribute_lookup",
+      "source_distribution": {
+        "table_grounding_required": 1
+      },
+      "elapsed_ms_p50": 20006,
+      "elapsed_ms_p95": 20006,
+      "rows": [
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 20,
+          "answer": "[source: table_grounding_required] I did not find a grounded table-cell match for this request and stopped fallback to avoid an ungrounded answer. Requested row='Statute date', column='the Handelsregisterauszug of Aphotonix GmbH'.",
+          "answer_len": 230,
+          "answer_source": "table_grounding_required",
+          "intent": "attribute_lookup",
+          "confidence": 0.87,
+          "entity_name": "APhotonix GmbH",
+          "attribute_name": "the_handelsregisterauszug_of_aphotonix_gmbh",
+          "query": "What is the Statute date in the Handelsregisterauszug of Aphotonix GmbH?"
+        },
+        {
+          "ok": false,
+          "http_status": null,
+          "elapsed_ms": 20018,
+          "error": "HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out. (read timeout=20)",
+          "query": "What is the Statute date in the Handelsregisterauszug of Aphotonix GmbH please"
+        },
+        {
+          "ok": false,
+          "http_status": null,
+          "elapsed_ms": 20006,
+          "error": "HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out. (read timeout=20)",
+          "query": "What is the Sttute date in the Handelsregisterauszug of Aphotonix GmbH?"
+        }
+      ]
+    },
+    {
+      "seed": "What companies does B. Pang hold shares?",
+      "bucket": "relationship_lookup",
+      "language": "en",
+      "variant_count": 3,
+      "success_count": 1,
+      "failure_count": 2,
+      "valid_answer_count": 1,
+      "success_rate": 0.3333333333333333,
+      "valid_answer_rate": 0.3333333333333333,
+      "intent_stability": 1.0,
+      "dominant_intent": "attribute_lookup",
+      "source_distribution": {
+        "qdrant": 1
+      },
+      "elapsed_ms_p50": 20013,
+      "elapsed_ms_p95": 20013,
+      "rows": [
+        {
+          "ok": true,
+          "http_status": 200,
+          "elapsed_ms": 19,
+          "answer": "[source: qdrant] B. Pang holds shares in the following companies:\n* **APHOTONIX GmbH** (from Qdrant-guided SQL)\n* **Sirius Group AG** (from Qdrant-guided SQL)",
+          "answer_len": 158,
+          "answer_source": "qdrant",
+          "intent": "attribute_lookup",
+          "confidence": 0.9,
+          "entity_name": "B. Pang",
+          "attribute_name": null,
+          "query": "What companies does B. Pang hold shares?"
+        },
+        {
+          "ok": false,
+          "http_status": null,
+          "elapsed_ms": 20013,
+          "error": "HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out. (read timeout=20)",
+          "query": "What companies does B. Pang hold shares please"
+        },
+        {
+          "ok": false,
+          "http_status": null,
+          "elapsed_ms": 20029,
+          "error": "HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out. (read timeout=20)",
+          "query": "What copanies does B. Pang hold shares?"
+        }
+      ]
+    }
+  ]
+}

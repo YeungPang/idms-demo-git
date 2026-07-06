@@ -1,0 +1,52 @@
+# Secrets and environment
+.env
+.env.*
+!.env.example
+secr/
+*_key.json
+*credentials*.json
+google.txt
+
+# Python cache and virtual envs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Runtime artifacts
+log/*.log
+server_startup.log
+harness_ascii_check.log
+generated/markdown/
+generated/db_exports/
+generated/recovery_backups/
+
+# Temporary/debug artifacts
+_tmp_*
+test_output.txt
+query_history_extracted.json
+custom_eval/
+eval_results/
+generated/workflow_docs/
+log/_tmp_*/
+
+# Local handoff/export bundles
+handoff/
+*.dump
+*.backup
+*.bak
+
+# Temporary Office lock files
+~$*.docx
+**/~$*.docx

@@ -1,0 +1,2422 @@
+entity ≔ {
+    objectType: class,
+    id: Ø,
+    name: Ø,
+    legal_name: Ø,
+    description: Ø,
+    ingest: ⦃db_ingest(_entity_payload)⦄,
+    update: ⦃db_update(_entity_payload)⦄,
+    delete: ⦃db_delete(_entity_payload)⦄
+}
+
+ingest(_entity_payload) ⦃db_ingest(_entity_payload)⦄
+update(_entity_payload) ⦃db_update(_entity_payload)⦄
+delete(_entity_payload) ⦃db_delete(_entity_payload)⦄
+entity_ingest(_entity_payload) ⦃ingest(_entity_payload)⦄
+entity_update(_entity_payload) ⦃update(_entity_payload)⦄
+entity_delete(_entity_payload) ⦃delete(_entity_payload)⦄
+
+resolve_policy(_entity_payload) ⦃
+    ↲({
+        threshold: 0.72,
+        low_threshold: 0.72,
+        high_threshold: 0.72,
+        margin: 0.08,
+        max_candidates: 20,
+        name_similarity_weight: 0.35,
+        strong_match_score: 0.45,
+        medium_match_score: 0.2,
+        strong_keys: [],
+        medium_keys: []
+    })
+⦄
+
+entity_resolve_policy(_entity_payload) ⦃↲(resolve_policy(_entity_payload))⦄
+
+person_resolve_policy(_entity_payload) ⦃
+    ↲({
+        threshold: 0.78,
+        low_threshold: 0.70,
+        high_threshold: 0.78,
+        margin: 0.10,
+        max_candidates: 20,
+        name_similarity_weight: 0.30,
+        strong_match_score: 0.55,
+        medium_match_score: 0.18,
+        strong_keys: [email, phone, birth_date, birth_place],
+        medium_keys: [address]
+    })
+⦄
+
+organization_resolve_policy(_entity_payload) ⦃
+    ↲({
+        threshold: 0.76,
+        low_threshold: 0.68,
+        high_threshold: 0.76,
+        margin: 0.10,
+        max_candidates: 20,
+        name_similarity_weight: 0.40,
+        strong_match_score: 0.50,
+        medium_match_score: 0.20,
+        strong_keys: [registration_no, vat_no, uid_che, mwst_no, tax_no],
+        medium_keys: [legal_name, address, country]
+    })
+⦄
+
+company_resolve_policy(_entity_payload) ⦃
+    ↲({
+        threshold: 0.80,
+        low_threshold: 0.72,
+        high_threshold: 0.80,
+        margin: 0.12,
+        max_candidates: 20,
+        name_similarity_weight: 0.42,
+        strong_match_score: 0.55,
+        medium_match_score: 0.20,
+        strong_keys: [registration_no, vat_no, uid_che, mwst_no, tax_no, eori_no],
+        medium_keys: [legal_name, address, country]
+    })
+⦄
+
+interaction_query_policy(_context) ⦃
+    ↲({
+        mode: allow,
+        reason: default_interaction_query_policy,
+        message: ""
+    })
+⦄
+
+interaction_answer_policy(_context) ⦃
+    ↲({
+        mode: allow,
+        reason: default_interaction_answer_policy,
+        message: ""
+    })
+⦄
+
+query_style_policy(_context) ⦃
+    (_style_hint ≔ _context[style_hint]) ⋀
+    (_initial_action ≔ _context[initial_action]) ⋀
+    (_style_hint = temporal_filtered_criteria) ⋀
+    ↲({
+        mode: allow,
+        reason: temporal_criteria_query,
+        query_style: temporal_filtered_criteria,
+        initial_action: search_criteria,
+        message: ""
+    })
+⦄
+
+query_style_policy(_context) ⦃
+    (_style_hint ≔ _context[style_hint]) ⋀
+    (_initial_action ≔ _context[initial_action]) ⋀
+    (_style_hint = criteria_list) ⋀
+    ↲({
+        mode: allow,
+        reason: criteria_list_query,
+        query_style: criteria_list,
+        initial_action: search_criteria,
+        message: ""
+    })
+⦄
+
+query_style_policy(_context) ⦃
+    (_style_hint ≔ _context[style_hint]) ⋀
+    (_initial_action ≔ _context[initial_action]) ⋀
+    (_style_hint = document_retrieval) ⋀
+    ↲({
+        mode: allow,
+        reason: document_retrieval_query,
+        query_style: document_retrieval,
+        initial_action: lookup_attribute,
+        message: ""
+    })
+⦄
+
+query_style_policy(_context) ⦃
+    (_style_hint ≔ _context[style_hint]) ⋀
+    (_initial_action ≔ _context[initial_action]) ⋀
+    (_style_hint = attribute_value) ⋀
+    ↲({
+        mode: allow,
+        reason: attribute_value_query,
+        query_style: attribute_value,
+        initial_action: lookup_attribute,
+        message: ""
+    })
+⦄
+
+query_style_policy(_context) ⦃
+    (_style_hint ≔ _context[style_hint]) ⋀
+    (_initial_action ≔ _context[initial_action]) ⋀
+    ↲({
+        mode: allow,
+        reason: default_query_style_policy,
+        query_style: _style_hint,
+        initial_action: _initial_action,
+        message: ""
+    })
+⦄
+
+can_create_task(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_create_task,
+        allowed: true
+    })
+⦄
+
+can_update_entity(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_update_entity,
+        allowed: true
+    })
+⦄
+
+can_assign_task(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_assign_task,
+        allowed: true
+    })
+⦄
+
+can_close_task(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_close_task,
+        allowed: true
+    })
+⦄
+
+can_validate_plan(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_validate_plan,
+        allowed: true
+    })
+⦄
+
+can_create_workflow_case(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_create_workflow_case,
+        allowed: true
+    })
+⦄
+
+can_record_approval(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_record_approval,
+        allowed: true
+    })
+⦄
+
+can_create_compliance_action(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_create_compliance_action,
+        allowed: true
+    })
+⦄
+
+can_ingest_document(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_ingest_document,
+        allowed: true
+    })
+⦄
+
+can_ingest_information(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_ingest_information,
+        allowed: true
+    })
+⦄
+
+can_generate_document(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_generate_document,
+        allowed: true
+    })
+⦄
+
+can_retrieve_document_file(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_can_retrieve_document_file,
+        allowed: true
+    })
+⦄
+
+event_subscription_policy(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_event_subscription_policy,
+        allowed: true
+    })
+⦄
+
+scheduler_command_policy(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_scheduler_command_policy,
+        allowed: true
+    })
+⦄
+
+event_publish_policy(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_event_publish_policy,
+        allowed: true
+    })
+⦄
+
+workflow_transition_policy(_payload) ⦃
+    (_entity_type ≔ _payload[entity_type]) ⋀
+    (_to_state ≔ _payload[to_state]) ⋀
+    (_event ≔ _payload[event]) ⋀
+    (_actor_ref ≔ _payload[actor_ref]) ⋀
+    (_entity_type = "workflow_case") ⋀
+    ((_to_state = "approved") ⋁ (_to_state = "rejected")) ⋀
+    (_event ≠ "approval_recorded") ⋀
+    ↲({
+        mode: deny,
+        reason: workflow_case_terminal_state_requires_approval_event,
+        allowed: false,
+        message: "workflow_case can move to approved/rejected only from approval_recorded event"
+    })
+⦄
+
+workflow_transition_policy(_payload) ⦃
+    (_entity_type ≔ _payload[entity_type]) ⋀
+    (_to_state ≔ _payload[to_state]) ⋀
+    (_event ≔ _payload[event]) ⋀
+    (_actor_ref ≔ _payload[actor_ref]) ⋀
+    (_entity_type = "project_task") ⋀
+    (_to_state = "done") ⋀
+    (_event ≠ "task_completed") ⋀
+    ↲({
+        mode: deny,
+        reason: project_task_done_requires_completion_event,
+        allowed: false,
+        message: "project_task can move to done only with task_completed event"
+    })
+⦄
+
+workflow_transition_policy(_payload) ⦃
+    (_entity_type ≔ _payload[entity_type]) ⋀
+    (_to_state ≔ _payload[to_state]) ⋀
+    (_event ≔ _payload[event]) ⋀
+    (_entity_type = "compliance_action") ⋀
+    (_to_state = "escalated") ⋀
+    (_event = "compliance_deadline_breach") ⋀
+    ↲({
+        mode: escalate,
+        reason: compliance_deadline_breach_escalation,
+        allowed: true,
+        message: "compliance_action escalation requires urgent handling"
+    })
+⦄
+
+workflow_transition_policy(_payload) ⦃
+    (_entity_type ≔ _payload[entity_type]) ⋀
+    (_to_state ≔ _payload[to_state]) ⋀
+    (_event ≔ _payload[event]) ⋀
+    (_actor_ref ≔ _payload[actor_ref]) ⋀
+    (_entity_type = "workflow_case") ⋀
+    ((_to_state = "approved") ⋁ (_to_state = "rejected")) ⋀
+    (_actor_ref = "system") ⋀
+    ↲({
+        mode: deny,
+        reason: manual_terminal_transition_not_allowed,
+        allowed: false,
+        message: "manual transition to terminal workflow_case state is not allowed"
+    })
+⦄
+
+workflow_transition_policy(_payload) ⦃
+    ↲({
+        mode: allow,
+        reason: default_workflow_transition_policy,
+        allowed: true,
+        message: ""
+    })
+⦄
+
+# ---------------------------------------------------------------------------
+# SOLF semantic composition templates (Phase 1)
+# ---------------------------------------------------------------------------
+
+compose_interaction(_intent_payload) ⦃
+    (_interaction_type ≔ _intent_payload[interaction_type]) ⋀
+    (_action ≔ _intent_payload[action]) ⋀
+    (_entity_type ≔ _intent_payload[entity_type]) ⋀
+    (_args ≔ _intent_payload[args]) ⋀
+    ↲({
+        interaction_type: _interaction_type,
+        action: _action,
+        entity_type: _entity_type,
+        args: _args,
+        route: workflow
+    })
+⦄
+
+action_plan(create_task, _args) ⦃↲(create_task_plan(_args))⦄
+action_plan(update_entity, _args) ⦃↲(update_entity_plan(_args))⦄
+action_plan(assign_task, _args) ⦃↲(assign_task_plan(_args))⦄
+action_plan(close_task, _args) ⦃↲(close_task_plan(_args))⦄
+action_plan(validate_plan, _args) ⦃↲(validate_plan_plan(_args))⦄
+action_plan(create_workflow_case, _args) ⦃↲(create_workflow_case_plan(_args))⦄
+action_plan(record_approval, _args) ⦃↲(record_approval_plan(_args))⦄
+action_plan(create_compliance_action, _args) ⦃↲(create_compliance_action_plan(_args))⦄
+action_plan(ingest_document, _args) ⦃↲(ingest_document_plan(_args))⦄
+action_plan(ingest_information, _args) ⦃↲(ingest_information_plan(_args))⦄
+action_plan(generate_document, _args) ⦃↲(generate_document_plan(_args))⦄
+action_plan(retrieve_document_file, _args) ⦃↲(retrieve_document_file_plan(_args))⦄
+
+# Pattern 1: create_task with assignee
+create_task_plan(_args) ⦃
+    (_project_id ≔ _args[project_id]) ⋀
+    (_title ≔ _args[title]) ⋀
+    (_hours_estimate ≔ _args[hours_estimate]) ⋀
+    (_assigned_to ≔ _args[assigned_to]) ⋀
+    ↲({
+        action: create_task,
+        guard: can_create_task,
+        sql_builder: sql_plan_create_task,
+        args: {
+            project_id: _project_id,
+            title: _title,
+            hours_estimate: _hours_estimate,
+            assigned_to: _assigned_to
+        }
+    })
+⦄
+
+# Pattern 2: create_task without assignee (same predicate name, different args)
+create_task_plan(_args) ⦃
+    (_project_id ≔ _args[project_id]) ⋀
+    (_title ≔ _args[title]) ⋀
+    (_hours_estimate ≔ _args[hours_estimate]) ⋀
+    ↲({
+        action: create_task,
+        guard: can_create_task,
+        sql_builder: sql_plan_create_task,
+        args: {
+            project_id: _project_id,
+            title: _title,
+            hours_estimate: _hours_estimate,
+            assigned_to: Ø
+        }
+    })
+⦄
+
+# Pattern 1: update_entity by numeric id
+update_entity_plan(_args) ⦃
+    (_entity_type ≔ _args[entity_type]) ⋀
+    (_entity_id ≔ _args[entity_id]) ⋀
+    (_field ≔ _args[field]) ⋀
+    (_new_value ≔ _args[new_value]) ⋀
+    ↲({
+        action: update_entity,
+        guard: can_update_entity,
+        sql_builder: sql_plan_update_entity_by_id,
+        args: {
+            entity_type: _entity_type,
+            entity_id: _entity_id,
+            field: _field,
+            new_value: _new_value
+        }
+    })
+⦄
+
+# Pattern 2: update_entity by natural key
+update_entity_plan(_args) ⦃
+    (_entity_type ≔ _args[entity_type]) ⋀
+    (_natural_key_field ≔ _args[natural_key_field]) ⋀
+    (_natural_key_value ≔ _args[natural_key_value]) ⋀
+    (_field ≔ _args[field]) ⋀
+    (_new_value ≔ _args[new_value]) ⋀
+    ↲({
+        action: update_entity,
+        guard: can_update_entity,
+        sql_builder: sql_plan_update_entity_by_natural_key,
+        args: {
+            entity_type: _entity_type,
+            natural_key_field: _natural_key_field,
+            natural_key_value: _natural_key_value,
+            field: _field,
+            new_value: _new_value
+        }
+    })
+⦄
+
+assign_task_plan(_args) ⦃
+    (_task_id ≔ _args[task_id]) ⋀
+    (_assigned_to ≔ _args[assigned_to]) ⋀
+    ↲({
+        action: assign_task,
+        guard: can_assign_task,
+        sql_builder: sql_plan_assign_task,
+        args: {
+            task_id: _task_id,
+            assigned_to: _assigned_to
+        }
+    })
+⦄
+
+close_task_plan(_args) ⦃
+    (_task_id ≔ _args[task_id]) ⋀
+    ↲({
+        action: close_task,
+        guard: can_close_task,
+        sql_builder: sql_plan_close_task,
+        args: {
+            task_id: _task_id
+        }
+    })
+⦄
+
+validate_plan_plan(_args) ⦃
+    (_plan_id ≔ _args[plan_id]) ⋀
+    ↲({
+        action: validate_plan,
+        guard: can_validate_plan,
+        sql_builder: sql_plan_validate_plan,
+        args: {
+            plan_id: _plan_id
+        }
+    })
+⦄
+
+create_workflow_case_plan(_args) ⦃
+    (_case_no ≔ _args[case_no]) ⋀
+    (_case_type ≔ _args[case_type]) ⋀
+    (_subject_ref ≔ _args[subject_ref]) ⋀
+    (_initiated_by_ref ≔ _args[initiated_by_ref]) ⋀
+    (_current_step ≔ _args[current_step]) ⋀
+    (_sla_due_at ≔ _args[sla_due_at]) ⋀
+    (_status ≔ _args[status]) ⋀
+    ↲({
+        action: create_workflow_case,
+        guard: can_create_workflow_case,
+        sql_builder: sql_plan_create_workflow_case,
+        args: {
+            case_no: _case_no,
+            case_type: _case_type,
+            subject_ref: _subject_ref,
+            initiated_by_ref: _initiated_by_ref,
+            current_step: _current_step,
+            sla_due_at: _sla_due_at,
+            status: _status
+        }
+    })
+⦄
+
+record_approval_plan(_args) ⦃
+    (_approval_no ≔ _args[approval_no]) ⋀
+    (_case_ref ≔ _args[case_ref]) ⋀
+    (_approver_ref ≔ _args[approver_ref]) ⋀
+    (_decision ≔ _args[decision]) ⋀
+    (_decision_at ≔ _args[decision_at]) ⋀
+    (_comment ≔ _args[comment]) ⋀
+    (_escalation_level ≔ _args[escalation_level]) ⋀
+    ↲({
+        action: record_approval,
+        guard: can_record_approval,
+        sql_builder: sql_plan_record_approval,
+        args: {
+            approval_no: _approval_no,
+            case_ref: _case_ref,
+            approver_ref: _approver_ref,
+            decision: _decision,
+            decision_at: _decision_at,
+            comment: _comment,
+            escalation_level: _escalation_level
+        }
+    })
+⦄
+
+create_compliance_action_plan(_args) ⦃
+    (_action_no ≔ _args[action_no]) ⋀
+    (_action_type ≔ _args[action_type]) ⋀
+    (_authority_ref ≔ _args[authority_ref]) ⋀
+    (_workflow_case_ref ≔ _args[workflow_case_ref]) ⋀
+    (_subject_ref ≔ _args[subject_ref]) ⋀
+    (_responsible_party_ref ≔ _args[responsible_party_ref]) ⋀
+    (_legal_basis ≔ _args[legal_basis]) ⋀
+    (_due_date ≔ _args[due_date]) ⋀
+    (_due_date_key ≔ _args[due_date_key]) ⋀
+    (_status ≔ _args[status]) ⋀
+    (_priority ≔ _args[priority]) ⋀
+    ↲({
+        action: create_compliance_action,
+        guard: can_create_compliance_action,
+        sql_builder: sql_plan_create_compliance_action,
+        args: {
+            action_no: _action_no,
+            action_type: _action_type,
+            authority_ref: _authority_ref,
+            workflow_case_ref: _workflow_case_ref,
+            subject_ref: _subject_ref,
+            responsible_party_ref: _responsible_party_ref,
+            legal_basis: _legal_basis,
+            due_date: _due_date,
+            due_date_key: _due_date_key,
+            status: _status,
+            priority: _priority
+        }
+    })
+⦄
+
+ingest_document_plan(_args) ⦃
+    (_source ≔ _args[source]) ⋀
+    (_description ≔ _args[description]) ⋀
+    (_tags ≔ _args[tags]) ⋀
+    (_metadata ≔ _args[metadata]) ⋀
+    ↲({
+        action: ingest_document,
+        guard: can_ingest_document,
+        args: {
+            source: _source,
+            description: _description,
+            tags: _tags,
+            metadata: _metadata
+        }
+    })
+⦄
+
+ingest_information_plan(_args) ⦃
+    (_information_text ≔ _args[information_text]) ⋀
+    (_description ≔ _args[description]) ⋀
+    (_tags ≔ _args[tags]) ⋀
+    (_metadata ≔ _args[metadata]) ⋀
+    ↲({
+        action: ingest_information,
+        guard: can_ingest_information,
+        args: {
+            information_text: _information_text,
+            description: _description,
+            tags: _tags,
+            metadata: _metadata
+        }
+    })
+⦄
+
+generate_document_plan(_args) ⦃
+    (_document_type ≔ _args[document_type]) ⋀
+    (_subject ≔ _args[subject]) ⋀
+    (_context ≔ _args[context]) ⋀
+    (_template ≔ _args[template]) ⋀
+    (_output_path ≔ _args[output_path]) ⋀
+    ↲({
+        action: generate_document,
+        guard: can_generate_document,
+        args: {
+            document_type: _document_type,
+            subject: _subject,
+            context: _context,
+            template: _template,
+            output_path: _output_path
+        }
+    })
+⦄
+
+retrieve_document_file_plan(_args) ⦃
+    (_doc_id ≔ _args[doc_id]) ⋀
+    ↲({
+        action: retrieve_document_file,
+        guard: can_retrieve_document_file,
+        sql_builder: sql_plan_retrieve_document_by_doc_id,
+        args: {
+            doc_id: _doc_id
+        }
+    })
+⦄
+
+retrieve_document_file_plan(_args) ⦃
+    (_doc_key ≔ _args[doc_key]) ⋀
+    ↲({
+        action: retrieve_document_file,
+        guard: can_retrieve_document_file,
+        sql_builder: sql_plan_retrieve_document_by_doc_key,
+        args: {
+            doc_key: _doc_key
+        }
+    })
+⦄
+
+retrieve_document_file_plan(_args) ⦃
+    (_doc_name ≔ _args[doc_name]) ⋀
+    ↲({
+        action: retrieve_document_file,
+        guard: can_retrieve_document_file,
+        sql_builder: sql_plan_retrieve_document_by_doc_name,
+        args: {
+            doc_name: _doc_name
+        }
+    })
+⦄
+
+# SQL plan templates emitted by SOLF, executed by Python adapters.
+sql_plan_create_task(_args) ⦃
+    (_project_id ≔ _args[project_id]) ⋀
+    (_title ≔ _args[title]) ⋀
+    (_hours_estimate ≔ _args[hours_estimate]) ⋀
+    (_assigned_to ≔ _args[assigned_to]) ⋀
+    ↲({
+        operation: insert,
+        table: project_tasks,
+        values: {
+            project_id: _project_id,
+            name: _title,
+            estimated_hours: _hours_estimate,
+            assigned_to: _assigned_to,
+            status: open
+        },
+        returning: [id]
+    })
+⦄
+
+sql_plan_update_entity_by_id(_args) ⦃
+    (_entity_type ≔ _args[entity_type]) ⋀
+    (_entity_id ≔ _args[entity_id]) ⋀
+    (_field ≔ _args[field]) ⋀
+    (_new_value ≔ _args[new_value]) ⋀
+    ↲({
+        operation: update,
+        table: _entity_type,
+        where: { id: _entity_id },
+        values: { [_field]: _new_value },
+        returning: [id]
+    })
+⦄
+
+sql_plan_update_entity_by_natural_key(_args) ⦃
+    (_entity_type ≔ _args[entity_type]) ⋀
+    (_natural_key_field ≔ _args[natural_key_field]) ⋀
+    (_natural_key_value ≔ _args[natural_key_value]) ⋀
+    (_field ≔ _args[field]) ⋀
+    (_new_value ≔ _args[new_value]) ⋀
+    ↲({
+        operation: update,
+        table: _entity_type,
+        where: { [_natural_key_field]: _natural_key_value },
+        values: { [_field]: _new_value },
+        returning: [id]
+    })
+⦄
+
+sql_plan_assign_task(_args) ⦃
+    (_task_id ≔ _args[task_id]) ⋀
+    (_assigned_to ≔ _args[assigned_to]) ⋀
+    ↲({
+        operation: update,
+        table: project_tasks,
+        where: { id: _task_id },
+        values: {
+            assigned_to: _assigned_to,
+            status: in_progress
+        },
+        returning: [id]
+    })
+⦄
+
+sql_plan_close_task(_args) ⦃
+    (_task_id ≔ _args[task_id]) ⋀
+    ↲({
+        operation: update,
+        table: project_tasks,
+        where: { id: _task_id },
+        values: {
+            status: done
+        },
+        returning: [id]
+    })
+⦄
+
+sql_plan_validate_plan(_args) ⦃
+    (_plan_id ≔ _args[plan_id]) ⋀
+    ↲({
+        operation: select,
+        table: projects,
+        where: { id: _plan_id },
+        checks: [budget, overdue_tasks, resource_conflicts]
+    })
+⦄
+
+sql_plan_create_workflow_case(_args) ⦃
+    (_case_no ≔ _args[case_no]) ⋀
+    (_case_type ≔ _args[case_type]) ⋀
+    (_subject_ref ≔ _args[subject_ref]) ⋀
+    (_initiated_by_ref ≔ _args[initiated_by_ref]) ⋀
+    (_current_step ≔ _args[current_step]) ⋀
+    (_sla_due_at ≔ _args[sla_due_at]) ⋀
+    (_status ≔ _args[status]) ⋀
+    ↲({
+        operation: insert,
+        table: workflow_cases,
+        values: {
+            case_no: _case_no,
+            case_type: _case_type,
+            subject_ref: _subject_ref,
+            initiated_by_ref: _initiated_by_ref,
+            current_step: _current_step,
+            sla_due_at: _sla_due_at,
+            status: _status
+        },
+        returning: [id]
+    })
+⦄
+
+sql_plan_record_approval(_args) ⦃
+    (_approval_no ≔ _args[approval_no]) ⋀
+    (_case_ref ≔ _args[case_ref]) ⋀
+    (_approver_ref ≔ _args[approver_ref]) ⋀
+    (_decision ≔ _args[decision]) ⋀
+    (_decision_at ≔ _args[decision_at]) ⋀
+    (_comment ≔ _args[comment]) ⋀
+    (_escalation_level ≔ _args[escalation_level]) ⋀
+    ↲({
+        operation: insert,
+        table: approvals,
+        values: {
+            approval_no: _approval_no,
+            case_ref: _case_ref,
+            approver_ref: _approver_ref,
+            decision: _decision,
+            decision_at: _decision_at,
+            comment: _comment,
+            escalation_level: _escalation_level
+        },
+        returning: [id]
+    })
+⦄
+
+sql_plan_create_compliance_action(_args) ⦃
+    (_action_no ≔ _args[action_no]) ⋀
+    (_action_type ≔ _args[action_type]) ⋀
+    (_authority_ref ≔ _args[authority_ref]) ⋀
+    (_workflow_case_ref ≔ _args[workflow_case_ref]) ⋀
+    (_subject_ref ≔ _args[subject_ref]) ⋀
+    (_responsible_party_ref ≔ _args[responsible_party_ref]) ⋀
+    (_legal_basis ≔ _args[legal_basis]) ⋀
+    (_due_date ≔ _args[due_date]) ⋀
+    (_due_date_key ≔ _args[due_date_key]) ⋀
+    (_status ≔ _args[status]) ⋀
+    (_priority ≔ _args[priority]) ⋀
+    ↲({
+        operation: insert,
+        table: compliance_actions,
+        values: {
+            action_no: _action_no,
+            action_type: _action_type,
+            authority_ref: _authority_ref,
+            workflow_case_ref: _workflow_case_ref,
+            subject_ref: _subject_ref,
+            responsible_party_ref: _responsible_party_ref,
+            legal_basis: _legal_basis,
+            due_date: _due_date,
+            due_date_key: _due_date_key,
+            status: _status,
+            priority: _priority
+        },
+        returning: [id]
+    })
+⦄
+
+sql_plan_retrieve_document_by_doc_id(_args) ⦃
+    (_doc_id ≔ _args[doc_id]) ⋀
+    ↲({
+        operation: select,
+        table: document,
+        where: { doc_id: _doc_id }
+    })
+⦄
+
+sql_plan_retrieve_document_by_doc_key(_args) ⦃
+    (_doc_key ≔ _args[doc_key]) ⋀
+    ↲({
+        operation: select,
+        table: document,
+        where: { doc_key: _doc_key }
+    })
+⦄
+
+sql_plan_retrieve_document_by_doc_name(_args) ⦃
+    (_doc_name ≔ _args[doc_name]) ⋀
+    ↲({
+        operation: select,
+        table: document,
+        where: { doc_name: _doc_name }
+    })
+⦄
+
+# Scheduler semantic command patterns.
+scheduler_command(start, _args) ⦃
+    ↲({
+        command: start,
+        args: _args
+    })
+⦄
+
+scheduler_command(stop, _args) ⦃
+    ↲({
+        command: stop,
+        args: _args
+    })
+⦄
+
+scheduler_command(add_job, _args) ⦃
+    (_query ≔ _args[query]) ⋀
+    (_cron_expression ≔ _args[cron_expression]) ⋀
+    ↲({
+        command: add_job,
+        args: {
+            query: _query,
+            cron_expression: _cron_expression,
+            tags: _args[tags]
+        }
+    })
+⦄
+
+scheduler_command(remove_job, _args) ⦃
+    (_job_id ≔ _args[job_id]) ⋀
+    ↲({
+        command: remove_job,
+        args: {
+            job_id: _job_id
+        }
+    })
+⦄
+
+scheduler_command(pause_job, _args) ⦃
+    (_job_id ≔ _args[job_id]) ⋀
+    ↲({
+        command: pause_job,
+        args: {
+            job_id: _job_id
+        }
+    })
+⦄
+
+scheduler_command(resume_job, _args) ⦃
+    (_job_id ≔ _args[job_id]) ⋀
+    ↲({
+        command: resume_job,
+        args: {
+            job_id: _job_id
+        }
+    })
+⦄
+
+scheduler_command(list_jobs, _args) ⦃
+    ↲({
+        command: list_jobs,
+        args: _args
+    })
+⦄
+
+# Event rules + notification routing.
+event_rule(task.overdue, _payload) ⦃
+    ↲({
+        severity: warning,
+        channels: [log, webhook],
+        subject: task_overdue,
+        notify: true,
+        payload: _payload
+    })
+⦄
+
+event_rule(invoice.overdue, _payload) ⦃
+    ↲({
+        severity: critical,
+        channels: [log, webhook, email],
+        subject: invoice_overdue,
+        notify: true,
+        payload: _payload
+    })
+⦄
+
+event_rule(resource.conflict_detected, _payload) ⦃
+    ↲({
+        severity: critical,
+        channels: [log, webhook],
+        subject: resource_conflict,
+        notify: true,
+        payload: _payload
+    })
+⦄
+
+person ≔ {
+    objectType: class,
+    extending: entity,
+    birth_date: Ø,
+    birth_place: Ø,
+    gender: Ø,
+    nationality: Ø,
+    address: Ø,
+    email: Ø,
+    phone: Ø
+}
+
+organization ≔ {
+    objectType: class,
+    extending: entity,
+    org_type: Ø,
+    sector: Ø,
+    jurisdiction: Ø,
+    parent_org_ref: Ø,
+    website: Ø,
+    address: Ø,
+    country: Ø,
+    email: Ø,
+    phone: Ø
+}
+
+government_entity ≔ {
+    objectType: class,
+    extending: organization,
+    authority_level: Ø,
+    mandate: Ø,
+    regulator_code: Ø,
+    jurisdiction: Ø
+}
+
+institution ≔ {
+    objectType: class,
+    extending: organization,
+    institution_type: Ø,
+    supervising_body_ref: Ø,
+    service_scope: Ø,
+    operating_region: Ø
+}
+
+legal_entity ≔ {
+    objectType: class,
+    extending: organization,
+    legal_form: Ø,
+    registration_no: Ø,
+    tax_no: Ø,
+    incorporation_date: Ø,
+    registry_office: Ø,
+    registered_address: Ø,
+    legal_representative: Ø,
+    accounting_currency: Ø,
+    fiscal_year_start: Ø,
+    fiscal_year_end: Ø,
+    statute_date: Ø
+}
+
+company ≔ {
+    objectType: class,
+    extending: legal_entity,
+    company_type: Ø,
+    vat_no: Ø,
+    uid_che: Ø,
+    mwst_no: Ø,
+    eori_no: Ø,
+    industry_code: Ø,
+    canton: Ø,
+    municipal_tax_office_ref: Ø,
+    cantonal_tax_authority_ref: Ø,
+    payment_terms: Ø,
+    bank_account_ref: Ø
+}
+
+public_authority ≔ {
+    objectType: class,
+    extending: institution,
+    authority_type: Ø,
+    authority_level: Ø,
+    official_identifier: Ø,
+    mandate: Ø,
+    contact_portal: Ø
+}
+
+registration_office ≔ {
+    objectType: class,
+    extending: public_authority,
+    registry_type: Ø,
+    registry_code: Ø,
+    filing_requirements: Ø
+}
+
+tax_authority ≔ {
+    objectType: class,
+    extending: public_authority,
+    tax_authority_code: Ø,
+    tax_jurisdiction: Ø,
+    filing_channel: Ø
+}
+
+education_institution ≔ {
+    objectType: class,
+    extending: institution,
+    education_type: Ø,
+    accreditation_status: Ø,
+    campus_ref: Ø,
+    awarding_body: Ø
+}
+
+research_lab ≔ {
+    objectType: class,
+    extending: institution,
+    lab_type: Ø,
+    research_domain: Ø,
+    principal_investigator_ref: Ø,
+    host_institution_ref: Ø,
+    funding_source: Ø
+}
+
+document ≔ {
+    objectType: class,
+    extending: entity,
+    document_no: Ø,
+    document_type: Ø,
+    issue_date: Ø,
+    valid_from: Ø,
+    valid_until: Ø,
+    language: Ø,
+    source_system: Ø,
+    status: Ø
+}
+
+email ≔ {
+    objectType: class,
+    extending: document,
+    subject: Ø,
+    sender_ref: Ø,
+    recipient_ref: Ø,
+    sent_at: Ø,
+    thread_ref: Ø
+}
+
+event ≔ {
+    objectType: class,
+    extending: entity,
+    event_type: Ø,
+    event_date: Ø,
+    venue_ref: Ø,
+    organizer_ref: Ø,
+    status: Ø
+}
+
+meeting ≔ {
+    objectType: class,
+    extending: event,
+    meeting_no: Ø,
+    agenda: Ø,
+    minutes_ref: Ø,
+    chair_ref: Ø
+}
+
+venue ≔ {
+    objectType: class,
+    extending: entity,
+    venue_name: Ø,
+    venue_type: Ø,
+    address_line_1: Ø,
+    address_line_2: Ø,
+    postal_code: Ø,
+    city: Ø,
+    state_region: Ø,
+    country: Ø,
+    building: Ø,
+    hall: Ø,
+    room: Ø,
+    floor: Ø,
+    exhibition_area: Ø,
+    conference_area: Ø,
+    capacity: Ø,
+    status: Ø
+}
+
+department ≔ {
+    objectType: class,
+    extending: entity,
+    department_code: Ø,
+    cost_center: Ø,
+    manager_ref: Ø,
+    parent_department_ref: Ø,
+    employer_ref: Ø
+}
+
+role ≔ {
+    objectType: class,
+    extending: entity,
+    role_code: Ø,
+    role_family: Ø,
+    seniority_level: Ø,
+    permissions: Ø,
+    department_ref: Ø
+}
+
+contract ≔ {
+    objectType: class,
+    extending: entity,
+    contract_no: Ø,
+    contract_type: Ø,
+    effective_date: Ø,
+    start_date: Ø,
+    end_date: Ø,
+    status: Ø,
+    signed_date: Ø,
+    source_document_ref: Ø
+}
+
+agreement ≔ {
+    objectType: class,
+    extending: contract,
+    agreement_type: Ø,
+    counterparty_ref: Ø,
+    governing_law: Ø,
+    termination_clause: Ø
+}
+
+policy ≔ {
+    objectType: class,
+    extending: document,
+    policy_type: Ø,
+    owner_ref: Ø,
+    review_due_date: Ø,
+    approval_ref: Ø
+}
+
+employment_contract ≔ {
+    objectType: class,
+    extending: contract,
+    person_ref: Ø,
+    employer_ref: Ø,
+    department_ref: Ø,
+    role_ref: Ø,
+    manager_ref: Ø,
+    employment_type: Ø,
+    work_percentage: Ø,
+    salary_amount: Ø,
+    salary_currency: Ø,
+    payment_frequency: Ø,
+    source_tax_code: Ø,
+    source_tax_applicable: Ø,
+    pension_plan_ref: Ø,
+    social_insurance_category: Ø,
+    probation_end_date: Ø,
+    notice_period: Ø,
+    work_location: Ø,
+    holiday_entitlement: Ø
+}
+
+employment_contract_validate(_entity_payload) ⦃↲(db_hr_validate_payload(_entity_payload))⦄
+employment_contract_ingest(_entity_payload) ⦃↲(db_hr_ingest(_entity_payload))⦄
+employment_contract_update(_entity_payload) ⦃↲(db_hr_ingest(_entity_payload))⦄
+employment_contract_delete(_entity_payload) ⦃↲(db_hr_delete(_entity_payload))⦄
+
+employee_profile ≔ {
+    objectType: class,
+    extending: person,
+    employee_no: Ø,
+    ahv_number: Ø,
+    permit_type: Ø,
+    source_tax_code: Ø,
+    pension_fund_no: Ø,
+    accident_insurance_no: Ø,
+    current_contract_ref: Ø,
+    current_employer_ref: Ø,
+    current_department_ref: Ø,
+    current_role_ref: Ø,
+    employment_status: Ø,
+    availability_status: Ø
+}
+
+employee_profile_validate(_entity_payload) ⦃↲(db_hr_validate_payload(_entity_payload))⦄
+employee_profile_ingest(_entity_payload) ⦃↲(db_hr_ingest(_entity_payload))⦄
+employee_profile_update(_entity_payload) ⦃↲(db_hr_ingest(_entity_payload))⦄
+employee_profile_delete(_entity_payload) ⦃↲(db_hr_delete(_entity_payload))⦄
+
+party ≔ {
+    objectType: class,
+    extending: entity,
+    party_code: Ø,
+    party_type: Ø,
+    legal_entity_ref: Ø,
+    tax_identifier: Ø,
+    billing_address: Ø,
+    shipping_address: Ø,
+    payment_terms: Ø,
+    preferred_currency: Ø,
+    bank_account_ref: Ø,
+    status: Ø
+}
+
+customer ≔ {
+    objectType: class,
+    extending: party,
+    customer_no: Ø,
+    customer_segment: Ø,
+    credit_limit: Ø,
+    risk_rating: Ø,
+    account_manager_ref: Ø,
+    onboarding_date: Ø
+}
+
+supplier ≔ {
+    objectType: class,
+    extending: party,
+    supplier_no: Ø,
+    supplier_category: Ø,
+    lead_time_days: Ø,
+    quality_rating: Ø,
+    preferred_supplier: Ø,
+    procurement_owner_ref: Ø
+}
+
+product ≔ {
+    objectType: class,
+    extending: entity,
+    sku: Ø,
+    product_type: Ø,
+    unit_of_measure: Ø,
+    standard_price: Ø,
+    tax_code: Ø,
+    category_ref: Ø,
+    active: Ø
+}
+
+service ≔ {
+    objectType: class,
+    extending: product,
+    service_code: Ø,
+    service_level: Ø,
+    billing_model: Ø,
+    default_duration: Ø
+}
+
+warehouse ≔ {
+    objectType: class,
+    extending: entity,
+    warehouse_code: Ø,
+    location: Ø,
+    manager_ref: Ø,
+    capacity: Ø,
+    status: Ø
+}
+
+inventory_item ≔ {
+    objectType: class,
+    extending: entity,
+    product_ref: Ø,
+    warehouse_ref: Ø,
+    batch_no: Ø,
+    serial_no: Ø,
+    quantity_on_hand: Ø,
+    quantity_reserved: Ø,
+    reorder_point: Ø,
+    expiry_date: Ø
+}
+
+chart_of_accounts ≔ {
+    objectType: class,
+    extending: entity,
+    coa_code: Ø,
+    legal_entity_ref: Ø,
+    country_code: Ø,
+    vat_scheme: Ø,
+    account_plan_standard: Ø,
+    accounting_standard: Ø,
+    fiscal_year_start: Ø,
+    fiscal_year_end: Ø,
+    status: Ø
+}
+
+account ≔ {
+    objectType: class,
+    extending: entity,
+    account_code: Ø,
+    account_name: Ø,
+    account_type: Ø,
+    fs_report_section: Ø,
+    vat_statement_box: Ø,
+    withholding_tax_applicable: Ø,
+    direct_tax_category: Ø,
+    parent_account_ref: Ø,
+    coa_ref: Ø,
+    currency: Ø,
+    active: Ø
+}
+
+journal ≔ {
+    objectType: class,
+    extending: entity,
+    journal_code: Ø,
+    journal_type: Ø,
+    legal_entity_ref: Ø,
+    posting_policy: Ø,
+    status: Ø
+}
+
+journal_entry ≔ {
+    objectType: class,
+    extending: entity,
+    entry_no: Ø,
+    journal_ref: Ø,
+    fiscal_year: Ø,
+    fiscal_period: Ø,
+    document_date: Ø,
+    posting_date: Ø,
+    period: Ø,
+    exchange_rate: Ø,
+    journal_source: Ø,
+    source_document_ref: Ø,
+    entered_by_ref: Ø,
+    approved_by_ref: Ø,
+    booked_at: Ø,
+    status: Ø
+}
+
+journal_line ≔ {
+    objectType: class,
+    extending: entity,
+    entry_ref: Ø,
+    line_no: Ø,
+    line_description: Ø,
+    counterparty_ref: Ø,
+    account_ref: Ø,
+    debit_amount: Ø,
+    credit_amount: Ø,
+    currency: Ø,
+    tax_code: Ø,
+    tax_rate: Ø,
+    vat_amount: Ø,
+    vat_jurisdiction: Ø,
+    tax_reporting_period: Ø,
+    cost_center_ref: Ø,
+    project_ref: Ø
+}
+
+accounting_transaction ≔ {
+    objectType: class,
+    extending: journal_entry,
+    transaction_id: Ø,
+    legal_entity_ref: Ø,
+    company_ref: Ø,
+    employer_ref: Ø,
+    current_employer_ref: Ø,
+    person_ref: Ø,
+    employee_ref: Ø,
+    payer_ref: Ø,
+    owner_ref: Ø,
+    submitted_by_ref: Ø,
+    entered_by_ref: Ø,
+    source_type: Ø,
+    transaction_date: Ø,
+    description: Ø,
+    source_document_ref: Ø,
+    receipt_archive_url: Ø,
+    currency: Ø,
+    debit_total: Ø,
+    credit_total: Ø,
+    ledger_lines: Ø,
+    validation_status: Ø,
+    tax_authority_ref: Ø,
+    ingest: ⦃db_accounting_ingest(_entity_payload)⦄,
+    update: ⦃db_accounting_ingest(_entity_payload)⦄,
+    delete: ⦃db_accounting_delete(_entity_payload)⦄
+}
+
+accounting_line ≔ {
+    objectType: class,
+    extending: journal_line,
+    transaction_ref: Ø,
+    account_number: Ø,
+    direction: Ø,
+    source_currency: Ø,
+    amount_source_currency: Ø,
+    exchange_rate_to_chf: Ø,
+    amount_chf: Ø,
+    swiss_vat_code: Ø,
+    swiss_vat_box: Ø,
+    line_description: Ø
+}
+
+accounting_transaction_resolve_policy(_entity_payload) ⦃
+    ↲({
+        threshold: 0.92,
+        low_threshold: 0.88,
+        high_threshold: 0.92,
+        margin: 0.05,
+        max_candidates: 10,
+        name_similarity_weight: 0.15,
+        strong_match_score: 0.70,
+        medium_match_score: 0.15,
+        strong_keys: [transaction_id, source_document_ref],
+        medium_keys: [transaction_date, description]
+    })
+⦄
+
+resolve_accounting_booking_context(_entity_payload) ⦃
+    ↲(resolve_accounting_booking_company(_entity_payload))
+⦄
+
+accounting_transaction_validate(_entity_payload) ⦃
+    (_resolved_payload ≔ resolve_accounting_booking_context(_entity_payload)) ⋀
+    ↲(db_validate_ledger_payload(_resolved_payload))
+⦄
+
+accounting_transaction_ingest(_entity_payload) ⦃
+    (_resolved_payload ≔ resolve_accounting_booking_context(_entity_payload)) ⋀
+    ↲(db_accounting_ingest(_resolved_payload))
+⦄
+
+accounting_transaction_update(_entity_payload) ⦃
+    (_resolved_payload ≔ resolve_accounting_booking_context(_entity_payload)) ⋀
+    ↲(db_accounting_ingest(_resolved_payload))
+⦄
+accounting_transaction_delete(_entity_payload) ⦃↲(db_accounting_delete(_entity_payload))⦄
+
+invoice ≔ {
+    objectType: class,
+    extending: entity,
+    invoice_no: Ø,
+    invoice_type: Ø,
+    supplier_ref: Ø,
+    customer_ref: Ø,
+    invoice_date: Ø,
+    due_date: Ø,
+    net_amount: Ø,
+    tax_amount: Ø,
+    withholding_tax_amount: Ø,
+    gross_amount: Ø,
+    currency: Ø,
+    counterparty_vat_no: Ø,
+    place_of_supply: Ø,
+    vat_country: Ø,
+    swiss_qr_reference: Ø,
+    status: Ø,
+    source_document_ref: Ø
+}
+
+bill ≔ {
+    objectType: class,
+    extending: invoice,
+    bill_no: Ø,
+    payable_to_ref: Ø,
+    payable_from_ref: Ø,
+    payment_terms: Ø,
+    status: Ø
+}
+
+quotation ≔ {
+    objectType: class,
+    extending: invoice,
+    quotation_no: Ø,
+    valid_until: Ø,
+    quoted_by_ref: Ø,
+    quoted_to_ref: Ø,
+    status: Ø
+}
+
+invoice_line ≔ {
+    objectType: class,
+    extending: entity,
+    invoice_ref: Ø,
+    line_no: Ø,
+    product_ref: Ø,
+    description: Ø,
+    quantity: Ø,
+    unit_price: Ø,
+    net_amount: Ø,
+    tax_rate: Ø,
+    tax_amount: Ø,
+    account_ref: Ø
+}
+
+payment ≔ {
+    objectType: class,
+    extending: entity,
+    payment_no: Ø,
+    payment_type: Ø,
+    payer_ref: Ø,
+    payee_ref: Ø,
+    payment_date: Ø,
+    value_date: Ø,
+    amount: Ø,
+    currency: Ø,
+    method: Ø,
+    qr_iban: Ø,
+    qr_reference: Ø,
+    bank_reference: Ø,
+    clearing_status: Ø,
+    status: Ø
+}
+
+receipt ≔ {
+    objectType: class,
+    extending: payment,
+    receipt_no: Ø,
+    payment_method: Ø,
+    payment_reference: Ø,
+    payment_status: Ø
+}
+
+vat_return ≔ {
+    objectType: class,
+    extending: entity,
+    return_no: Ø,
+    legal_entity_ref: Ø,
+    vat_period_start: Ø,
+    vat_period_end: Ø,
+    filing_due_date: Ø,
+    filing_date: Ø,
+    net_tax_payable: Ø,
+    input_tax_credit: Ø,
+    currency: Ø,
+    status: Ø,
+    authority_ref: Ø
+}
+
+tax_declaration ≔ {
+    objectType: class,
+    extending: entity,
+    declaration_no: Ø,
+    declaration_type: Ø,
+    legal_entity_ref: Ø,
+    fiscal_year: Ø,
+    period_start: Ø,
+    period_end: Ø,
+    submission_date: Ø,
+    due_date: Ø,
+    assessed_amount: Ø,
+    currency: Ø,
+    authority_ref: Ø,
+    status: Ø
+}
+
+tax_form ≔ {
+    objectType: class,
+    extending: document,
+    form_no: Ø,
+    form_type: Ø,
+    period_start: Ø,
+    period_end: Ø,
+    filing_due_date: Ø,
+    status: Ø
+}
+
+social_contribution_report ≔ {
+    objectType: class,
+    extending: entity,
+    report_no: Ø,
+    legal_entity_ref: Ø,
+    period_start: Ø,
+    period_end: Ø,
+    ahv_total: Ø,
+    alv_total: Ø,
+    bvg_total: Ø,
+    uvg_total: Ø,
+    filing_date: Ø,
+    due_date: Ø,
+    authority_ref: Ø,
+    status: Ø
+}
+
+crm_lead ≔ {
+    objectType: class,
+    extending: entity,
+    lead_no: Ø,
+    source: Ø,
+    contact_person_ref: Ø,
+    company_ref: Ø,
+    owner_ref: Ø,
+    qualification_score: Ø,
+    status: Ø,
+    expected_value: Ø
+}
+
+crm_opportunity ≔ {
+    objectType: class,
+    extending: entity,
+    opportunity_no: Ø,
+    customer_ref: Ø,
+    owner_ref: Ø,
+    stage: Ø,
+    probability: Ø,
+    expected_close_date: Ø,
+    expected_revenue: Ø,
+    status: Ø
+}
+
+sales_order ≔ {
+    objectType: class,
+    extending: entity,
+    order_no: Ø,
+    customer_ref: Ø,
+    order_date: Ø,
+    requested_delivery_date: Ø,
+    total_amount: Ø,
+    currency: Ø,
+    status: Ø,
+    billing_address: Ø,
+    shipping_address: Ø
+}
+
+purchase_order ≔ {
+    objectType: class,
+    extending: entity,
+    order_no: Ø,
+    supplier_ref: Ø,
+    order_date: Ø,
+    expected_receipt_date: Ø,
+    total_amount: Ø,
+    currency: Ø,
+    status: Ø,
+    buyer_ref: Ø
+}
+
+order ≔ {
+    objectType: class,
+    extending: entity,
+    order_no: Ø,
+    order_type: Ø,
+    order_date: Ø,
+    customer_ref: Ø,
+    supplier_ref: Ø,
+    status: Ø
+}
+
+delivery ≔ {
+    objectType: class,
+    extending: entity,
+    delivery_no: Ø,
+    order_ref: Ø,
+    dispatch_date: Ø,
+    delivery_date: Ø,
+    carrier_ref: Ø,
+    status: Ø
+}
+
+employment_position ≔ {
+    objectType: class,
+    extending: entity,
+    position_code: Ø,
+    title: Ø,
+    department_ref: Ø,
+    reports_to_ref: Ø,
+    grade: Ø,
+    fte_budget: Ø,
+    location: Ø,
+    status: Ø
+}
+
+leave_request ≔ {
+    objectType: class,
+    extending: entity,
+    request_no: Ø,
+    employee_ref: Ø,
+    leave_type: Ø,
+    start_date: Ø,
+    end_date: Ø,
+    days_requested: Ø,
+    approver_ref: Ø,
+    status: Ø
+}
+
+payroll_record ≔ {
+    objectType: class,
+    extending: entity,
+    payroll_no: Ø,
+    employee_ref: Ø,
+    period_start: Ø,
+    period_end: Ø,
+    gross_pay: Ø,
+    deductions: Ø,
+    net_pay: Ø,
+    currency: Ø,
+    payment_date: Ø,
+    status: Ø
+}
+
+project ≔ {
+    objectType: class,
+    extending: entity,
+    project_code: Ø,
+    project_type: Ø,
+    sponsor_ref: Ø,
+    manager_ref: Ø,
+    customer_ref: Ø,
+    start_date: Ø,
+    end_date: Ø,
+    budget_amount: Ø,
+    currency: Ø,
+    status: Ø
+}
+
+project_task ≔ {
+    objectType: class,
+    extending: entity,
+    task_code: Ø,
+    project_ref: Ø,
+    task_name: Ø,
+    parent_task_ref: Ø,
+    assignee_ref: Ø,
+    planned_start: Ø,
+    planned_end: Ø,
+    actual_start: Ø,
+    actual_end: Ø,
+    planned_effort_hours: Ø,
+    actual_effort_hours: Ø,
+    status: Ø,
+    priority: Ø
+}
+
+project_milestone ≔ {
+    objectType: class,
+    extending: entity,
+    milestone_code: Ø,
+    project_ref: Ø,
+    target_date: Ø,
+    achieved_date: Ø,
+    acceptance_criteria: Ø,
+    status: Ø
+}
+
+project_risk ≔ {
+    objectType: class,
+    extending: entity,
+    risk_code: Ø,
+    project_ref: Ø,
+    category: Ø,
+    impact: Ø,
+    probability: Ø,
+    mitigation_plan: Ø,
+    owner_ref: Ø,
+    status: Ø
+}
+
+workflow_case ≔ {
+    objectType: class,
+    extending: entity,
+    case_no: Ø,
+    case_type: Ø,
+    subject_ref: Ø,
+    initiated_by_ref: Ø,
+    current_step: Ø,
+    sla_due_at: Ø,
+    status: Ø
+}
+
+approval ≔ {
+    objectType: class,
+    extending: entity,
+    approval_no: Ø,
+    case_ref: Ø,
+    approver_ref: Ø,
+    decision: Ø,
+    decision_at: Ø,
+    comment: Ø,
+    escalation_level: Ø
+}
+
+compliance_action ≔ {
+    objectType: class,
+    extending: entity,
+    action_no: Ø,
+    action_type: Ø,
+    authority_ref: Ø,
+    workflow_case_ref: Ø,
+    subject_ref: Ø,
+    responsible_party_ref: Ø,
+    legal_basis: Ø,
+    due_date: Ø,
+    due_date_key: Ø,
+    completion_date: Ø,
+    status: Ø,
+    priority: Ø,
+    escalation_level: Ø,
+    source_document_ref: Ø,
+    evidence_ref: Ø
+}
+
+is_active_employee_status(_employment_status) ⦃
+    ↲((_employment_status = active) ⋁ (_employment_status = on_probation) ⋁ (_employment_status = seconded))
+⦄
+
+employment_contract_is_effective(_contract_status) ⦃
+    ↲((_contract_status = active) ⋁ (_contract_status = signed) ⋁ (_contract_status = in_force))
+⦄
+
+employee_is_active(_employment_status, _contract_status) ⦃
+    ↲(is_active_employee_status(_employment_status) ⋀ employment_contract_is_effective(_contract_status))
+⦄
+
+journal_is_balanced(_debit_total, _credit_total) ⦃
+    ↲((_debit_total = _credit_total) ⋀ (_debit_total ≥ 0) ⋀ (_credit_total ≥ 0))
+⦄
+
+invoice_is_postable(_invoice_status, _has_supplier, _has_lines, _has_due_date) ⦃
+    ↲((_invoice_status = draft) ⋀ (_has_supplier = true) ⋀ (_has_lines = true) ⋀ (_has_due_date = true))
+⦄
+
+payment_is_postable(_payment_status, _amount, _currency) ⦃
+    ↲((_payment_status = ready) ⋀ (_amount > 0) ⋀ (_currency ≠ Ø))
+⦄
+
+approval_required_by_amount(_amount, _threshold) ⦃
+    ↲(_amount > _threshold)
+⦄
+
+task_can_start(_all_dependencies_done, _resource_available, _task_status) ⦃
+    ↲((_all_dependencies_done = true) ⋀ (_resource_available = true) ⋀ ((_task_status = open) ⋁ (_task_status = planned)))
+⦄
+
+project_is_on_track(_open_blocker_count, _late_critical_task_count) ⦃
+    ↲((_open_blocker_count = 0) ⋀ (_late_critical_task_count = 0))
+⦄
+
+opportunity_is_winnable(_stage, _probability, _expected_revenue) ⦃
+    ↲((_stage ≠ closed_lost) ⋀ (_probability > 0) ⋀ (_expected_revenue > 0))
+⦄
+
+stock_replenishment_needed(_quantity_on_hand, _quantity_reserved, _reorder_point) ⦃
+    ↲((_quantity_on_hand - _quantity_reserved) ≤ _reorder_point)
+⦄
+
+purchase_order_recommended(_supplier_status, _replenishment_needed) ⦃
+    ↲((_supplier_status = active) ⋀ (_replenishment_needed = true))
+⦄
+
+workflow_case_is_overdue(_status, _now_ts, _sla_due_ts) ⦃
+    ↲((_status ≠ closed) ⋀ (_status ≠ cancelled) ⋀ (_now_ts > _sla_due_ts))
+⦄
+
+approval_is_final(_decision, _escalation_level) ⦃
+    ↲(((_decision = approved) ⋁ (_decision = rejected)) ⋀ (_escalation_level = 0))
+⦄
+
+compliance_action_is_overdue(_status, _now_date_key, _due_date_key) ⦃
+    ↲((_status ≠ closed) ⋀ (_status ≠ completed) ⋀ (_status ≠ submitted) ⋀ (_status ≠ cancelled) ⋀ (_now_date_key > _due_date_key))
+⦄
+
+compliance_action_is_complete(_status) ⦃
+    ↲((_status = closed) ⋁ (_status = completed) ⋁ (_status = submitted))
+⦄
+
+compliance_action_requires_escalation(_status, _now_date_key, _due_date_key, _escalation_level, _max_escalation_level) ⦃
+    ↲(compliance_action_is_overdue(_status, _now_date_key, _due_date_key) ⋀ (_escalation_level < _max_escalation_level))
+⦄
+
+vat_return_is_consistent(_output_vat, _input_vat, _net_tax_payable) ⦃
+    ↲((_output_vat ≥ 0) ⋀ (_input_vat ≥ 0) ⋀ (_net_tax_payable = (_output_vat - _input_vat)))
+⦄
+
+social_contribution_totals_valid(_ahv_total, _alv_total, _bvg_total, _uvg_total) ⦃
+    ↲((_ahv_total ≥ 0) ⋀ (_alv_total ≥ 0) ⋀ (_bvg_total ≥ 0) ⋀ (_uvg_total ≥ 0))
+⦄
+
+employee_has_required_ch_identifiers(_ahv_number, _permit_type) ⦃
+    ↲((_ahv_number ≠ Ø) ⋀ (_permit_type ≠ Ø))
+⦄
+
+tax_declaration_is_complete(_has_financial_statements, _has_vat_return, _has_payroll_reports, _declaration_status) ⦃
+    ↲((_has_financial_statements = true) ⋀ (_has_vat_return = true) ⋀ (_has_payroll_reports = true) ⋀ ((_declaration_status = draft) ⋁ (_declaration_status = ready) ⋁ (_declaration_status = filed)))
+⦄
+
+tax_declaration_is_timely(_submission_date_key, _due_date_key) ⦃
+    ↲(_submission_date_key ≤ _due_date_key)
+⦄
+
+# Reference-indexed policy dictionaries (to be filled from DB/object layer)
+employee_status_by_ref ≔ {}
+employment_contract_status_by_ref ≔ {}
+invoice_status_by_ref ≔ {}
+invoice_has_supplier_by_ref ≔ {}
+invoice_has_lines_by_ref ≔ {}
+invoice_has_due_date_by_ref ≔ {}
+payment_status_by_ref ≔ {}
+payment_amount_by_ref ≔ {}
+payment_currency_by_ref ≔ {}
+task_dependencies_done_by_ref ≔ {}
+task_resource_available_by_ref ≔ {}
+task_status_by_ref ≔ {}
+project_open_blocker_count_by_ref ≔ {}
+project_late_critical_task_count_by_ref ≔ {}
+opportunity_stage_by_ref ≔ {}
+opportunity_probability_by_ref ≔ {}
+opportunity_expected_revenue_by_ref ≔ {}
+inventory_quantity_on_hand_by_ref ≔ {}
+inventory_quantity_reserved_by_ref ≔ {}
+inventory_reorder_point_by_ref ≔ {}
+supplier_status_by_ref ≔ {}
+replenishment_needed_by_ref ≔ {}
+workflow_case_status_by_ref ≔ {}
+workflow_case_sla_due_by_ref ≔ {}
+approval_decision_by_ref ≔ {}
+approval_escalation_level_by_ref ≔ {}
+compliance_action_status_by_ref ≔ {}
+compliance_action_due_date_key_by_ref ≔ {}
+compliance_action_escalation_level_by_ref ≔ {}
+vat_output_by_ref ≔ {}
+vat_input_by_ref ≔ {}
+vat_net_payable_by_ref ≔ {}
+social_ahv_by_ref ≔ {}
+social_alv_by_ref ≔ {}
+social_bvg_by_ref ≔ {}
+social_uvg_by_ref ≔ {}
+employee_ahv_number_by_ref ≔ {}
+employee_permit_type_by_ref ≔ {}
+tax_decl_has_financials_by_ref ≔ {}
+tax_decl_has_vat_return_by_ref ≔ {}
+tax_decl_has_payroll_by_ref ≔ {}
+tax_decl_status_by_ref ≔ {}
+tax_decl_submission_date_key_by_ref ≔ {}
+tax_decl_due_date_key_by_ref ≔ {}
+
+employee_is_active_by_ref(_employee_ref) ⦃
+    (_employment_status ≔ employee_status_by_ref[_employee_ref]) ⋀
+    (_contract_status ≔ employment_contract_status_by_ref[_employee_ref]) ⋀
+    ↲(employee_is_active(_employment_status, _contract_status))
+⦄
+
+invoice_is_postable_by_ref(_invoice_ref) ⦃
+    (_invoice_status ≔ invoice_status_by_ref[_invoice_ref]) ⋀
+    (_has_supplier ≔ invoice_has_supplier_by_ref[_invoice_ref]) ⋀
+    (_has_lines ≔ invoice_has_lines_by_ref[_invoice_ref]) ⋀
+    (_has_due_date ≔ invoice_has_due_date_by_ref[_invoice_ref]) ⋀
+    ↲(invoice_is_postable(_invoice_status, _has_supplier, _has_lines, _has_due_date))
+⦄
+
+payment_is_postable_by_ref(_payment_ref) ⦃
+    (_payment_status ≔ payment_status_by_ref[_payment_ref]) ⋀
+    (_amount ≔ payment_amount_by_ref[_payment_ref]) ⋀
+    (_currency ≔ payment_currency_by_ref[_payment_ref]) ⋀
+    ↲(payment_is_postable(_payment_status, _amount, _currency))
+⦄
+
+task_can_start_by_ref(_task_ref) ⦃
+    (_all_dependencies_done ≔ task_dependencies_done_by_ref[_task_ref]) ⋀
+    (_resource_available ≔ task_resource_available_by_ref[_task_ref]) ⋀
+    (_task_status ≔ task_status_by_ref[_task_ref]) ⋀
+    ↲(task_can_start(_all_dependencies_done, _resource_available, _task_status))
+⦄
+
+project_is_on_track_by_ref(_project_ref) ⦃
+    (_open_blocker_count ≔ project_open_blocker_count_by_ref[_project_ref]) ⋀
+    (_late_critical_task_count ≔ project_late_critical_task_count_by_ref[_project_ref]) ⋀
+    ↲(project_is_on_track(_open_blocker_count, _late_critical_task_count))
+⦄
+
+opportunity_is_winnable_by_ref(_opportunity_ref) ⦃
+    (_stage ≔ opportunity_stage_by_ref[_opportunity_ref]) ⋀
+    (_probability ≔ opportunity_probability_by_ref[_opportunity_ref]) ⋀
+    (_expected_revenue ≔ opportunity_expected_revenue_by_ref[_opportunity_ref]) ⋀
+    ↲(opportunity_is_winnable(_stage, _probability, _expected_revenue))
+⦄
+
+stock_replenishment_needed_by_ref(_inventory_ref) ⦃
+    (_quantity_on_hand ≔ inventory_quantity_on_hand_by_ref[_inventory_ref]) ⋀
+    (_quantity_reserved ≔ inventory_quantity_reserved_by_ref[_inventory_ref]) ⋀
+    (_reorder_point ≔ inventory_reorder_point_by_ref[_inventory_ref]) ⋀
+    ↲(stock_replenishment_needed(_quantity_on_hand, _quantity_reserved, _reorder_point))
+⦄
+
+purchase_order_recommended_by_ref(_supplier_ref, _inventory_ref) ⦃
+    (_supplier_status ≔ supplier_status_by_ref[_supplier_ref]) ⋀
+    (_replenishment_needed ≔ replenishment_needed_by_ref[_inventory_ref]) ⋀
+    ↲(purchase_order_recommended(_supplier_status, _replenishment_needed))
+⦄
+
+workflow_case_is_overdue_by_ref(_case_ref, _now_ts) ⦃
+    (_status ≔ workflow_case_status_by_ref[_case_ref]) ⋀
+    (_sla_due_ts ≔ workflow_case_sla_due_by_ref[_case_ref]) ⋀
+    ↲(workflow_case_is_overdue(_status, _now_ts, _sla_due_ts))
+⦄
+
+approval_is_final_by_ref(_approval_ref) ⦃
+    (_decision ≔ approval_decision_by_ref[_approval_ref]) ⋀
+    (_escalation_level ≔ approval_escalation_level_by_ref[_approval_ref]) ⋀
+    ↲(approval_is_final(_decision, _escalation_level))
+⦄
+
+compliance_action_is_overdue_by_ref(_action_ref, _now_date_key) ⦃
+    (_status ≔ compliance_action_status_by_ref[_action_ref]) ⋀
+    (_due_date_key ≔ compliance_action_due_date_key_by_ref[_action_ref]) ⋀
+    ↲(compliance_action_is_overdue(_status, _now_date_key, _due_date_key))
+⦄
+
+compliance_action_requires_escalation_by_ref(_action_ref, _now_date_key, _max_escalation_level) ⦃
+    (_status ≔ compliance_action_status_by_ref[_action_ref]) ⋀
+    (_due_date_key ≔ compliance_action_due_date_key_by_ref[_action_ref]) ⋀
+    (_escalation_level ≔ compliance_action_escalation_level_by_ref[_action_ref]) ⋀
+    ↲(compliance_action_requires_escalation(_status, _now_date_key, _due_date_key, _escalation_level, _max_escalation_level))
+⦄
+
+vat_return_is_consistent_by_ref(_vat_return_ref) ⦃
+    (_output_vat ≔ vat_output_by_ref[_vat_return_ref]) ⋀
+    (_input_vat ≔ vat_input_by_ref[_vat_return_ref]) ⋀
+    (_net_tax_payable ≔ vat_net_payable_by_ref[_vat_return_ref]) ⋀
+    ↲(vat_return_is_consistent(_output_vat, _input_vat, _net_tax_payable))
+⦄
+
+social_contribution_report_valid_by_ref(_report_ref) ⦃
+    (_ahv_total ≔ social_ahv_by_ref[_report_ref]) ⋀
+    (_alv_total ≔ social_alv_by_ref[_report_ref]) ⋀
+    (_bvg_total ≔ social_bvg_by_ref[_report_ref]) ⋀
+    (_uvg_total ≔ social_uvg_by_ref[_report_ref]) ⋀
+    ↲(social_contribution_totals_valid(_ahv_total, _alv_total, _bvg_total, _uvg_total))
+⦄
+
+employee_ch_identifiers_valid_by_ref(_employee_ref) ⦃
+    (_ahv_number ≔ employee_ahv_number_by_ref[_employee_ref]) ⋀
+    (_permit_type ≔ employee_permit_type_by_ref[_employee_ref]) ⋀
+    ↲(employee_has_required_ch_identifiers(_ahv_number, _permit_type))
+⦄
+
+tax_declaration_is_complete_by_ref(_tax_decl_ref) ⦃
+    (_has_financials ≔ tax_decl_has_financials_by_ref[_tax_decl_ref]) ⋀
+    (_has_vat_return ≔ tax_decl_has_vat_return_by_ref[_tax_decl_ref]) ⋀
+    (_has_payroll_reports ≔ tax_decl_has_payroll_by_ref[_tax_decl_ref]) ⋀
+    (_decl_status ≔ tax_decl_status_by_ref[_tax_decl_ref]) ⋀
+    ↲(tax_declaration_is_complete(_has_financials, _has_vat_return, _has_payroll_reports, _decl_status))
+⦄
+
+tax_declaration_is_timely_by_ref(_tax_decl_ref) ⦃
+    (_submission_date_key ≔ tax_decl_submission_date_key_by_ref[_tax_decl_ref]) ⋀
+    (_due_date_key ≔ tax_decl_due_date_key_by_ref[_tax_decl_ref]) ⋀
+    ↲(tax_declaration_is_timely(_submission_date_key, _due_date_key))
+⦄
+
+children_snapshot_by_parent_ref ≔ {}
+children_count_by_parent_ref ≔ {}
+
+children_snapshot_ready(_parent_ref) ⦃
+    (_children_snapshot ≔ children_snapshot_by_parent_ref[_parent_ref]) ⋀
+    ↲(_children_snapshot ≠ Ø)
+⦄
+
+children_count_available(_parent_ref) ⦃
+    (_children_count ≔ children_count_by_parent_ref[_parent_ref]) ⋀
+    ↲(_children_count ≥ 0)
+⦄
+
+children_for_allowance_by_ref(_parent_ref) ⦃
+    ↲(children_snapshot_by_parent_ref[_parent_ref])
+⦄
+
+child_allowance_input_complete(_parent_ref) ⦃
+    ↲(children_snapshot_ready(_parent_ref) ⋀ children_count_available(_parent_ref))
+⦄
+
+child_allowance_children_count(_parent_ref) ⦃
+    (_children_count ≔ children_count_by_parent_ref[_parent_ref]) ⋀
+    ↲(_children_count)
+⦄
+
+child_allowance_children_snapshot(_parent_ref) ⦃
+    (_children_snapshot ≔ children_snapshot_by_parent_ref[_parent_ref]) ⋀
+    ↲(_children_snapshot)
+⦄
+
+# Adapter helpers for ADK/DB integration
+# These helpers let the agent hydrate map-based policy signals and run checks in one call.
+
+reset_policy_maps() ⦃
+    (employee_status_by_ref ≔ {}) ⋀
+    (employment_contract_status_by_ref ≔ {}) ⋀
+    (invoice_status_by_ref ≔ {}) ⋀
+    (invoice_has_supplier_by_ref ≔ {}) ⋀
+    (invoice_has_lines_by_ref ≔ {}) ⋀
+    (invoice_has_due_date_by_ref ≔ {}) ⋀
+    (payment_status_by_ref ≔ {}) ⋀
+    (payment_amount_by_ref ≔ {}) ⋀
+    (payment_currency_by_ref ≔ {}) ⋀
+    (task_dependencies_done_by_ref ≔ {}) ⋀
+    (task_resource_available_by_ref ≔ {}) ⋀
+    (task_status_by_ref ≔ {}) ⋀
+    (project_open_blocker_count_by_ref ≔ {}) ⋀
+    (project_late_critical_task_count_by_ref ≔ {}) ⋀
+    (opportunity_stage_by_ref ≔ {}) ⋀
+    (opportunity_probability_by_ref ≔ {}) ⋀
+    (opportunity_expected_revenue_by_ref ≔ {}) ⋀
+    (inventory_quantity_on_hand_by_ref ≔ {}) ⋀
+    (inventory_quantity_reserved_by_ref ≔ {}) ⋀
+    (inventory_reorder_point_by_ref ≔ {}) ⋀
+    (supplier_status_by_ref ≔ {}) ⋀
+    (replenishment_needed_by_ref ≔ {}) ⋀
+    (workflow_case_status_by_ref ≔ {}) ⋀
+    (workflow_case_sla_due_by_ref ≔ {}) ⋀
+    (approval_decision_by_ref ≔ {}) ⋀
+    (approval_escalation_level_by_ref ≔ {}) ⋀
+    (compliance_action_status_by_ref ≔ {}) ⋀
+    (compliance_action_due_date_key_by_ref ≔ {}) ⋀
+    (compliance_action_escalation_level_by_ref ≔ {}) ⋀
+    (vat_output_by_ref ≔ {}) ⋀
+    (vat_input_by_ref ≔ {}) ⋀
+    (vat_net_payable_by_ref ≔ {}) ⋀
+    (social_ahv_by_ref ≔ {}) ⋀
+    (social_alv_by_ref ≔ {}) ⋀
+    (social_bvg_by_ref ≔ {}) ⋀
+    (social_uvg_by_ref ≔ {}) ⋀
+    (employee_ahv_number_by_ref ≔ {}) ⋀
+    (employee_permit_type_by_ref ≔ {}) ⋀
+    (tax_decl_has_financials_by_ref ≔ {}) ⋀
+    (tax_decl_has_vat_return_by_ref ≔ {}) ⋀
+    (tax_decl_has_payroll_by_ref ≔ {}) ⋀
+    (tax_decl_status_by_ref ≔ {}) ⋀
+    (tax_decl_submission_date_key_by_ref ≔ {}) ⋀
+    (tax_decl_due_date_key_by_ref ≔ {}) ⋀
+    (children_snapshot_by_parent_ref ≔ {}) ⋀
+    (children_count_by_parent_ref ≔ {}) ⋀
+    ↲(true)
+⦄
+
+adk_seed_employee_policy(_employee_ref, _employment_status, _contract_status) ⦃
+    (employee_status_by_ref[_employee_ref] ≔ _employment_status) ⋀
+    (employment_contract_status_by_ref[_employee_ref] ≔ _contract_status) ⋀
+    ↲(true)
+⦄
+
+adk_seed_invoice_policy(_invoice_ref, _invoice_status, _has_supplier, _has_lines, _has_due_date) ⦃
+    (invoice_status_by_ref[_invoice_ref] ≔ _invoice_status) ⋀
+    (invoice_has_supplier_by_ref[_invoice_ref] ≔ _has_supplier) ⋀
+    (invoice_has_lines_by_ref[_invoice_ref] ≔ _has_lines) ⋀
+    (invoice_has_due_date_by_ref[_invoice_ref] ≔ _has_due_date) ⋀
+    ↲(true)
+⦄
+
+adk_seed_payment_policy(_payment_ref, _payment_status, _amount, _currency) ⦃
+    (payment_status_by_ref[_payment_ref] ≔ _payment_status) ⋀
+    (payment_amount_by_ref[_payment_ref] ≔ _amount) ⋀
+    (payment_currency_by_ref[_payment_ref] ≔ _currency) ⋀
+    ↲(true)
+⦄
+
+adk_seed_task_policy(_task_ref, _dependencies_done, _resource_available, _task_status) ⦃
+    (task_dependencies_done_by_ref[_task_ref] ≔ _dependencies_done) ⋀
+    (task_resource_available_by_ref[_task_ref] ≔ _resource_available) ⋀
+    (task_status_by_ref[_task_ref] ≔ _task_status) ⋀
+    ↲(true)
+⦄
+
+adk_seed_project_policy(_project_ref, _open_blockers, _late_critical_tasks) ⦃
+    (project_open_blocker_count_by_ref[_project_ref] ≔ _open_blockers) ⋀
+    (project_late_critical_task_count_by_ref[_project_ref] ≔ _late_critical_tasks) ⋀
+    ↲(true)
+⦄
+
+adk_seed_approval_policy(_approval_ref, _decision, _escalation_level) ⦃
+    (approval_decision_by_ref[_approval_ref] ≔ _decision) ⋀
+    (approval_escalation_level_by_ref[_approval_ref] ≔ _escalation_level) ⋀
+    ↲(true)
+⦄
+
+adk_seed_compliance_action_policy(_action_ref, _status, _due_date_key, _escalation_level) ⦃
+    (compliance_action_status_by_ref[_action_ref] ≔ _status) ⋀
+    (compliance_action_due_date_key_by_ref[_action_ref] ≔ _due_date_key) ⋀
+    (compliance_action_escalation_level_by_ref[_action_ref] ≔ _escalation_level) ⋀
+    ↲(true)
+⦄
+
+adk_seed_vat_return_policy(_vat_return_ref, _output_vat, _input_vat, _net_tax_payable) ⦃
+    (vat_output_by_ref[_vat_return_ref] ≔ _output_vat) ⋀
+    (vat_input_by_ref[_vat_return_ref] ≔ _input_vat) ⋀
+    (vat_net_payable_by_ref[_vat_return_ref] ≔ _net_tax_payable) ⋀
+    ↲(true)
+⦄
+
+adk_seed_social_report_policy(_report_ref, _ahv_total, _alv_total, _bvg_total, _uvg_total) ⦃
+    (social_ahv_by_ref[_report_ref] ≔ _ahv_total) ⋀
+    (social_alv_by_ref[_report_ref] ≔ _alv_total) ⋀
+    (social_bvg_by_ref[_report_ref] ≔ _bvg_total) ⋀
+    (social_uvg_by_ref[_report_ref] ≔ _uvg_total) ⋀
+    ↲(true)
+⦄
+
+adk_seed_employee_ch_id_policy(_employee_ref, _ahv_number, _permit_type) ⦃
+    (employee_ahv_number_by_ref[_employee_ref] ≔ _ahv_number) ⋀
+    (employee_permit_type_by_ref[_employee_ref] ≔ _permit_type) ⋀
+    ↲(true)
+⦄
+
+adk_seed_tax_declaration_policy(_tax_decl_ref, _has_financials, _has_vat_return, _has_payroll_reports, _decl_status, _submission_date_key, _due_date_key) ⦃
+    (tax_decl_has_financials_by_ref[_tax_decl_ref] ≔ _has_financials) ⋀
+    (tax_decl_has_vat_return_by_ref[_tax_decl_ref] ≔ _has_vat_return) ⋀
+    (tax_decl_has_payroll_by_ref[_tax_decl_ref] ≔ _has_payroll_reports) ⋀
+    (tax_decl_status_by_ref[_tax_decl_ref] ≔ _decl_status) ⋀
+    (tax_decl_submission_date_key_by_ref[_tax_decl_ref] ≔ _submission_date_key) ⋀
+    (tax_decl_due_date_key_by_ref[_tax_decl_ref] ≔ _due_date_key) ⋀
+    ↲(true)
+⦄
+
+adk_seed_children_snapshot_policy(_parent_ref, _children_snapshot, _children_count) ⦃
+    (children_snapshot_by_parent_ref[_parent_ref] ≔ _children_snapshot) ⋀
+    (children_count_by_parent_ref[_parent_ref] ≔ _children_count) ⋀
+    ↲(true)
+⦄
+
+adk_check_employee_active(_employee_ref, _employment_status, _contract_status) ⦃
+    adk_seed_employee_policy(_employee_ref, _employment_status, _contract_status) ⋀
+    ↲(employee_is_active(_employment_status, _contract_status))
+⦄
+
+adk_check_invoice_postable(_invoice_ref, _invoice_status, _has_supplier, _has_lines, _has_due_date) ⦃
+    adk_seed_invoice_policy(_invoice_ref, _invoice_status, _has_supplier, _has_lines, _has_due_date) ⋀
+    ↲(invoice_is_postable(_invoice_status, _has_supplier, _has_lines, _has_due_date))
+⦄
+
+adk_check_payment_postable(_payment_ref, _payment_status, _amount, _currency) ⦃
+    adk_seed_payment_policy(_payment_ref, _payment_status, _amount, _currency) ⋀
+    ↲(payment_is_postable(_payment_status, _amount, _currency))
+⦄
+
+adk_check_task_startable(_task_ref, _dependencies_done, _resource_available, _task_status) ⦃
+    adk_seed_task_policy(_task_ref, _dependencies_done, _resource_available, _task_status) ⋀
+    ↲(task_can_start(_dependencies_done, _resource_available, _task_status))
+⦄
+
+adk_check_project_on_track(_project_ref, _open_blockers, _late_critical_tasks) ⦃
+    adk_seed_project_policy(_project_ref, _open_blockers, _late_critical_tasks) ⋀
+    ↲(project_is_on_track(_open_blockers, _late_critical_tasks))
+⦄
+
+adk_check_approval_final(_approval_ref, _decision, _escalation_level) ⦃
+    adk_seed_approval_policy(_approval_ref, _decision, _escalation_level) ⋀
+    ↲(approval_is_final(_decision, _escalation_level))
+⦄
+
+adk_check_compliance_action_status(_action_ref, _status, _due_date_key, _escalation_level, _now_date_key, _max_escalation_level) ⦃
+    adk_seed_compliance_action_policy(_action_ref, _status, _due_date_key, _escalation_level) ⋀
+    (_complete_ok ≔ compliance_action_is_complete(_status)) ⋀
+    (_escalation_ok ≔ compliance_action_requires_escalation(_status, _now_date_key, _due_date_key, _escalation_level, _max_escalation_level)) ⋀
+    ↲((_complete_ok = true) ⋁ (_escalation_ok = true))
+⦄
+
+adk_check_vat_return_consistent(_vat_return_ref, _output_vat, _input_vat, _net_tax_payable) ⦃
+    adk_seed_vat_return_policy(_vat_return_ref, _output_vat, _input_vat, _net_tax_payable) ⋀
+    ↲(vat_return_is_consistent(_output_vat, _input_vat, _net_tax_payable))
+⦄
+
+adk_check_social_report_valid(_report_ref, _ahv_total, _alv_total, _bvg_total, _uvg_total) ⦃
+    adk_seed_social_report_policy(_report_ref, _ahv_total, _alv_total, _bvg_total, _uvg_total) ⋀
+    ↲(social_contribution_totals_valid(_ahv_total, _alv_total, _bvg_total, _uvg_total))
+⦄
+
+adk_check_employee_ch_identifiers(_employee_ref, _ahv_number, _permit_type) ⦃
+    adk_seed_employee_ch_id_policy(_employee_ref, _ahv_number, _permit_type) ⋀
+    ↲(employee_has_required_ch_identifiers(_ahv_number, _permit_type))
+⦄
+
+adk_check_tax_declaration_compliance(_tax_decl_ref, _has_financials, _has_vat_return, _has_payroll_reports, _decl_status, _submission_date_key, _due_date_key) ⦃
+    adk_seed_tax_declaration_policy(_tax_decl_ref, _has_financials, _has_vat_return, _has_payroll_reports, _decl_status, _submission_date_key, _due_date_key) ⋀
+    (_complete_ok ≔ tax_declaration_is_complete(_has_financials, _has_vat_return, _has_payroll_reports, _decl_status)) ⋀
+    (_timely_ok ≔ tax_declaration_is_timely(_submission_date_key, _due_date_key)) ⋀
+    ↲((_complete_ok = true) ⋀ (_timely_ok = true))
+⦄
+
+adk_check_children_snapshot_ready(_parent_ref, _children_snapshot, _children_count) ⦃
+    adk_seed_children_snapshot_policy(_parent_ref, _children_snapshot, _children_count) ⋀
+    ↲(child_allowance_input_complete(_parent_ref))
+⦄
+
+run_regression_checks() ⦃
+    reset_policy_maps() ⋀
+    (_invoice_ok ≔ adk_check_invoice_postable(INV_DEMO_1, draft, true, true, true)) ⋀
+    (_payment_ok ≔ adk_check_payment_postable(PAY_DEMO_1, ready, 1000, CHF)) ⋀
+    (_employee_ok ≔ adk_check_employee_active(EMP_DEMO_1, active, active)) ⋀
+    (_task_ok ≔ adk_check_task_startable(TASK_DEMO_1, true, true, open)) ⋀
+    (_project_ok ≔ adk_check_project_on_track(PROJ_DEMO_1, 0, 0)) ⋀
+    (_approval_ok ≔ adk_check_approval_final(APR_DEMO_1, approved, 0)) ⋀
+    (_compliance_action_ok ≔ adk_check_compliance_action_status(CA_DEMO_1, open, 20260415, 0, 20260420, 2)) ⋀
+    (_vat_ok ≔ adk_check_vat_return_consistent(VAT_DEMO_1, 1200, 200, 1000)) ⋀
+    (_social_ok ≔ adk_check_social_report_valid(SOC_DEMO_1, 500, 80, 300, 120)) ⋀
+    (_employee_id_ok ≔ adk_check_employee_ch_identifiers(EMP_DEMO_1, AHV_756_1234_5678_97, B)) ⋀
+    (_tax_decl_ok ≔ adk_check_tax_declaration_compliance(TAX_DECL_DEMO_1, true, true, true, ready, 20260320, 20260331)) ⋀
+    (_children_ok ≔ adk_check_children_snapshot_ready(EMP_DEMO_1, [("Child One", 20160101), ("Child Two", 20190314)], 2)) ⋀
+    ↲({
+        invoice_postable: _invoice_ok,
+        payment_postable: _payment_ok,
+        employee_active: _employee_ok,
+        task_startable: _task_ok,
+        project_on_track: _project_ok,
+        approval_final: _approval_ok,
+        compliance_action_ready: _compliance_action_ok,
+        vat_consistent: _vat_ok,
+        social_report_valid: _social_ok,
+        employee_ch_identifiers: _employee_id_ok,
+        tax_declaration_compliant: _tax_decl_ok,
+        children_snapshot_ready: _children_ok
+    })
+⦄
+
+regression_examples ≔ {
+    smoke: "(_smoke ≔ run_regression_checks())",
+    invoice_postable: "(_invoice_ok ≔ adk_check_invoice_postable(INV_1, draft, true, true, true))",
+    payment_postable: "(_payment_ok ≔ adk_check_payment_postable(PAY_1, ready, 2500, CHF))",
+    employee_active: "(_employee_ok ≔ adk_check_employee_active(EMP_1, active, signed))",
+    task_startable: "(_task_ok ≔ adk_check_task_startable(TASK_1, true, true, planned))",
+    project_on_track: "(_project_ok ≔ adk_check_project_on_track(PROJ_1, 1, 0))",
+    approval_final: "(_approval_ok ≔ adk_check_approval_final(APR_1, approved, 0))",
+    compliance_action_ready: "(_ca_ok ≔ adk_check_compliance_action_status(CA_1, open, 20260415, 0, 20260420, 2))",
+    vat_consistent: "(_vat_ok ≔ adk_check_vat_return_consistent(VAT_1, 1500, 500, 1000))",
+    social_report_valid: "(_social_ok ≔ adk_check_social_report_valid(SOC_1, 500, 80, 300, 120))",
+    employee_ch_identifiers: "(_emp_id_ok ≔ adk_check_employee_ch_identifiers(EMP_1, AHV_756_1111_2222_33, B))",
+    tax_declaration_compliant: "(_tax_ok ≔ adk_check_tax_declaration_compliance(TAX_1, true, true, true, ready, 20260320, 20260331))",
+    children_snapshot_ready: "(_children_ok ≔ adk_check_children_snapshot_ready(EMP_1, [(\"Child One\", 20160101), (\"Child Two\", 20190314)], 2))"
+}
+
+# ---------------------------------------------------------------------------
+# Interaction Type 6: Simulation & What-If Analysis predicates
+# ---------------------------------------------------------------------------
+
+scenario_cloned(_project_id, _scenario_id, _modifications) ⦃
+    ↲({
+        interaction_type: simulation_what_if,
+        event: scenario_cloned,
+        project_id: _project_id,
+        scenario_id: _scenario_id,
+        modifications: _modifications,
+        status: tracked
+    })
+⦄
+
+schedule_simulation_result(_scenario_id, _duration, _conflicts, _utilization) ⦃
+    ↲({
+        interaction_type: simulation_what_if,
+        event: schedule_simulation_result,
+        scenario_id: _scenario_id,
+        duration_days: _duration,
+        conflict_count: _conflicts,
+        resource_utilization_percent: _utilization,
+        status: analyzed
+    })
+⦄
+
+budget_impact(_scenario_id, _baseline, _modified, _delta_percent) ⦃
+    ↲({
+        interaction_type: simulation_what_if,
+        event: budget_impact,
+        scenario_id: _scenario_id,
+        baseline_budget: _baseline,
+        modified_budget: _modified,
+        delta_percent: _delta_percent,
+        status: analyzed
+    })
+⦄
+
+scenario_comparison(_scenario1, _scenario2, _recommendation) ⦃
+    ↲({
+        interaction_type: simulation_what_if,
+        event: scenario_comparison,
+        scenario_1: _scenario1,
+        scenario_2: _scenario2,
+        recommendation: _recommendation,
+        status: completed
+    })
+⦄
+
+

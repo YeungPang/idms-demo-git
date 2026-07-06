@@ -1,0 +1,224 @@
+# ---------------------------------------------------------------------------
+# SOLF Predicates for What-If Analysis & Scenario Simulation (Interaction Type 6)
+# ---------------------------------------------------------------------------
+#
+# These predicates capture the outcomes of scenario simulation and what-if analysis
+# operations, enabling reasoning about project planning alternatives.
+#
+# For use in interaction.py monitor_command() or autonomous planning contexts.
+# ---------------------------------------------------------------------------
+
+# Scenario Creation Predicate
+scenario_cloned(_project_id, _scenario_id, _scenario_name, _modifications) ⦃
+    (_project_id > 0) ⋀
+    (_scenario_id > 0) ⋀
+    (_scenario_name ≠ "") ⋀
+    ↲({
+        type: scenario_event,
+        event: scenario_created,
+        project_id: _project_id,
+        scenario_id: _scenario_id,
+        scenario_name: _scenario_name,
+        modifications_count: length(_modifications),
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# Schedule Simulation Result Predicate
+schedule_simulation_result(_scenario_id, _critical_path_duration, _resource_utilization, _conflicts) ⦃
+    (_scenario_id > 0) ⋀
+    (_critical_path_duration > 0) ⋀
+    (_resource_utilization >= 0) ⋀
+    (_resource_utilization <= 100) ⋀
+    ↲({
+        type: simulation_result,
+        event: schedule_simulated,
+        scenario_id: _scenario_id,
+        critical_path_duration_days: _critical_path_duration,
+        resource_utilization_percent: _resource_utilization,
+        conflict_count: length(_conflicts),
+        has_conflicts: (length(_conflicts) > 0),
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# Budget Impact Calculation Predicate
+budget_impact_calculated(_scenario_id, _baseline_budget, _modified_budget, _delta_percent) ⦃
+    (_scenario_id > 0) ⋀
+    (_baseline_budget >= 0) ⋀
+    (_modified_budget >= 0) ⋀
+    ↲({
+        type: simulation_result,
+        event: budget_impact_calculated,
+        scenario_id: _scenario_id,
+        baseline_budget: _baseline_budget,
+        modified_budget: _modified_budget,
+        delta_percent: _delta_percent,
+        delta_direction: ((_delta_percent > 0) ⊙ increase | (_delta_percent < 0) ⊙ decrease | neutral),
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# Scenario Comparison Result Predicate
+scenario_comparison_result(_base_scenario_id, _compare_scenario_id, _duration_delta, _budget_delta, _recommendation) ⦃
+    (_base_scenario_id > 0) ⋀
+    (_compare_scenario_id > 0) ⋀
+    (_base_scenario_id ≠ _compare_scenario_id) ⋀
+    ↲({
+        type: comparison_result,
+        event: scenario_compared,
+        base_scenario_id: _base_scenario_id,
+        comparison_scenario_id: _compare_scenario_id,
+        duration_delta_days: _duration_delta,
+        budget_delta_percent: _budget_delta,
+        recommendation: _recommendation,
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# What-If Analysis Recommendation Predicate
+whatif_recommendation(_scenario_id, _recommendation_type, _reason, _impact_level) ⦃
+    (_scenario_id > 0) ⋀
+    ((_recommendation_type = "optimize") ⋁ (_recommendation_type = "accelerate") ⋁ (_recommendation_type = "balance") ⋁ (_recommendation_type = "risk_mitigate")) ⋀
+    ((_impact_level = "high") ⋁ (_impact_level = "medium") ⋁ (_impact_level = "low")) ⋀
+    ↲({
+        type: recommendation,
+        event: whatif_recommendation_generated,
+        scenario_id: _scenario_id,
+        recommendation_type: _recommendation_type,
+        reason: _reason,
+        impact_level: _impact_level,
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# Resource Conflict Detection Predicate
+resource_conflict_detected(_scenario_id, _resource_id, _conflicting_task_ids, _conflict_duration) ⦃
+    (_scenario_id > 0) ⋀
+    (_resource_id > 0) ⋀
+    (length(_conflicting_task_ids) >= 2) ⋀
+    (_conflict_duration > 0) ⋀
+    ↲({
+        type: conflict,
+        event: resource_conflict_detected,
+        scenario_id: _scenario_id,
+        resource_id: _resource_id,
+        conflicting_task_count: length(_conflicting_task_ids),
+        conflict_duration_days: _conflict_duration,
+        severity: ((length(_conflicting_task_ids) > 3) ⊙ critical | (length(_conflicting_task_ids) > 1) ⊙ high | medium),
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# Schedule Feasibility Assessment Predicate
+schedule_feasibility_assessment(_scenario_id, _is_feasible, _critical_issues, _warnings) ⦃
+    (_scenario_id > 0) ⋀
+    ↲({
+        type: assessment,
+        event: schedule_feasibility_assessed,
+        scenario_id: _scenario_id,
+        is_feasible: _is_feasible,
+        critical_issue_count: length(_critical_issues),
+        warning_count: length(_warnings),
+        feasibility_status: (_is_feasible ⊙ feasible | infeasible),
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# Scenario Optimization Suggestion Predicate
+scenario_optimization_suggestion(_scenario_id, _optimization_opportunity, _estimated_savings, _implementation_effort) ⦃
+    (_scenario_id > 0) ⋀
+    ↲({
+        type: optimization,
+        event: optimization_opportunity_identified,
+        scenario_id: _scenario_id,
+        opportunity: _optimization_opportunity,
+        estimated_savings: _estimated_savings,
+        implementation_effort_hours: _implementation_effort,
+        roi: (_estimated_savings > 0 ⊙ (_estimated_savings / _implementation_effort) | 0),
+        timestamp: now(),
+        interaction_type: 6
+    })
+⦄
+
+# Interaction Type 6 Query Pattern Predicates
+interaction_6_query_analyze_alternatives(_project_id, _alternatives_count) ⦃
+    (_project_id > 0) ⋀
+    (_alternatives_count >= 1) ⋀
+    ↲({
+        interaction_type: 6,
+        query_pattern: analyze_alternatives,
+        project_id: _project_id,
+        alternative_scenarios_count: _alternatives_count,
+        analysis_timestamp: now()
+    })
+⦄
+
+interaction_6_query_impact_assessment(_scenario_id, _metrics_evaluated) ⦃
+    (_scenario_id > 0) ⋀
+    ↲({
+        interaction_type: 6,
+        query_pattern: impact_assessment,
+        scenario_id: _scenario_id,
+        metrics_evaluated: length(_metrics_evaluated),
+        assessment_timestamp: now()
+    })
+⦄
+
+interaction_6_query_feasibility_check(_scenario_id, _issues_found) ⦃
+    (_scenario_id > 0) ⋀
+    ↲({
+        interaction_type: 6,
+        query_pattern: feasibility_check,
+        scenario_id: _scenario_id,
+        issues_found: _issues_found,
+        check_timestamp: now()
+    })
+⦄
+
+interaction_6_action_create_scenario(_project_id, _scenario_name, _modifications_applied) ⦃
+    (_project_id > 0) ⋀
+    (_scenario_name ≠ "") ⋀
+    (_modifications_applied >= 1) ⋀
+    ↲({
+        interaction_type: 6,
+        action: create_scenario,
+        project_id: _project_id,
+        scenario_name: _scenario_name,
+        modification_count: _modifications_applied,
+        action_timestamp: now()
+    })
+⦄
+
+interaction_6_action_compare_scenarios(_scenario1_id, _scenario2_id, _comparison_results) ⦃
+    (_scenario1_id > 0) ⋀
+    (_scenario2_id > 0) ⋀
+    (_scenario1_id ≠ _scenario2_id) ⋀
+    ↲({
+        interaction_type: 6,
+        action: compare_scenarios,
+        scenario1_id: _scenario1_id,
+        scenario2_id: _scenario2_id,
+        comparison_metrics: length(_comparison_results),
+        action_timestamp: now()
+    })
+⦄
+
+interaction_6_action_simulate_schedule(_scenario_id, _simulation_complete) ⦃
+    (_scenario_id > 0) ⋀
+    (_simulation_complete = true) ⋀
+    ↲({
+        interaction_type: 6,
+        action: simulate_schedule,
+        scenario_id: _scenario_id,
+        simulation_status: complete,
+        action_timestamp: now()
+    })
+⦄
