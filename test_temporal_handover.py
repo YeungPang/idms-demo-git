@@ -117,3 +117,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_temporal_handover_module_smoke() -> None:
+    assert callable(run_temporal_handover_test)
+    assert callable(_print_result)

@@ -167,8 +167,17 @@ input_json = """
 """
 
 
-client_openai = OpenAI(api_key=OPENAI_API_KEY)
-qdrant = QdrantClient(url=QDRANT_URL, api_key=os.getenv("QDRANT_API_KEY"))
+def test_qdrant_module_smoke() -> None:
+    assert isinstance(QDRANT_COLLECTION, str)
+    assert bool(DENSE_MODEL.strip())
+
+
+def _get_openai_client() -> OpenAI:
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+def _get_qdrant_client() -> QdrantClient:
+    return QdrantClient(url=QDRANT_URL, api_key=os.getenv("QDRANT_API_KEY"))
 
 
 def stable_token_index(token: str) -> int:
@@ -189,11 +198,12 @@ def encode_sparse(text: str) -> tuple[list[int], list[float]]:
 
 
 def embed_text(text: str) -> list[float]:
-    response = client_openai.embeddings.create(model=DENSE_MODEL, input=text)
+    response = _get_openai_client().embeddings.create(model=DENSE_MODEL, input=text)
     return response.data[0].embedding
 
 
 def ensure_qdrant_collection(collection_name: str = QDRANT_COLLECTION) -> None:
+    qdrant = _get_qdrant_client()
     existing = {c.name for c in qdrant.get_collections().collections}
     if collection_name not in existing:
         qdrant.create_collection(
@@ -237,6 +247,7 @@ def upsert_dense_vectors_batch(
     items: list[dict],
     collection_name: str = QDRANT_COLLECTION,
 ) -> list[str]:
+    qdrant = _get_qdrant_client()
     points: list[PointStruct] = []
     point_ids: list[str] = []
     for item in items:
@@ -258,6 +269,7 @@ def upsert_sparse_vectors_batch(
     items: list[dict],
     collection_name: str = QDRANT_COLLECTION,
 ) -> list[str]:
+    qdrant = _get_qdrant_client()
     points: list[PointStruct] = []
     point_ids: list[str] = []
     for item in items:

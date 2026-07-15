@@ -8,7 +8,10 @@ Covers:
 """
 
 import unittest
+import uuid
+from pathlib import Path
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import business_rules
@@ -143,6 +146,681 @@ class TestInteractionPartialTypes(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["operation"], "update")
         self.assertIn("SQL update failed", result["message"])
+
+    def test_perform_action_update_entity_natural_key_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_update_entity",
+            "sql_builder": "sql_plan_update_entity_by_natural_key",
+            "args": {
+                "entity_type": "company",
+                "natural_key_field": "name",
+                "natural_key_value": "Aphotonix",
+                "field": "eori_no",
+                "new_value": "CH123",
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "update",
+            "table": "company",
+            "where": {"name": "Aphotonix"},
+            "values": {"eori_no": "CH123"},
+            "returning": ["id"],
+        })
+        tools._resolve_merge_entity_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "Aphotonix",
+            "candidates": [{"name": "Aphotonix GmbH", "object_id": 33}],
+        })
+        tools._create_update_action_clarification = MagicMock(return_value={
+            "action": "update_entity",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 27,
+            "clarification_question": "choose entity",
+            "candidates": [{"name": "Aphotonix GmbH", "object_id": 33}],
+            "message": "choose entity",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "update_entity",
+            {
+                "entity_type": "company",
+                "natural_key_field": "name",
+                "natural_key_value": "Aphotonix",
+                "field": "eori_no",
+                "new_value": "CH123",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 27)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_retrieve_document_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_retrieve_document_file",
+            "sql_builder": "sql_plan_retrieve_document_by_doc_name",
+            "args": {"doc_name": "invoice april"},
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "select",
+            "table": "document",
+            "where": {"doc_name": "invoice april"},
+        })
+        tools._resolve_document_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "invoice april",
+            "candidates": [{"name": "Invoice-April-2026", "doc_id": 101}],
+        })
+        tools._create_retrieve_action_clarification = MagicMock(return_value={
+            "action": "retrieve_document_file",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 31,
+            "clarification_question": "choose document",
+            "candidates": [{"name": "Invoice-April-2026", "doc_id": 101}],
+            "message": "choose document",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "retrieve_document_file",
+            {
+                "doc_name": "invoice april",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 31)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_assign_task_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_assign_task",
+            "sql_builder": "sql_plan_assign_task",
+            "args": {
+                "task_name": "monthly close",
+                "assigned_to": 88,
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "update",
+            "table": "project_tasks",
+            "where": {"name": "monthly close"},
+            "values": {"assigned_to": 88, "status": "in_progress"},
+            "returning": ["id"],
+        })
+        tools._resolve_task_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "monthly close",
+            "candidates": [{"name": "Monthly Close - EU", "task_id": 12}],
+        })
+        tools._create_task_action_clarification = MagicMock(return_value={
+            "action": "assign_task",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 44,
+            "clarification_question": "choose task",
+            "candidates": [{"name": "Monthly Close - EU", "task_id": 12}],
+            "message": "choose task",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "assign_task",
+            {
+                "task_name": "monthly close",
+                "assigned_to": 88,
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 44)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_close_task_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_close_task",
+            "sql_builder": "sql_plan_close_task",
+            "args": {
+                "task_name": "monthly close",
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "update",
+            "table": "project_tasks",
+            "where": {"name": "monthly close"},
+            "values": {"status": "done"},
+            "returning": ["id"],
+        })
+        tools._resolve_task_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "monthly close",
+            "candidates": [{"name": "Monthly Close - EU", "task_id": 12}],
+        })
+        tools._create_task_action_clarification = MagicMock(return_value={
+            "action": "close_task",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 45,
+            "clarification_question": "choose task",
+            "candidates": [{"name": "Monthly Close - EU", "task_id": 12}],
+            "message": "choose task",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "close_task",
+            {
+                "task_name": "monthly close",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 45)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_create_task_project_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_create_task",
+            "sql_builder": "sql_plan_create_task",
+            "args": {
+                "project_id": None,
+                "title": "Prepare filing package",
+                "hours_estimate": 3,
+                "assigned_to": None,
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "insert",
+            "table": "project_tasks",
+            "values": {
+                "project_id": None,
+                "name": "Prepare filing package",
+                "estimated_hours": 3,
+                "assigned_to": None,
+                "status": "open",
+            },
+            "returning": ["id"],
+        })
+        tools._resolve_project_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "Phase 4",
+            "candidates": [{"name": "Phase 4 Regression Project", "project_id": 77}],
+        })
+        tools._create_create_task_action_clarification = MagicMock(return_value={
+            "action": "create_task",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 51,
+            "clarification_question": "choose project",
+            "candidates": [{"name": "Phase 4 Regression Project", "project_id": 77}],
+            "message": "choose project",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "create_task",
+            {
+                "project_name": "Phase 4",
+                "title": "Prepare filing package",
+                "hours_estimate": 3,
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 51)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_create_task_assignee_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_create_task",
+            "sql_builder": "sql_plan_create_task",
+            "args": {
+                "project_id": 77,
+                "title": "Prepare filing package",
+                "hours_estimate": 3,
+                "assigned_to": "Yeung Pang",
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "insert",
+            "table": "project_tasks",
+            "values": {
+                "project_id": 77,
+                "name": "Prepare filing package",
+                "estimated_hours": 3,
+                "assigned_to": "Yeung Pang",
+                "status": "open",
+            },
+            "returning": ["id"],
+        })
+        tools._resolve_merge_entity_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "Yeung Pang",
+            "candidates": [{"name": "Yeung Pang", "object_id": 11}],
+        })
+        tools._create_create_task_action_clarification = MagicMock(return_value={
+            "action": "create_task",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 52,
+            "clarification_question": "choose assignee",
+            "candidates": [{"name": "Yeung Pang", "object_id": 11}],
+            "message": "choose assignee",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "create_task",
+            {
+                "project_id": 77,
+                "title": "Prepare filing package",
+                "hours_estimate": 3,
+                "assigned_to": "Yeung Pang",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 52)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_create_workflow_case_subject_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_create_workflow_case",
+            "sql_builder": "sql_plan_create_workflow_case",
+            "args": {
+                "case_no": "CASE-100",
+                "case_type": "ops",
+                "subject_name": "Phase 4",
+                "initiated_by_name": "Yeung Pang",
+                "current_step": "review",
+                "sla_due_at": "2026-07-15T10:00:00Z",
+                "status": "open",
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "insert",
+            "table": "workflow_cases",
+            "values": {
+                "case_no": "CASE-100",
+                "case_type": "ops",
+                "subject_ref": None,
+                "initiated_by_ref": None,
+                "current_step": "review",
+                "sla_due_at": "2026-07-15T10:00:00Z",
+                "status": "open",
+            },
+            "returning": ["id"],
+        })
+        tools._resolve_merge_entity_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "Phase 4",
+            "candidates": [{"name": "Phase 4 Regression Project", "object_id": 77}],
+        })
+        tools._create_create_workflow_case_action_clarification = MagicMock(return_value={
+            "action": "create_workflow_case",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 61,
+            "clarification_question": "choose subject",
+            "candidates": [{"name": "Phase 4 Regression Project", "object_id": 77}],
+            "message": "choose subject",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "create_workflow_case",
+            {
+                "case_no": "CASE-100",
+                "case_type": "ops",
+                "subject_name": "Phase 4",
+                "initiated_by_name": "Yeung Pang",
+                "current_step": "review",
+                "sla_due_at": "2026-07-15T10:00:00Z",
+                "status": "open",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 61)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_create_workflow_case_initiator_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_create_workflow_case",
+            "sql_builder": "sql_plan_create_workflow_case",
+            "args": {
+                "case_no": "CASE-101",
+                "case_type": "ops",
+                "subject_ref": 77,
+                "initiated_by_name": "Yeung Pang",
+                "current_step": "review",
+                "sla_due_at": "2026-07-15T10:00:00Z",
+                "status": "open",
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "insert",
+            "table": "workflow_cases",
+            "values": {
+                "case_no": "CASE-101",
+                "case_type": "ops",
+                "subject_ref": 77,
+                "initiated_by_ref": None,
+                "current_step": "review",
+                "sla_due_at": "2026-07-15T10:00:00Z",
+                "status": "open",
+            },
+            "returning": ["id"],
+        })
+        tools._resolve_merge_entity_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "Yeung Pang",
+            "candidates": [{"name": "Yeung Pang", "object_id": 11}],
+        })
+        tools._create_create_workflow_case_action_clarification = MagicMock(return_value={
+            "action": "create_workflow_case",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 62,
+            "clarification_question": "choose initiator",
+            "candidates": [{"name": "Yeung Pang", "object_id": 11}],
+            "message": "choose initiator",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "create_workflow_case",
+            {
+                "case_no": "CASE-101",
+                "case_type": "ops",
+                "subject_ref": 77,
+                "initiated_by_name": "Yeung Pang",
+                "current_step": "review",
+                "sla_due_at": "2026-07-15T10:00:00Z",
+                "status": "open",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 62)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_record_approval_case_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_record_approval",
+            "sql_builder": "sql_plan_record_approval",
+            "args": {
+                "case_no": "CASE-200",
+                "approver_name": "Yeung Pang",
+                "decision": "approved",
+                "decision_at": "2026-07-08T10:00:00Z",
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "insert",
+            "table": "approvals",
+            "values": {
+                "case_ref": None,
+                "approver_ref": None,
+                "decision": "approved",
+                "decision_at": "2026-07-08T10:00:00Z",
+                "comment": None,
+                "escalation_level": 0,
+            },
+            "returning": ["id"],
+        })
+        tools._resolve_workflow_case_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "CASE-200",
+            "candidates": [{"case_no": "CASE-200-A", "case_ref": 301}],
+        })
+        tools._create_record_approval_action_clarification = MagicMock(return_value={
+            "action": "record_approval",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 71,
+            "clarification_question": "choose case",
+            "candidates": [{"case_no": "CASE-200-A", "case_ref": 301}],
+            "message": "choose case",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "record_approval",
+            {
+                "case_no": "CASE-200",
+                "approver_name": "Yeung Pang",
+                "decision": "approved",
+                "decision_at": "2026-07-08T10:00:00Z",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 71)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_perform_action_record_approval_approver_ambiguous_returns_pending_clarification(self):
+        tools = self._build_tools_for_perform_action()
+        tools._invoke_solf_policy = MagicMock(return_value={"mode": "allow", "reason": "ok"})
+        tools._apply_workflow_rule_directives = MagicMock(
+            side_effect=lambda **kwargs: {
+                "payload": dict(kwargs.get("payload") or {}),
+                "applied": False,
+                "applied_rules": [],
+            }
+        )
+        tools._compose_action_plan = MagicMock(return_value={
+            "guard": "can_record_approval",
+            "sql_builder": "sql_plan_record_approval",
+            "args": {
+                "case_ref": 301,
+                "approver_name": "Yeung Pang",
+                "decision": "approved",
+                "decision_at": "2026-07-08T10:00:00Z",
+            },
+        })
+        tools._invoke_solf_clause_raw = MagicMock(return_value={
+            "operation": "insert",
+            "table": "approvals",
+            "values": {
+                "case_ref": 301,
+                "approver_ref": None,
+                "decision": "approved",
+                "decision_at": "2026-07-08T10:00:00Z",
+                "comment": None,
+                "escalation_level": 0,
+            },
+            "returning": ["id"],
+        })
+        tools._resolve_merge_entity_reference = MagicMock(return_value={
+            "status": "ambiguous",
+            "input": "Yeung Pang",
+            "candidates": [{"name": "Yeung Pang", "object_id": 11}],
+        })
+        tools._create_record_approval_action_clarification = MagicMock(return_value={
+            "action": "record_approval",
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": 72,
+            "clarification_question": "choose approver",
+            "candidates": [{"name": "Yeung Pang", "object_id": 11}],
+            "message": "choose approver",
+        })
+        tools._execute_sql_plan = MagicMock()
+
+        result = tools.perform_action(
+            "record_approval",
+            {
+                "case_ref": 301,
+                "approver_name": "Yeung Pang",
+                "decision": "approved",
+                "decision_at": "2026-07-08T10:00:00Z",
+            },
+        )
+
+        self.assertEqual(result.get("status"), "pending_clarification")
+        self.assertEqual(result.get("thread_id"), 72)
+        tools._execute_sql_plan.assert_not_called()
+
+    def test_search_criteria_uses_scope_documents_when_sparse(self):
+        tools = IDMSInteractionTools.__new__(IDMSInteractionTools)
+        parsed = SimpleNamespace(
+            intent="criteria_lookup",
+            criteria={
+                "must_contain": ["travelling"],
+                "document_hint": "all",
+                "semantic_frame": "document_about_entity",
+            },
+        )
+        query_engine = MagicMock()
+        query_engine.parse_query.return_value = parsed
+        query_engine.search_by_criteria.side_effect = [
+            {
+                "criteria": parsed.criteria,
+                "count": 1,
+                "matches": [
+                    {
+                        "doc_id": 101,
+                        "doc_name": "paper_23_11_annex_c_forum_account_pdf",
+                        "matched_terms": ["travelling"],
+                    }
+                ],
+                "source": "criteria_docs_sql",
+            },
+            {
+                "criteria": parsed.criteria,
+                "count": 1,
+                "matches": [
+                    {
+                        "doc_id": 101,
+                        "doc_name": "paper_23_11_annex_c_forum_account_pdf",
+                        "matched_terms": ["travelling"],
+                    }
+                ],
+                "source": "criteria_semantic_qdrant",
+            },
+        ]
+        tools.query_engine = query_engine
+
+        scope_payload = {
+            "doc_ids": [201, 202, 203],
+            "documents": [
+                {"doc_id": 201, "doc_name": "2025-12-18_SBB_Kontanz_ticket_forward.pdf", "doc_path": "2025-12-18_SBB_Kontanz_ticket_forward.pdf"},
+                {"doc_id": 202, "doc_name": "2025-12-18_SBB_Kontanz_ticket_return.pdf", "doc_path": "2025-12-18_SBB_Kontanz_ticket_return.pdf"},
+                {"doc_id": 203, "doc_name": "vicenza-zug20260331.pdf", "doc_path": "vicenza-zug20260331.pdf"},
+            ],
+            "candidate_count": 12,
+            "discovery_candidate_count": 0,
+        }
+
+        out = tools.search_criteria("Show me all the documents that are related to travelling", scope=scope_payload)
+
+        self.assertTrue(out.get("success"))
+        self.assertEqual(int(out.get("count") or 0), 3)
+        self.assertEqual(str(out.get("source") or ""), "criteria_scope_docs")
+        self.assertEqual(str(out.get("scope_retry") or ""), "scope_documents")
+        self.assertEqual(
+            [item.get("doc_name") for item in (out.get("matches") or [])],
+            [
+                "2025-12-18_SBB_Kontanz_ticket_forward.pdf",
+                "2025-12-18_SBB_Kontanz_ticket_return.pdf",
+                "vicenza-zug20260331.pdf",
+            ],
+        )
 
     def test_resolve_accounting_booking_company_prefers_explicit_company(self):
         payload = {
@@ -377,6 +1055,61 @@ class TestInteractionPartialTypes(unittest.TestCase):
         self.assertEqual(sales_lines[0]["account_number"], 1100)
         self.assertEqual(sales_lines[1]["account_number"], 3000)
         self.assertEqual(sales_lines[-1]["account_number"], 2200)
+
+        purchase_order_lines = domain_function._derive_summary_ledger_lines_from_amounts(
+            {
+                "invoice_total": "2500.00",
+                "currency": "CHF",
+            },
+            "purchase_order",
+        )
+        self.assertEqual(purchase_order_lines[0]["account_number"], 9100)
+        self.assertEqual(purchase_order_lines[-1]["account_number"], 2900)
+
+        po_linked_invoice_lines = domain_function._derive_summary_ledger_lines_from_amounts(
+            {
+                "invoice_total": "2500.00",
+                "currency": "CHF",
+                "purchase_order_no": "PO-2026-0001",
+                "issuer_name": "Northwind Supplies AG",
+                "bill_to": "Aphotonix GmbH",
+            },
+            "invoice",
+            invoice_party_role="vendor_invoice",
+        )
+        commitment_reverse_accounts = [
+            int(line.get("account_number") or 0)
+            for line in po_linked_invoice_lines
+            if int(line.get("account_number") or 0) in {2900, 9100}
+        ]
+        self.assertIn(2900, commitment_reverse_accounts)
+        self.assertIn(9100, commitment_reverse_accounts)
+
+        po_unmatched_invoice_lines = domain_function._derive_summary_ledger_lines_from_amounts(
+            {
+                "invoice_total": "2500.00",
+                "currency": "CHF",
+                "purchase_order_no": "PO-2026-0001",
+            },
+            "invoice",
+            invoice_party_role="vendor_invoice",
+        )
+        unmatched_accounts = [int(line.get("account_number") or 0) for line in po_unmatched_invoice_lines]
+        self.assertNotIn(2900, unmatched_accounts)
+        self.assertNotIn(9100, unmatched_accounts)
+
+    def test_derive_summary_ledger_lines_from_bank_statement_settlement(self):
+        bank_lines = domain_function._derive_summary_ledger_lines_from_amounts(
+            {
+                "amount": "1800.00",
+                "currency": "CHF",
+                "payment_status": "paid",
+                "payment_direction": "outgoing",
+            },
+            "bank_statement",
+        )
+        self.assertEqual(bank_lines[0]["account_number"], 2000)
+        self.assertEqual(bank_lines[1]["account_number"], 1020)
 
     def test_db_accounting_ingest_enriches_company_before_upsert(self):
         payload = {
@@ -748,6 +1481,8 @@ class TestInteractionPartialTypes(unittest.TestCase):
         ]
         self.assertEqual(len(accounting_entities), 1)
         accounting_attrs = accounting_entities[0].get("attributes") if isinstance(accounting_entities[0].get("attributes"), dict) else {}
+        self.assertEqual(accounting_attrs.get("booking_debit_account_name"), "travelling expenses")
+        self.assertEqual(accounting_attrs.get("booking_particulars"), "train or bus")
         ledger_lines = accounting_attrs.get("ledger_lines") if isinstance(accounting_attrs.get("ledger_lines"), list) else []
         self.assertEqual(ledger_lines[0].get("account_number"), 6400)
         self.assertEqual(ledger_lines[0].get("line_description"), "train or bus")
@@ -789,6 +1524,78 @@ class TestInteractionPartialTypes(unittest.TestCase):
         self.assertNotIn("booking_debit_account_name", source_attrs)
         self.assertNotIn("booking_particulars", source_attrs)
         self.assertEqual(int(applied.get("applied_count") or 0), 0)
+
+    def test_inferred_sbb_rule_matches_ticket_like_invoice_using_peer_vendor_candidates(self):
+        extracted = {
+            "document": {"doc_type": "invoice", "country": "switzerland", "metadata": {}},
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "invoice_1",
+                    "class_name": "invoice",
+                    "attributes": {
+                        "invoice_no": "151422346029",
+                        "invoice_type": "ticket",
+                        "gross_amount": "83.00",
+                        "currency": "CHF",
+                    },
+                    "confidence": 0.98,
+                },
+                {
+                    "entity_id": "e2",
+                    "entity_name": "SBB CFF FFS",
+                    "class_name": "organization",
+                    "attributes": {},
+                    "confidence": 0.98,
+                },
+            ],
+            "relationships": [],
+        }
+        inferred_rule = {
+            "rule_id": 204,
+            "rule_name": "sbb_booking",
+            "rule_text": "In general, for entity classes invoice, bill, receipt, ticket, document, and entity, if vendor/issuer/supplier/legal_name contains SBB or CFF, set booking debit account name to travelling expenses and booking particulars to train or bus.",
+            "structured_rule": {
+                "application_mode": "general",
+                "post_extraction_directives": [
+                    {
+                        "target_scope": "entity",
+                        "target_entity_classes": ["invoice", "bill", "receipt", "ticket", "document", "entity"],
+                        "conditions": [
+                            {
+                                "attribute_terms": ["vendor", "issuer", "supplier", "legal_name"],
+                                "operator": "contains_any",
+                                "values": ["sbb", "cff"],
+                            }
+                        ],
+                        "set_attributes": {
+                            "booking_debit_account_name": "travelling expenses",
+                            "booking_particulars": "train or bus",
+                        },
+                        "overwrite_existing": False,
+                        "scope": {
+                            "document_types": [],
+                            "countries": [],
+                            "entity_classes": [],
+                            "operations": [],
+                        },
+                    }
+                ],
+            },
+        }
+
+        with patch.object(business_rules, "list_business_rules", return_value=[inferred_rule]):
+            applied = business_rules.apply_post_extraction_business_rules(
+                extracted,
+                context={"country": "switzerland", "document_type": "invoice", "operation": "ingest"},
+                selected_rules=[],
+                include_inferred=True,
+            )
+
+        source_attrs = applied["extracted"]["entities"][0]["attributes"]
+        self.assertEqual(source_attrs.get("booking_debit_account_name"), "travelling expenses")
+        self.assertEqual(source_attrs.get("booking_particulars"), "train or bus")
+        self.assertGreaterEqual(int(applied.get("applied_count") or 0), 1)
 
     def test_derive_accounting_transaction_for_email_with_paid_ticket_entity(self):
         payload = {
@@ -872,6 +1679,225 @@ class TestInteractionPartialTypes(unittest.TestCase):
         attrs = accounting_entities[0].get("attributes") or {}
         ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
         self.assertEqual(ledger_lines[0].get("account_number"), 4200)
+
+    def test_derive_accounting_transaction_for_purchase_order(self):
+        payload = {
+            "document": {
+                "doc_key": "po-1",
+                "doc_path": "purchase-order.xlsx",
+                "doc_theme": "Purchase order",
+                "doc_date": "2026-07-07",
+                "metadata": {},
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "purchase_order:teyu-1",
+                    "class_name": "purchase_order",
+                    "attributes": {
+                        "gross_amount": "2500.00",
+                        "currency": "CHF",
+                        "company_ref": "Aphotonix GmbH",
+                    },
+                    "confidence": 0.98,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "purchase_order"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        self.assertEqual(ledger_lines[0].get("account_number"), 9100)
+        self.assertEqual(ledger_lines[-1].get("account_number"), 2900)
+
+    def test_derive_accounting_transaction_for_po_linked_invoice_adds_commitment_settlement(self):
+        payload = {
+            "document": {
+                "doc_key": "inv-po-1",
+                "doc_path": "invoice.pdf",
+                "doc_theme": "Supplier invoice for PO",
+                "doc_date": "2026-07-07",
+                "metadata": {},
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "invoice:po-1",
+                    "class_name": "invoice",
+                    "attributes": {
+                        "gross_amount": "2500.00",
+                        "currency": "CHF",
+                        "purchase_order_no": "PO-2026-0001",
+                        "issuer_name": "Northwind Supplies AG",
+                        "bill_to": "Aphotonix GmbH",
+                    },
+                    "confidence": 0.98,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "invoice"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        accounts = [int(line.get("account_number") or 0) for line in ledger_lines]
+        self.assertIn(4200, accounts)
+        self.assertIn(2000, accounts)
+        self.assertIn(2900, accounts)
+        self.assertIn(9100, accounts)
+
+    def test_derive_accounting_transaction_for_bank_statement_payment_settlement(self):
+        payload = {
+            "document": {
+                "doc_key": "bank-1",
+                "doc_path": "bank-statement.xlsx",
+                "doc_theme": "Bank statement",
+                "doc_date": "2026-07-07",
+                "metadata": {},
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "payment:tx-1",
+                    "class_name": "bank_transaction",
+                    "attributes": {
+                        "amount": "1800.00",
+                        "currency": "CHF",
+                        "payment_status": "paid",
+                        "payment_direction": "outgoing",
+                        "invoice_no": "INV-2026-001",
+                    },
+                    "confidence": 0.98,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "bank_statement"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertEqual(len(ledger_lines), 2)
+        self.assertEqual(int(ledger_lines[0].get("account_number") or 0), 2000)
+        self.assertEqual(int(ledger_lines[1].get("account_number") or 0), 1020)
+
+    def test_derive_accounting_transaction_for_purchase_order_document_fallback_without_entities(self):
+        payload = {
+            "document": {
+                "doc_key": "po-doc-fallback-1",
+                "doc_path": "purchase-order.xlsx",
+                "doc_theme": "Purchase order",
+                "doc_date": "2026-07-07",
+                "metadata": {
+                    "structured_tables": {
+                        "tables": [
+                            {
+                                "rows": [
+                                    ["Total", "CHF 2'500.00"],
+                                ]
+                            }
+                        ]
+                    }
+                },
+            },
+            "entities": [],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "purchase_order"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        self.assertEqual(int(ledger_lines[0].get("account_number") or 0), 9100)
+        self.assertEqual(int(ledger_lines[-1].get("account_number") or 0), 2900)
+
+    def test_purchase_order_derivation_does_not_fallback_to_ticket_accounts(self):
+        payload = {
+            "document": {
+                "doc_key": "po-ticketlike-1",
+                "doc_path": "purchase-order.xlsx",
+                "doc_theme": "Purchase order",
+                "doc_date": "2026-07-07",
+                "metadata": {
+                    "processing_rule_names": ["aphotonix_booking"],
+                },
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "Purchase Order",
+                    "class_name": "purchase_order",
+                    "attributes": {
+                        "amount": "131300.00",
+                        "currency": "CHF",
+                        "ticket_type": "Point-to-point Ticket",
+                        "booking_debit_account_name": "travelling expenses",
+                    },
+                    "confidence": 0.9,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "purchase_order"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        accounts = [int(line.get("account_number") or 0) for line in ledger_lines]
+        self.assertIn(9100, accounts)
+        self.assertIn(2900, accounts)
+        self.assertNotIn(6400, accounts)
 
     def test_derive_accounting_transaction_for_email_prefers_receipt_with_amount(self):
         payload = {
@@ -1021,6 +2047,352 @@ class TestInteractionPartialTypes(unittest.TestCase):
         ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
         self.assertTrue(ledger_lines)
         self.assertEqual(ledger_lines[0].get("account_number"), 6400)
+
+    def test_derive_accounting_transaction_for_email_invoice_uses_structured_table_eur_fallback(self):
+        payload = {
+            "document": {
+                "doc_key": "invoice-mail-eur-1",
+                "doc_path": "invoice-email.pdf",
+                "doc_theme": "supplier invoice via email",
+                "doc_date": "2026-02-04",
+                "metadata": {
+                    "processing_rule_names": ["aphotonix_booking"],
+                    "user_metadata": {
+                        "structured_tables": {
+                            "tables": [
+                                {
+                                    "rows": [
+                                        ["Total", "EUR 99.90"],
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                },
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "Invoice Header",
+                    "class_name": "invoice",
+                    "attributes": {
+                        "invoice_no": "INV-2026-0001",
+                        "supplier_ref": "SBB CFF FFS",
+                    },
+                    "confidence": 0.94,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "email"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        self.assertEqual(ledger_lines[0].get("source_currency"), "EUR")
+        self.assertEqual(ledger_lines[0].get("amount_source_currency"), "99.90")
+
+    def test_derive_accounting_transaction_for_email_honors_forced_currency_note(self):
+        payload = {
+            "document": {
+                "doc_key": "invoice-mail-currency-override-1",
+                "doc_path": "invoice-email.pdf",
+                "doc_theme": "supplier invoice via email",
+                "doc_date": "2026-02-04",
+                "metadata": {
+                    "processing_rule_names": ["aphotonix_booking"],
+                    "user_metadata": {
+                        "force_currency": "CHF",
+                        "structured_tables": {
+                            "tables": [
+                                {
+                                    "rows": [
+                                        ["Total", "EUR 99.90"],
+                                    ]
+                                }
+                            ]
+                        },
+                    },
+                },
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "Invoice Header",
+                    "class_name": "invoice",
+                    "attributes": {
+                        "invoice_no": "INV-2026-0002",
+                        "supplier_ref": "SBB CFF FFS",
+                    },
+                    "confidence": 0.94,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "email"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        self.assertEqual(ledger_lines[0].get("source_currency"), "CHF")
+        self.assertEqual(ledger_lines[0].get("amount_source_currency"), "99.90")
+
+    def test_derive_accounting_transaction_uses_booking_hint_from_non_source_entity(self):
+        payload = {
+            "document": {
+                "doc_key": "receipt-mail-booking-hint-1",
+                "doc_path": "receipt-email.pdf",
+                "doc_theme": "sbb easyride receipt",
+                "doc_date": "2026-02-04",
+                "metadata": {
+                    "processing_rule_names": ["aphotonix_booking"],
+                },
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "SBB CFF FFS",
+                    "class_name": "organization",
+                    "attributes": {
+                        "booking_debit_account_name": "travelling expenses",
+                        "booking_particulars": "easyride",
+                    },
+                    "confidence": 0.95,
+                },
+                {
+                    "entity_id": "e2",
+                    "entity_name": "EasyRide Receipt",
+                    "class_name": "receipt",
+                    "attributes": {
+                        "receipt_no": "260204101637918404",
+                        "amount": "26.50",
+                        "currency": "CHF",
+                    },
+                    "confidence": 0.95,
+                },
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "receipt"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        self.assertEqual(int(ledger_lines[0].get("account_number") or 0), 6400)
+
+    def test_derive_accounting_transaction_for_document_with_rule_context_uses_structured_fallback(self):
+        payload = {
+            "document": {
+                "doc_key": "vicenza-zug20260331.pdf",
+                "doc_path": "vicenza-zug20260331.pdf",
+                "doc_theme": "travel_booking_confirmation",
+                "doc_date": "2026-03-31",
+                "metadata": {
+                    "processing_rule_names": ["aphotonix_booking"],
+                    "user_metadata": {
+                        "structured_tables": {
+                            "tables": [
+                                {
+                                    "rows": [
+                                        ["Totale", "CHF 47.00"],
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                },
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "Travel Booking",
+                    "class_name": "order",
+                    "attributes": {},
+                    "confidence": 0.92,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "document"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        self.assertEqual(int(ledger_lines[0].get("account_number") or 0), 6400)
+        self.assertEqual(str(ledger_lines[0].get("source_currency") or ""), "CHF")
+
+    def test_extract_amount_from_markdown_cache_path_resolves_outside_cwd(self):
+        module_dir = Path(domain_function.__file__).resolve().parent
+        markdown_dir = module_dir / "generated" / "markdown"
+        markdown_dir.mkdir(parents=True, exist_ok=True)
+        temp_name = f"preextract-test-{uuid.uuid4().hex}.md"
+        temp_file = markdown_dir / temp_name
+        original_cwd = Path.cwd()
+
+        try:
+            temp_file.write_text("Total price of order: CHF 83.00", encoding="utf-8")
+            # Simulate service runtime started from parent workspace instead of module directory.
+            try:
+                import os
+                os.chdir(module_dir.parent)
+            except Exception:
+                pass
+
+            amount, currency = domain_function._extract_amount_and_currency_from_structured_tables(
+                {
+                    "metadata": {
+                        "user_metadata": {
+                            "source_reference": {
+                                "markdown_cache_path": f"generated\\markdown\\{temp_name}"
+                            }
+                        }
+                    }
+                }
+            )
+        finally:
+            try:
+                import os
+                os.chdir(original_cwd)
+            except Exception:
+                pass
+            if temp_file.exists():
+                temp_file.unlink()
+
+        self.assertEqual(str(amount), "83.00")
+        self.assertEqual(currency, "CHF")
+
+    def test_derive_accounting_transaction_for_travel_invoice_uses_6400_without_explicit_override(self):
+        payload = {
+            "document": {
+                "doc_key": "travel-overview-1.pdf",
+                "doc_path": "travel-overview-1.pdf",
+                "doc_theme": "train_ticket",
+                "doc_date": "2026-03-26",
+                "metadata": {
+                    "processing_rule_names": ["aphotonix_booking"],
+                },
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "invoice_1",
+                    "class_name": "invoice",
+                    "attributes": {
+                        "invoice_no": "151422346029",
+                        "amount": "83.00",
+                        "currency": "CHF",
+                        "description": "Your travel overview",
+                    },
+                    "confidence": 0.95,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "invoice"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        self.assertEqual(int(ledger_lines[0].get("account_number") or 0), 6400)
+
+    def test_derive_accounting_transaction_for_travel_invoice_overrides_sales_role_inference(self):
+        payload = {
+            "document": {
+                "doc_key": "travel-overview-2.pdf",
+                "doc_path": "travel-overview-2.pdf",
+                "doc_theme": "train_ticket",
+                "doc_date": "2026-03-26",
+                "metadata": {
+                    "processing_rule_names": ["aphotonix_booking"],
+                },
+            },
+            "entities": [
+                {
+                    "entity_id": "e1",
+                    "entity_name": "invoice_1",
+                    "class_name": "invoice",
+                    "attributes": {
+                        "invoice_no": "151422346029",
+                        "amount": "83.00",
+                        "currency": "CHF",
+                        "description": "Travel booking Arth-Goldau - Vicenza",
+                        "sender_name": "Aphotonix GmbH",
+                    },
+                    "confidence": 0.95,
+                }
+            ],
+            "relationships": [],
+        }
+
+        domain_function._derive_accounting_transaction_entity(
+            {"document_type": "invoice"},
+            payload,
+            {"accounting_transaction": object()},
+        )
+
+        accounting_entities = [
+            entity for entity in payload["entities"]
+            if str(entity.get("class_name") or "").strip().lower() == "accounting_transaction"
+        ]
+        self.assertEqual(len(accounting_entities), 1)
+        attrs = accounting_entities[0].get("attributes") or {}
+        ledger_lines = attrs.get("ledger_lines") if isinstance(attrs.get("ledger_lines"), list) else []
+        self.assertTrue(ledger_lines)
+        accounts = [int(line.get("account_number") or 0) for line in ledger_lines]
+        self.assertIn(6400, accounts)
+        self.assertIn(2000, accounts)
+        self.assertNotIn(1100, accounts)
+        self.assertNotIn(3000, accounts)
 
     def test_derive_accounting_transaction_propagates_reference_hints_from_other_entities(self):
         payload = {

@@ -29,11 +29,13 @@ DEFAULT_CHART_OF_ACCOUNTS: list[dict[str, Any]] = [
     {"account_number": 2000, "account_name": "Accounts Payable", "account_type": "liability"},
     {"account_number": 2200, "account_name": "VAT Payable", "account_type": "liability"},
     {"account_number": 2800, "account_name": "Equity", "account_type": "equity"},
+    {"account_number": 2900, "account_name": "Purchase Commitment Reserve", "account_type": "liability"},
     {"account_number": 3000, "account_name": "Domestic Sales", "account_type": "revenue"},
     {"account_number": 3200, "account_name": "Export Sales", "account_type": "revenue"},
     {"account_number": 4000, "account_name": "Cost of Goods Sold", "account_type": "expense"},
     {"account_number": 4200, "account_name": "Purchases", "account_type": "expense"},
     {"account_number": 6500, "account_name": "Office and Admin Expense", "account_type": "expense"},
+    {"account_number": 9100, "account_name": "Purchase Commitment Expense", "account_type": "expense"},
 ]
 
 
@@ -53,6 +55,7 @@ ENTERPRISE_CHART_OF_ACCOUNTS: list[dict[str, Any]] = [
     {"account_number": 2300, "account_name": "Payroll Liabilities", "account_type": "liability"},
     {"account_number": 2500, "account_name": "Long-term Debt", "account_type": "liability"},
     {"account_number": 2800, "account_name": "Share Capital and Reserves", "account_type": "equity"},
+    {"account_number": 2900, "account_name": "Purchase Commitment Reserve", "account_type": "liability"},
     {"account_number": 3000, "account_name": "Domestic Product Revenue", "account_type": "revenue"},
     {"account_number": 3010, "account_name": "Service Revenue", "account_type": "revenue"},
     {"account_number": 3200, "account_name": "Export Revenue", "account_type": "revenue"},
@@ -63,6 +66,7 @@ ENTERPRISE_CHART_OF_ACCOUNTS: list[dict[str, Any]] = [
     {"account_number": 6300, "account_name": "Utilities Expense", "account_type": "expense"},
     {"account_number": 6500, "account_name": "General and Administrative Expense", "account_type": "expense"},
     {"account_number": 6800, "account_name": "Depreciation Expense", "account_type": "expense"},
+    {"account_number": 9100, "account_name": "Purchase Commitment Expense", "account_type": "expense"},
 ]
 
 
@@ -315,6 +319,93 @@ CREATE INDEX IF NOT EXISTS idx_domain_audit_metadata_gin ON domain_definition_au
 """
 
 
+create_source_database_registry_table = """
+CREATE TABLE IF NOT EXISTS source_database_registry (
+    source_id BIGSERIAL PRIMARY KEY,
+    source_key VARCHAR(256) NOT NULL UNIQUE,
+    source_name VARCHAR(256) NOT NULL,
+    db_host VARCHAR(256),
+    db_port INT,
+    db_name VARCHAR(256) NOT NULL,
+    db_user VARCHAR(256),
+    db_schema VARCHAR(256),
+    connection_hint TEXT,
+    status VARCHAR(32) NOT NULL DEFAULT 'active',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_database_registry_status ON source_database_registry(status);
+CREATE INDEX IF NOT EXISTS idx_source_database_registry_db_name ON source_database_registry(db_name);
+CREATE INDEX IF NOT EXISTS idx_source_database_registry_metadata_gin ON source_database_registry USING GIN(metadata);
+"""
+
+
+create_source_schema_inventory_table = """
+CREATE TABLE IF NOT EXISTS source_schema_inventory (
+    inventory_id BIGSERIAL PRIMARY KEY,
+    source_id BIGINT NOT NULL REFERENCES source_database_registry(source_id) ON DELETE CASCADE,
+    schema_name VARCHAR(256) NOT NULL,
+    table_name VARCHAR(256) NOT NULL,
+    object_kind VARCHAR(32) NOT NULL DEFAULT 'table',
+    fingerprint TEXT NOT NULL,
+    discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (source_id, schema_name, table_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_schema_inventory_source ON source_schema_inventory(source_id);
+CREATE INDEX IF NOT EXISTS idx_source_schema_inventory_fingerprint ON source_schema_inventory(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_source_schema_inventory_metadata_gin ON source_schema_inventory USING GIN(metadata);
+"""
+
+
+create_source_entity_mapping_table = """
+CREATE TABLE IF NOT EXISTS source_entity_mapping (
+    mapping_id BIGSERIAL PRIMARY KEY,
+    source_id BIGINT NOT NULL REFERENCES source_database_registry(source_id) ON DELETE CASCADE,
+    schema_name VARCHAR(256) NOT NULL,
+    table_name VARCHAR(256) NOT NULL,
+    source_pk_value TEXT NOT NULL,
+    target_class_name VARCHAR(256) NOT NULL,
+    target_object_id BIGINT REFERENCES object_instance(object_id) ON DELETE SET NULL,
+    target_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_row_hash TEXT NOT NULL,
+    source_row_updated_at TIMESTAMPTZ,
+    source_row_fingerprint TEXT NOT NULL,
+    mapped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_id, schema_name, table_name, source_pk_value, target_class_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_entity_mapping_source ON source_entity_mapping(source_id);
+CREATE INDEX IF NOT EXISTS idx_source_entity_mapping_target ON source_entity_mapping(target_object_id);
+CREATE INDEX IF NOT EXISTS idx_source_entity_mapping_updated_at ON source_entity_mapping(updated_at);
+CREATE INDEX IF NOT EXISTS idx_source_entity_mapping_metadata_gin ON source_entity_mapping USING GIN(target_metadata);
+"""
+
+
+create_source_sync_state_table = """
+CREATE TABLE IF NOT EXISTS source_sync_state (
+    sync_id BIGSERIAL PRIMARY KEY,
+    source_id BIGINT NOT NULL REFERENCES source_database_registry(source_id) ON DELETE CASCADE,
+    sync_scope VARCHAR(128) NOT NULL DEFAULT 'entity_mapping',
+    last_sync_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_error TEXT,
+    sync_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_id, sync_scope)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_sync_state_source ON source_sync_state(source_id);
+CREATE INDEX IF NOT EXISTS idx_source_sync_state_last_sync_at ON source_sync_state(last_sync_at DESC);
+CREATE INDEX IF NOT EXISTS idx_source_sync_state_metadata_gin ON source_sync_state USING GIN(sync_metadata);
+"""
+
+
 create_solf_attribute_proposals_table = """
 CREATE TABLE IF NOT EXISTS solf_attribute_proposals (
     proposal_id BIGSERIAL PRIMARY KEY,
@@ -363,6 +454,10 @@ def create_tables(connection: Any, recreate: bool = False) -> None:
         create_ledger_lines_table,
         create_solf_attribute_proposals_table,
         create_solf_schema_promotion_batches_table,
+        create_source_database_registry_table,
+        create_source_schema_inventory_table,
+        create_source_entity_mapping_table,
+        create_source_sync_state_table,
         create_hr_department_master_table,
         create_hr_role_master_table,
         create_hr_employee_table,
@@ -390,6 +485,7 @@ def create_tables(connection: Any, recreate: bool = False) -> None:
             cursor.execute(sql)
         if not recreate:
             migration_statements = [
+                "ALTER TABLE IF EXISTS source_database_registry ADD COLUMN IF NOT EXISTS db_user VARCHAR(256);",
                 "ALTER TABLE IF EXISTS chart_of_accounts ADD COLUMN IF NOT EXISTS legal_entity_ref VARCHAR(128);",
                 "ALTER TABLE IF EXISTS chart_of_accounts ALTER COLUMN legal_entity_ref SET DEFAULT 'global';",
                 "UPDATE chart_of_accounts SET legal_entity_ref = COALESCE(NULLIF(TRIM(legal_entity_ref), ''), 'global') WHERE legal_entity_ref IS NULL OR TRIM(legal_entity_ref) = '';",
@@ -982,7 +1078,6 @@ def seed_chart_of_accounts(
         return 0
 
     scope_ref = str(legal_entity_ref or "global").strip() or "global"
-    count_sql = "SELECT COUNT(*) FROM chart_of_accounts WHERE legal_entity_ref = %s"
     upsert_sql = """
     INSERT INTO chart_of_accounts (legal_entity_ref, account_number, account_name, account_type)
     VALUES (%s, %s, %s, %s)
@@ -993,11 +1088,6 @@ def seed_chart_of_accounts(
     """
 
     with connection.cursor() as cursor:
-        cursor.execute(count_sql, (scope_ref,))
-        existing_count = int(cursor.fetchone()[0])
-        if existing_count > 0 and not overwrite:
-            return 0
-
         written = 0
         for row in seed_rows:
             account_number = int(row.get("account_number") or 0)
@@ -1016,12 +1106,22 @@ _DOMAIN_DEFINITION_TYPES = {
     "account": "account_definition",
     "chart_of_accounts": "account_definition",
     "coa": "account_definition",
+    "chart of accounts": "account_definition",
+    "ledger_account": "account_definition",
+    "konto": "account_definition",
+    "konten": "account_definition",
     "hr_department_definition": "hr_department_definition",
     "department_definition": "hr_department_definition",
     "department": "hr_department_definition",
+    "dept": "hr_department_definition",
+    "abteilung": "hr_department_definition",
     "hr_role_definition": "hr_role_definition",
     "role_definition": "hr_role_definition",
     "role": "hr_role_definition",
+    "position": "hr_role_definition",
+    "job_role": "hr_role_definition",
+    "funktion": "hr_role_definition",
+    "stelle": "hr_role_definition",
 }
 
 
@@ -1726,6 +1826,48 @@ def _tokenize_hint_text(value: Any) -> set[str]:
     return {token for token in re.split(r"[^a-z0-9]+", text) if len(token) >= 2}
 
 
+def _is_travel_context_hint(value: Any) -> bool:
+    tokens = _tokenize_hint_text(value)
+    if not tokens:
+        return False
+    travel_tokens = {
+        "travel",
+        "travelling",
+        "trip",
+        "ticket",
+        "rail",
+        "train",
+        "bahn",
+        "zug",
+        "reise",
+        "fahr",
+        "fahrt",
+        "transport",
+        "journey",
+    }
+    return bool(tokens.intersection(travel_tokens))
+
+
+def _choose_travel_expense_account_number(candidates: list[dict[str, Any]], fallback: int) -> int:
+    if not candidates:
+        return int(fallback)
+
+    for candidate in candidates:
+        number = int(candidate.get("account_number") or 0)
+        if number == 6400:
+            return 6400
+
+    for candidate in candidates:
+        number = int(candidate.get("account_number") or 0)
+        if number <= 0:
+            continue
+        name_tokens = _tokenize_hint_text(candidate.get("account_name"))
+        if {"travel", "travelling", "reise", "trip"}.intersection(name_tokens):
+            return number
+
+    return int(fallback)
+
+
 def _fetch_accounts_by_type(
     connection: Any,
     legal_entity_ref: str | None,
@@ -1809,29 +1951,43 @@ def align_ledger_lines_to_chart_of_accounts(
         return lines
 
     existing = get_existing_account_numbers(connection, account_numbers, legal_entity_ref=legal_entity_ref)
-    if all(number in existing for number in account_numbers):
-        return lines
 
     expense_accounts = _fetch_accounts_by_type(connection, legal_entity_ref, ["expense"])
     liability_accounts = _fetch_accounts_by_type(connection, legal_entity_ref, ["liability"])
     default_debit = _choose_best_account_number(expense_accounts, description_hint, "debit", 4200)
     default_credit = _choose_best_account_number(liability_accounts, description_hint, "credit", 2000)
+    is_travel_context = _is_travel_context_hint(description_hint)
+    travel_debit = _choose_travel_expense_account_number(expense_accounts, fallback=default_debit)
 
     aligned: list[dict[str, Any]] = []
     for line in lines:
-        current_number = int(line.get("account_number") or 0)
-        if current_number > 0 and current_number in existing:
-            aligned.append(line)
-            continue
-
         direction = str(line.get("direction") or "").strip().lower()
         line_meta = line.get("metadata") if isinstance(line.get("metadata"), dict) else {}
         line_hint = str(line_meta.get("line_description") or "")
         combined_hint = " ".join(item for item in (description_hint, line_hint) if item).strip()
+        line_is_travel = is_travel_context or _is_travel_context_hint(combined_hint)
+
+        current_number = int(line.get("account_number") or 0)
+        if current_number > 0 and current_number in existing:
+            if direction == "debit" and line_is_travel and current_number == 4200 and travel_debit != 4200:
+                updated = dict(line)
+                updated["account_number"] = int(travel_debit)
+                updated_meta = dict(line_meta)
+                updated_meta["original_account_number"] = current_number
+                updated_meta["travel_account_inferred"] = True
+                updated_meta["travel_account_hint"] = combined_hint[:240]
+                updated["metadata"] = updated_meta
+                aligned.append(updated)
+                continue
+            aligned.append(line)
+            continue
 
         replacement = default_debit if direction == "debit" else default_credit
         if direction == "debit":
-            replacement = _choose_best_account_number(expense_accounts, combined_hint, direction, default_debit)
+            if line_is_travel:
+                replacement = travel_debit
+            else:
+                replacement = _choose_best_account_number(expense_accounts, combined_hint, direction, default_debit)
         elif direction == "credit":
             replacement = _choose_best_account_number(liability_accounts, combined_hint, direction, default_credit)
 
@@ -1907,6 +2063,83 @@ def _resolve_legal_entity_ref(connection: Any, payload: dict[str, Any], attribut
         if text:
             return text
     return "global"
+
+
+def _build_account_alignment_hint(connection: Any, payload: dict[str, Any], attributes: dict[str, Any]) -> str:
+    hint_parts: list[str] = []
+
+    direct_keys = (
+        "description",
+        "source_type",
+        "document_type",
+        "booking_particulars",
+        "booking_debit_account_name",
+        "source_document_ref",
+    )
+    for key in direct_keys:
+        value = str(attributes.get(key) or "").strip()
+        if value:
+            hint_parts.append(value)
+
+    object_name = str(payload.get("object_name") or "").strip()
+    if object_name:
+        hint_parts.append(object_name)
+
+    doc_id_raw = payload.get("doc_id")
+    try:
+        doc_id = int(doc_id_raw) if doc_id_raw is not None else 0
+    except (TypeError, ValueError):
+        doc_id = 0
+
+    if doc_id > 0:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT class_name, object_name, metadata
+                FROM object_instance
+                WHERE metadata->>'doc_id' = %s
+                  AND class_name IN ('invoice', 'bill', 'receipt', 'ticket', 'service', 'organization')
+                ORDER BY object_id ASC
+                """,
+                (str(doc_id),),
+            )
+            rows = cursor.fetchall() or []
+
+        metadata_keys = (
+            "invoice_type",
+            "description",
+            "issuer_name",
+            "supplier_name",
+            "vendor_name",
+            "entity_name",
+            "booking_particulars",
+            "payment_method",
+        )
+        for class_name, row_object_name, metadata in rows:
+            class_text = str(class_name or "").strip()
+            if class_text:
+                hint_parts.append(class_text)
+            object_text = str(row_object_name or "").strip()
+            if object_text:
+                hint_parts.append(object_text)
+            md = metadata if isinstance(metadata, dict) else {}
+            for key in metadata_keys:
+                value = str(md.get(key) or "").strip()
+                if value:
+                    hint_parts.append(value)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in hint_parts:
+        normalized = part.strip()
+        if not normalized:
+            continue
+        marker = normalized.lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(normalized)
+    return " ".join(deduped)
 
 
 def department_exists(connection: Any, department_code: str) -> bool:
@@ -2307,13 +2540,15 @@ def upsert_transaction_and_lines(
     object_row: dict[str, Any],
 ) -> dict[str, Any]:
     attributes = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
+    doc_id = payload.get("doc_id")
     ledger_lines = normalize_ledger_lines(attributes)
     legal_entity_ref = _resolve_legal_entity_ref(connection, payload, attributes)
+    description_hint = _build_account_alignment_hint(connection, payload, attributes)
     ledger_lines = align_ledger_lines_to_chart_of_accounts(
         connection=connection,
         lines=ledger_lines,
         legal_entity_ref=legal_entity_ref,
-        description_hint=str(attributes.get("description") or payload.get("object_name") or ""),
+        description_hint=description_hint,
     )
     validation = validate_double_entry(
         ledger_lines,
@@ -2338,7 +2573,6 @@ def upsert_transaction_and_lines(
     source_type = str(attributes.get("source_type") or attributes.get("document_type") or "document_ingest")
     description = str(attributes.get("description") or payload.get("object_name") or "Accounting transaction")
     receipt_archive_url = attributes.get("receipt_archive_url")
-    doc_id = payload.get("doc_id")
     object_id = object_row.get("object_id")
 
     tx_sql = """

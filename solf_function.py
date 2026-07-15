@@ -11,7 +11,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import csv
 from datetime import date
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import object_db
@@ -53,6 +56,178 @@ def _connection_scope() -> tuple[Any, bool]:
     if _ACTIVE_CONNECTION is not None:
         return _ACTIVE_CONNECTION, False
     return object_db.get_connection(), True
+
+
+def _entity_name_tokens(value: Any) -> list[str]:
+    text = str(value or "").strip().lower()
+    return [tok for tok in re.findall(r"[a-z0-9äöüß]+", text) if tok]
+
+
+def _resolve_entity_id_fuzzy(connection: Any, entity_name: str) -> int | bool:
+    hint = str(entity_name or "").strip()
+    if not hint:
+        return False
+
+    try:
+        candidates = object_db.search_objects(
+            connection=connection,
+            name_query=hint,
+            class_name=None,
+            limit=8,
+            include_inactive=False,
+        )
+    except Exception:
+        LOGGER.exception("SOLF fuzzy entity resolution failed entity=%r", entity_name)
+        return False
+
+    if not candidates:
+        return False
+
+    hint_tokens = set(_entity_name_tokens(hint))
+    ranked: list[dict[str, Any]] = []
+    for candidate in candidates:
+        object_id = int(candidate.get("object_id") or 0)
+        if object_id <= 0:
+            continue
+        similarity = float(candidate.get("similarity") or 0.0)
+        candidate_name = str(candidate.get("object_name") or candidate.get("canonical_full_name") or "").strip()
+        candidate_tokens = set(_entity_name_tokens(candidate_name))
+        overlap = len(hint_tokens.intersection(candidate_tokens))
+        overlap_ratio = (overlap / max(1, len(hint_tokens))) if hint_tokens else 0.0
+        ranked.append(
+            {
+                "object_id": object_id,
+                "object_name": candidate_name,
+                "similarity": similarity,
+                "overlap": overlap,
+                "overlap_ratio": overlap_ratio,
+            }
+        )
+
+    if not ranked:
+        return False
+
+    ranked.sort(
+        key=lambda item: (
+            -float(item.get("overlap_ratio") or 0.0),
+            -float(item.get("similarity") or 0.0),
+            str(item.get("object_name") or "").lower(),
+        )
+    )
+    best = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else None
+
+    best_overlap_ratio = float(best.get("overlap_ratio") or 0.0)
+    best_similarity = float(best.get("similarity") or 0.0)
+    second_overlap_ratio = float(second.get("overlap_ratio") or 0.0) if isinstance(second, dict) else 0.0
+    second_similarity = float(second.get("similarity") or 0.0) if isinstance(second, dict) else 0.0
+
+    if best_overlap_ratio < 1.0:
+        return False
+
+    if second is None:
+        return int(best.get("object_id") or 0) if best_similarity >= 0.30 else False
+
+    overlap_gap = best_overlap_ratio - second_overlap_ratio
+    similarity_gap = best_similarity - second_similarity
+    if best_similarity >= 0.55 and (overlap_gap >= 0.20 or similarity_gap >= 0.12):
+        return int(best.get("object_id") or 0)
+
+    LOGGER.warning(
+        "SOLF fuzzy entity resolution ambiguous entity=%r best=%s second=%s",
+        entity_name,
+        best,
+        second,
+    )
+    return False
+
+
+def get_entity_id(entity: Any) -> int | bool:
+    """Resolve an entity reference to object_id.
+
+    Accepts numeric ids directly or exact entity names via object_name /
+    canonical_full_name lookup. Returns False on failure so SOLF AND chains fail
+    cleanly.
+    """
+    if entity in (None, "", [], {}):
+        return False
+
+    connection, should_close = _connection_scope()
+    try:
+        if isinstance(entity, bool):
+            return False
+
+        if isinstance(entity, int):
+            row = object_db.get_object_instance_by_id(connection, int(entity), include_inactive=False)
+            return int(row.get("object_id")) if isinstance(row, dict) and row.get("object_id") is not None else False
+
+        text = str(entity or "").strip()
+        if not text:
+            return False
+
+        if re.fullmatch(r"\d+", text):
+            row = object_db.get_object_instance_by_id(connection, int(text), include_inactive=False)
+            return int(row.get("object_id")) if isinstance(row, dict) and row.get("object_id") is not None else False
+
+        row = object_db.get_object_instance(connection, text, include_inactive=False)
+        if isinstance(row, dict) and row.get("object_id") is not None:
+            return int(row.get("object_id"))
+
+        return _resolve_entity_id_fuzzy(connection, text)
+    except Exception:
+        LOGGER.exception("SOLF get_entity_id failed entity=%r", entity)
+        return False
+    finally:
+        if should_close:
+            connection.close()
+
+
+def merge(canonical_entity_id: Any, duplicate_entity_id: Any) -> dict[str, Any] | bool:
+    """Merge two entities by object id and return a summary payload.
+
+    Returns False on failure so callers can use it directly in SOLF clauses.
+    """
+    if canonical_entity_id in (None, False, "") or duplicate_entity_id in (None, False, ""):
+        return False
+
+    try:
+        canonical_id = int(canonical_entity_id)
+        duplicate_id = int(duplicate_entity_id)
+    except (TypeError, ValueError):
+        return False
+
+    connection, should_close = _connection_scope()
+    try:
+        summary = object_db.merge_object_instances(
+            connection=connection,
+            canonical_object_id=canonical_id,
+            duplicate_object_id=duplicate_id,
+            merge_note="solf_merge_entities",
+            keep_alias_link=True,
+        )
+        if should_close:
+            connection.commit()
+        return {
+            "status": "merged",
+            "canonical_object_id": canonical_id,
+            "duplicate_object_id": duplicate_id,
+            "summary": summary,
+        }
+    except Exception:
+        if should_close:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        LOGGER.exception(
+            "SOLF merge failed canonical_entity_id=%r duplicate_entity_id=%r",
+            canonical_entity_id,
+            duplicate_entity_id,
+        )
+        return False
+    finally:
+        if should_close:
+            connection.close()
 
 
 def _normalize_entity_payload(payload: Any) -> dict[str, Any]:
@@ -1646,13 +1821,179 @@ def workflow_domain_operation(payload: Any) -> dict[str, Any] | bool:
         return {"ok": False, "error": str(exc)}
 
 
+def workflow_generate_artifact(payload: Any) -> dict[str, Any] | bool:
+    """Generate a generic workflow artifact from context/LLM JSON output.
+
+    The function supports xlsx/csv/json/txt and reads artifact hints from either:
+      - payload.artifact (dict)
+      - payload.json.artifact or payload.json.artifacts[0]
+
+    Common keys:
+      - output_dir (default generated/doc)
+      - output_filename (optional)
+      - default_format (default xlsx)
+      - artifact: {format, filename, title, columns, rows, summary}
+    """
+    try:
+        data = _normalize_entity_payload(payload)
+        ctx = data.get("context") if isinstance(data.get("context"), dict) else {}
+        merged = dict(ctx)
+        merged.update(data)
+
+        llm_json = merged.get("json") if isinstance(merged.get("json"), dict) else {}
+        artifact = merged.get("artifact") if isinstance(merged.get("artifact"), dict) else {}
+        if not artifact and isinstance(llm_json.get("artifact"), dict):
+            artifact = dict(llm_json.get("artifact") or {})
+        if not artifact and isinstance(llm_json.get("artifacts"), list) and llm_json.get("artifacts"):
+            first = llm_json.get("artifacts")[0]
+            if isinstance(first, dict):
+                artifact = dict(first)
+
+        output_dir = Path(str(merged.get("output_dir") or "generated/doc")).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = str(
+            artifact.get("filename")
+            or merged.get("output_filename")
+            or ""
+        ).strip()
+
+        workflow_key = str(merged.get("workflow_key") or merged.get("workflow") or "workflow").strip() or "workflow"
+        workflow_token = re.sub(r"[^A-Za-z0-9_-]+", "_", workflow_key.replace("::", "_")).strip("_") or "workflow"
+        title = str(artifact.get("title") or llm_json.get("title") or workflow_token).strip() or workflow_token
+        default_format = str(merged.get("default_format") or "xlsx").strip().lower() or "xlsx"
+        forced_format = str(merged.get("force_format") or "").strip().lower()
+        artifact_format = str(forced_format or artifact.get("format") or default_format).strip().lower() or default_format
+        if artifact_format == "excel":
+            artifact_format = "xlsx"
+
+        if not filename:
+            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", title).strip("_") or workflow_token
+            filename = f"{safe_name}_{stamp}.{artifact_format}"
+
+        artifact_path = output_dir / filename
+
+        columns = artifact.get("columns") if isinstance(artifact.get("columns"), list) else []
+        rows = artifact.get("rows") if isinstance(artifact.get("rows"), list) else []
+        if not rows and isinstance(llm_json.get("rows"), list):
+            rows = llm_json.get("rows")
+        if not columns and isinstance(llm_json.get("columns"), list):
+            columns = llm_json.get("columns")
+
+        if not rows and isinstance(llm_json, dict) and llm_json:
+            rows = [{"key": key, "value": value} for key, value in llm_json.items()]
+            columns = ["key", "value"]
+
+        if not rows:
+            summary_text = str(artifact.get("summary") or merged.get("text") or "")
+            rows = [{"summary": summary_text}] if summary_text else [{"summary": json.dumps(merged, ensure_ascii=False)}]
+            columns = ["summary"]
+
+        normalized_columns: list[str] = []
+        for col in columns:
+            if isinstance(col, dict):
+                name = str(col.get("name") or "").strip()
+            else:
+                name = str(col or "").strip()
+            if name:
+                normalized_columns.append(name)
+
+        normalized_rows: list[list[Any]] = []
+        if rows and isinstance(rows[0], dict):
+            if not normalized_columns:
+                first_keys = list(rows[0].keys())
+                normalized_columns = [str(key) for key in first_keys]
+            for row in rows:
+                if isinstance(row, dict):
+                    normalized_rows.append([row.get(col) for col in normalized_columns])
+        else:
+            for row in rows:
+                if isinstance(row, list):
+                    normalized_rows.append(list(row))
+                else:
+                    normalized_rows.append([row])
+            if not normalized_columns:
+                normalized_columns = ["value"]
+
+        def _cell_safe(value: Any) -> Any:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, (dict, list, tuple, set)):
+                try:
+                    return json.dumps(value, ensure_ascii=False)
+                except Exception:
+                    return str(value)
+            return str(value)
+
+        normalized_rows = [[_cell_safe(cell) for cell in row] for row in normalized_rows]
+
+        if artifact_format == "xlsx":
+            try:
+                from openpyxl import Workbook  # type: ignore
+
+                wb = Workbook()
+                ws = wb.active
+                ws.title = str(artifact.get("sheet_name") or "Result").strip() or "Result"
+                ws.append(normalized_columns)
+                for row in normalized_rows:
+                    ws.append(row)
+                wb.save(str(artifact_path.with_suffix(".xlsx")))
+                artifact_path = artifact_path.with_suffix(".xlsx")
+            except Exception as exc:
+                if forced_format == "xlsx":
+                    raise RuntimeError(f"xlsx generation failed while force_format=xlsx: {exc}") from exc
+                artifact_format = "csv"
+
+        if artifact_format == "csv":
+            artifact_path = artifact_path.with_suffix(".csv")
+            with artifact_path.open("w", encoding="utf-8", newline="") as fp:
+                writer = csv.writer(fp)
+                writer.writerow(normalized_columns)
+                writer.writerows(normalized_rows)
+
+        if artifact_format == "json":
+            artifact_path = artifact_path.with_suffix(".json")
+            artifact_path.write_text(
+                json.dumps(
+                    {
+                        "title": title,
+                        "columns": normalized_columns,
+                        "rows": normalized_rows,
+                        "artifact": artifact,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+        if artifact_format == "txt":
+            artifact_path = artifact_path.with_suffix(".txt")
+            lines = [str(title), ""]
+            lines.append(", ".join(normalized_columns))
+            lines.extend([", ".join([str(cell) for cell in row]) for row in normalized_rows])
+            artifact_path.write_text("\n".join(lines), encoding="utf-8")
+
+        return {
+            "ok": True,
+            "artifact_title": title,
+            "artifact_path": str(artifact_path),
+            "artifact_format": artifact_format,
+            "columns": normalized_columns,
+            "row_count": len(normalized_rows),
+        }
+    except Exception as exc:
+        LOGGER.exception("workflow_generate_artifact failed")
+        return {"ok": False, "error": str(exc)}
+
+
 def workflow_compose_operations(payload: Any) -> dict[str, Any] | bool:
     """Compose multiple operations to achieve a business goal.
 
     Payload:
       - context: dict (initial context)
       - operations: list of
-        { action: 'workflow_llm_call'|'workflow_generate_schema_and_solf'|'workflow_domain_operation',
+        { action: 'workflow_llm_call'|'workflow_generate_schema_and_solf'|'workflow_domain_operation'|'workflow_generate_artifact',
           payload: {...},
           save_as: 'key' (optional),
           merge_result_json: bool (optional) }
@@ -1671,6 +2012,7 @@ def workflow_compose_operations(payload: Any) -> dict[str, Any] | bool:
             "workflow_llm_call": workflow_llm_call,
             "workflow_generate_schema_and_solf": workflow_generate_schema_and_solf,
             "workflow_domain_operation": workflow_domain_operation,
+            "workflow_generate_artifact": workflow_generate_artifact,
         }
 
         step_results: list[dict[str, Any]] = []

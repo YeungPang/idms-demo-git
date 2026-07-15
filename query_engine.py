@@ -861,6 +861,19 @@ class QueryEngine:
         if has_contact_cue and (has_email_cue or has_process_cue):
             return None
 
+        # Identifier lookup questions (for example EORI/VAT) are scalar
+        # attribute intents and should not be treated as table cell requests.
+        if self._looks_like_identifier_request(stripped):
+            return None
+
+        # Time-windowed list-style requests (expenses/payments/invoices, etc.)
+        # belong to criteria parsing rather than row/column extraction.
+        if self._extract_time_window(stripped) and re.search(
+            r"\b(?:expense|expenses|payment|payments|invoice|invoices|receipt|receipts|transaction|transactions|travel|travelling)\b",
+            lowered,
+        ):
+            return None
+
         context_entity_hint = default_entity_hint
         context_match = re.match(r"^\s*in\s+the\s+(.+?),\s*(.+)$", stripped, flags=re.IGNORECASE)
         if context_match:
@@ -2963,29 +2976,6 @@ class QueryEngine:
         ):
             return "address", "attribute"
 
-        if business_rules is not None:
-            try:
-                lower_raw = raw_text
-                country_hint = None
-                if "switzerland" in lower_raw or "schweiz" in lower_raw:
-                    country_hint = "switzerland"
-                elif "germany" in lower_raw or "deutschland" in lower_raw:
-                    country_hint = "germany"
-
-                rule_match = business_rules.resolve_attribute_via_business_rules(
-                    requested_attribute=str(raw),
-                    context={
-                        "country": country_hint,
-                        "entity_class": None,
-                    },
-                )
-                if isinstance(rule_match, dict):
-                    canonical = str(rule_match.get("canonical_attribute") or "").strip()
-                    if canonical:
-                        return canonical, "attribute"
-            except Exception:
-                pass
-
         normalized = self._normalize_attribute_name(raw)
         if normalized and normalized in self._canonical_attribute_names():
             return normalized, "attribute"
@@ -3010,6 +3000,29 @@ class QueryEngine:
                 canonical_name = str(schema_match.get("canonical_name") or "").strip() or None
                 if canonical_name:
                     return canonical_name, kind
+
+        if business_rules is not None:
+            try:
+                lower_raw = raw_text
+                country_hint = None
+                if "switzerland" in lower_raw or "schweiz" in lower_raw:
+                    country_hint = "switzerland"
+                elif "germany" in lower_raw or "deutschland" in lower_raw:
+                    country_hint = "germany"
+
+                rule_match = business_rules.resolve_attribute_via_business_rules(
+                    requested_attribute=str(raw),
+                    context={
+                        "country": country_hint,
+                        "entity_class": None,
+                    },
+                )
+                if isinstance(rule_match, dict):
+                    canonical = str(rule_match.get("canonical_attribute") or "").strip()
+                    if canonical:
+                        return canonical, "attribute"
+            except Exception:
+                pass
 
         if normalized:
             return normalized, "attribute"
@@ -5357,8 +5370,15 @@ class QueryEngine:
 
     def _best_entity_hint(self, question: str) -> str | None:
         """Best-effort entity extraction: DB mention → spaCy → regex → LLM."""
+        explicit_legal_entity = self._extract_legal_entity_mention(question)
+
         hint = self._resolve_entity_mention_from_db(question)
         if hint and not self._is_suspicious_entity_hint(hint):
+            if explicit_legal_entity:
+                normalized_hint = self._normalize_entity_name_hint(hint) or ""
+                normalized_explicit = self._normalize_entity_name_hint(explicit_legal_entity) or ""
+                if normalized_hint and normalized_explicit and normalized_hint.casefold() == normalized_explicit.casefold():
+                    return explicit_legal_entity
             return hint
 
         hint = self._extract_entity_via_spacy(question)
@@ -6197,6 +6217,21 @@ class QueryEngine:
                 if entity_raw:
                     break
 
+        # Handle phrasing like "related to travelling for Chung Yeung Pang":
+        # the relation object (travelling) is a topic, while the for-clause carries
+        # the primary entity anchor.
+        topic_term = self._normalize_entity_name_hint(entity_raw) if entity_raw else None
+        anchor_for_entity = None
+        for_clause_match = re.search(
+            r"\b(?:for|f[üu]r)\s+([A-Za-z0-9 .&äöüÄÖÜß_\-/]+?)(?:\s+with\b|\s+that\b|\s+which\b|\s+having\b|\s+showing\b|\s+including\b|[\?\.!]|$)",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if for_clause_match:
+            anchor_for_entity = self._normalize_entity_name_hint((for_clause_match.group(1) or "").strip(" ."))
+        if anchor_for_entity:
+            entity_raw = anchor_for_entity
+
         # If spaCy already identified the entity (passed in as default_entity_hint), trust it
         # over the regex result. The regex captures trailing words like "with titles and file names"
         # even when our terminators miss edge cases. spaCy's NER knows exactly where the name ends.
@@ -6221,6 +6256,8 @@ class QueryEngine:
                 normalized_part = self._normalize_entity_name_hint(str(part or "").strip(" ."))
                 if normalized_part and normalized_part not in must_entities:
                     must_entities.append(normalized_part)
+        if topic_term and topic_term not in must_entities:
+            must_entities.append(topic_term)
         if not must_entities:
             must_entities = [entity_name]
         entity_name = must_entities[0]
@@ -6294,6 +6331,8 @@ class QueryEngine:
             "semantic_relation": matched_relation or "implicit",
             "semantic_retrieval_mode": retrieval_mode,
         }
+        if anchor_for_entity and topic_term and topic_term.lower() != str(entity_name or "").lower():
+            criteria["require_all_terms"] = True
         if wants_title_and_files:
             criteria["response_format"] = "doc_titles_and_files"
         if time_window:
@@ -6329,6 +6368,7 @@ class QueryEngine:
         if not attr_hints:
             attr_hints = ["description"]
         semantic_only = bool(criteria.get("semantic_only"))
+        require_all_terms = bool(criteria.get("require_all_terms"))
         keyword_patterns = self._criteria_keyword_patterns(must_contain)
 
         scope_doc_ids = self._unique_ints(list((scope or {}).get("doc_ids") or []))
@@ -6420,7 +6460,7 @@ class QueryEngine:
         except Exception:
             return None
 
-        scored: dict[str, dict[str, Any]] = {}
+        scored: dict[int | str, dict[str, Any]] = {}
         for row in rows:
             object_name = str(row[1] or "").strip()
             if not object_name:
@@ -6428,30 +6468,38 @@ class QueryEngine:
             blob = " ".join(
                 [
                     object_name,
+                    str(row[2] or ""),
                     str(row[3] or ""),
                     str(row[4] or ""),
                     str(row[5] or ""),
+                    str(row[7] or ""),
                 ]
-            ).lower()
-            hit_count = sum(1 for token in must_contain if token.lower() in blob)
+            )
+            blob_norm = self._normalize_semantic_text(blob)
+            matched_terms = [token for token in must_contain if self._criteria_term_matches_haystack(token, blob_norm)]
+            hit_count = len(matched_terms)
             if hit_count <= 0:
                 continue
+            if require_all_terms and hit_count < len(must_contain):
+                continue
 
-            prev = scored.get(object_name)
+            doc_id = row[6]
+            key: int | str = int(doc_id) if isinstance(doc_id, int) else f"obj:{row[0]}:{object_name.lower()}"
+            prev = scored.get(key)
             score = float(hit_count)
             item = {
                 "object_id": row[0],
                 "entity_name": object_name,
                 "entity_type": row[2],
-                "doc_id": row[6],
+                "doc_id": doc_id,
                 "doc_name": row[7],
                 "doc_path": row[8],
                 "doc_date": row[9],
-                "matched_terms": [token for token in must_contain if token.lower() in blob],
+                "matched_terms": matched_terms,
                 "score": score,
             }
             if prev is None or score > float(prev.get("score") or 0.0):
-                scored[object_name] = item
+                scored[key] = item
 
         ranked = sorted(scored.values(), key=lambda x: (-float(x.get("score") or 0.0), str(x.get("entity_name") or "")))
         matches = ranked[: max(1, int(limit))]
@@ -6492,12 +6540,103 @@ class QueryEngine:
         allow_indirect_expansion = retrieval_mode in {"related", "expanded"} or bool(
             criteria.get("allow_indirect_relationships")
         )
+        scope_doc_id_set = set(scope_doc_ids or [])
 
         sql_doc_filter = "any" if doc_hint == "all" else doc_hint
 
         keyword_patterns = self._criteria_keyword_patterns(must_contain)
         if not keyword_patterns:
             return None
+
+        require_all_terms = bool(criteria.get("require_all_terms"))
+        required_terms_norm = {
+            self._normalize_semantic_text(term)
+            for term in must_contain
+            if self._normalize_semantic_text(term)
+        }
+        semantic_frame = str(criteria.get("semantic_frame") or "").strip().lower()
+        entity_anchor_term = str((must_contain[0] if must_contain else "") or "").strip()
+        entity_anchor_doc_ids: set[int] = set()
+
+        if require_all_terms and semantic_frame == "document_about_entity" and entity_anchor_term:
+            entity_patterns = self._criteria_keyword_patterns([entity_anchor_term])
+            if entity_patterns:
+                try:
+                    with self._get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                SELECT DISTINCT p.doc_id
+                                FROM part p
+                                                                LEFT JOIN object_instance oi ON oi.object_id = p.object_id
+                                                                LEFT JOIN object_relationship rel ON rel.relationship_id = p.relationship_id
+                                                                LEFT JOIN object_instance src ON src.object_id = rel.src_object_id
+                                                                LEFT JOIN object_instance tar ON tar.object_id = rel.tar_object_id
+                                                                WHERE 1=1
+                                  AND (
+                                    COALESCE(array_length(%s::int[], 1), 0) = 0
+                                    OR p.doc_id = ANY(%s)
+                                  )
+                                                                    AND COALESCE(
+                                                                                concat_ws(
+                                                                                        ' ',
+                                                                                        oi.object_name,
+                                                                                        oi.class_name,
+                                                                                        oi.metadata::text,
+                                                                                        src.object_name,
+                                                                                        src.class_name,
+                                                                                        src.metadata::text,
+                                                                                        tar.object_name,
+                                                                                        tar.class_name,
+                                                                                        tar.metadata::text
+                                                                                ),
+                                                                                ''
+                                                                            ) ILIKE ANY(%s)
+                                """,
+                                (scope_doc_ids, scope_doc_ids, entity_patterns),
+                            )
+                            entity_anchor_doc_ids = {int(row[0]) for row in (cur.fetchall() or []) if isinstance(row[0], int)}
+                except Exception:
+                    entity_anchor_doc_ids = set()
+
+        def _has_full_term_coverage(matched_terms: list[str]) -> bool:
+            if not require_all_terms:
+                return True
+            matched_norm = {
+                self._normalize_semantic_text(term)
+                for term in (matched_terms or [])
+                if self._normalize_semantic_text(term)
+            }
+            return required_terms_norm.issubset(matched_norm)
+
+        def _upsert_scored(item: dict[str, Any]) -> None:
+            doc_id = item.get("doc_id")
+            if not isinstance(doc_id, int):
+                return
+            prev = scored.get(doc_id)
+            if prev is None:
+                scored[doc_id] = item
+                return
+            merged_terms: list[str] = []
+            seen: set[str] = set()
+            for token in list(prev.get("matched_terms") or []) + list(item.get("matched_terms") or []):
+                key = str(token or "").strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged_terms.append(str(token))
+            winner = dict(prev if float(prev.get("score") or 0.0) >= float(item.get("score") or 0.0) else item)
+            winner["matched_terms"] = merged_terms
+            winner["score"] = max(float(prev.get("score") or 0.0), float(item.get("score") or 0.0))
+            scored[doc_id] = winner
+
+        def _needs_enrichment(doc_id: int) -> bool:
+            existing = scored.get(doc_id)
+            if existing is None:
+                return True
+            if not require_all_terms:
+                return False
+            return not _has_full_term_coverage(list(existing.get("matched_terms") or []))
 
         query_sql = """
                         SELECT
@@ -6579,47 +6718,54 @@ class QueryEngine:
         scored: dict[int, dict[str, Any]] = {}
 
         def _term_matches_haystack(term: str, haystack: str) -> bool:
-            normalized_term = self._normalize_semantic_text(term)
-            if not normalized_term:
-                return False
-
-            # Primary check: phrase-level substring variants.
-            if any(v in haystack for v in self._semantic_token_variants(normalized_term)):
-                return True
-
-            # Fallback for names/phrases appearing in different token order, e.g.
-            # "Alex Example" vs "Example, Alex".
-            pieces = [
-                tok
-                for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9]{2,}", normalized_term)
-                if tok not in self.SEMANTIC_STOPWORDS
-            ]
-            if len(pieces) < 2:
-                return False
-            return all(any(v in haystack for v in self._semantic_token_variants(tok)) for tok in pieces)
+            return self._criteria_term_matches_haystack(term, haystack)
 
         for row in rows:
             doc_id = row[0]
             if not isinstance(doc_id, int):
                 continue
 
+            metadata = row[8] if isinstance(row[8], dict) else {}
+            metadata_desc = str(metadata.get("description") or "")
+            metadata_user_desc = str(metadata.get("user_description") or "")
+            user_meta = metadata.get("user_metadata") if isinstance(metadata.get("user_metadata"), dict) else {}
+            user_subject = str(user_meta.get("email_subject") or user_meta.get("subject") or "")
+            user_summary = str(user_meta.get("summary") or "")
+
             blob = self._normalize_semantic_text(
                 " ".join(
                     [
                         str(row[1] or ""),
-                        str(row[2] or ""),
                         str(row[3] or ""),
                         str(row[4] or ""),
                         str(row[6] or ""),
                         str(row[7] or ""),
-                        str(row[8] or ""),
+                        metadata_desc,
+                        metadata_user_desc,
+                        user_subject,
+                        user_summary,
                     ]
                 )
             )
 
             matched_terms: list[str] = []
             for term in must_contain:
-                if _term_matches_haystack(term, blob):
+                matched_from_text = _term_matches_haystack(term, blob)
+                matched_from_entity_link = (
+                    bool(entity_anchor_doc_ids)
+                    and term == entity_anchor_term
+                    and isinstance(doc_id, int)
+                    and doc_id in entity_anchor_doc_ids
+                )
+                matched_from_scope_anchor = (
+                    require_all_terms
+                    and semantic_frame == "document_about_entity"
+                    and retrieval_mode in {"related", "expanded"}
+                    and term == entity_anchor_term
+                    and isinstance(doc_id, int)
+                    and doc_id in scope_doc_id_set
+                )
+                if matched_from_text or matched_from_entity_link or matched_from_scope_anchor:
                     matched_terms.append(term)
             if not matched_terms:
                 continue
@@ -6640,9 +6786,7 @@ class QueryEngine:
                 "matched_terms": matched_terms,
                 "score": score,
             }
-            prev = scored.get(doc_id)
-            if prev is None or score > float(prev.get("score") or 0.0):
-                scored[doc_id] = item
+            _upsert_scored(item)
 
         # In direct mode, add lexical evidence from indexed chunk text as well.
         # This keeps retrieval semantically strict (explicit mention) while avoiding
@@ -6664,7 +6808,8 @@ class QueryEngine:
                                 d.metadata,
                                 oi.object_id,
                                 oi.object_name,
-                                oi.class_name
+                                oi.class_name,
+                                oi.metadata
                             FROM document d
                             JOIN part p
                               ON p.doc_id = d.doc_id
@@ -6686,7 +6831,7 @@ class QueryEngine:
                                 %s IS NULL
                                 OR (d.doc_date IS NOT NULL AND d.doc_date <= %s::date)
                               )
-                              AND COALESCE(oi.object_name, '') ILIKE ANY(%s)
+                                                            AND COALESCE(concat_ws(' ', oi.object_name, oi.class_name, oi.metadata::text), '') ILIKE ANY(%s)
                               AND (
                                 (%s = 'note' AND (
                                     LOWER(COALESCE(d.doc_type, '')) LIKE '%%note%%'
@@ -6732,6 +6877,7 @@ class QueryEngine:
                             [
                                 str(row[6] or ""),
                                 str(row[7] or ""),
+                                str(row[8] or ""),
                             ]
                         )
                     )
@@ -6759,9 +6905,7 @@ class QueryEngine:
                         # Strong direct evidence: explicit object link in part table.
                         "score": float(len(matched_terms)) + 2.25,
                     }
-                    prev = scored.get(doc_id)
-                    if prev is None or float(item.get("score") or 0.0) > float(prev.get("score") or 0.0):
-                        scored[doc_id] = item
+                    _upsert_scored(item)
             except Exception:
                 pass
 
@@ -6803,7 +6947,7 @@ class QueryEngine:
                         "score": score,
                     }
 
-            q_doc_ids = [doc_id for doc_id in candidate_hits.keys() if doc_id not in scored]
+            q_doc_ids = [doc_id for doc_id in candidate_hits.keys() if _needs_enrichment(doc_id)]
             if q_doc_ids:
                 try:
                     with self._get_connection() as conn:
@@ -6883,9 +7027,7 @@ class QueryEngine:
                             "matched_terms": list(hit.get("matched_terms") or []),
                             "score": float(hit.get("score") or 0.0),
                         }
-                        prev = scored.get(doc_id)
-                        if prev is None or float(item.get("score") or 0.0) > float(prev.get("score") or 0.0):
-                            scored[doc_id] = item
+                        _upsert_scored(item)
                 except Exception:
                     pass
 
@@ -6954,7 +7096,7 @@ class QueryEngine:
                 base_dir = os.path.dirname(__file__)
                 for row in md_rows:
                     doc_id = row[0]
-                    if not isinstance(doc_id, int) or doc_id in scored:
+                    if not isinstance(doc_id, int) or not _needs_enrichment(doc_id):
                         continue
 
                     metadata = row[4] if isinstance(row[4], dict) else {}
@@ -6999,7 +7141,7 @@ class QueryEngine:
                         "matched_terms": matched_terms,
                         "score": float(len(matched_terms)) + 0.65,
                     }
-                    scored[doc_id] = item
+                    _upsert_scored(item)
             except Exception:
                 pass
 
@@ -7331,9 +7473,7 @@ class QueryEngine:
                         # Linked-entity evidence is strong; boost to ensure inclusion.
                         "score": float(len(matched_terms) + 2.0),
                     }
-                    prev = scored.get(doc_id)
-                    if prev is None or float(item.get("score") or 0.0) > float(prev.get("score") or 0.0):
-                        scored[doc_id] = item
+                    _upsert_scored(item)
 
                 for row in related_rows:
                     doc_id = row[0]
@@ -7369,9 +7509,7 @@ class QueryEngine:
                         # Second-hop evidence is slightly weaker than direct linked_name evidence.
                         "score": float(len(matched_terms) + 1.5),
                     }
-                    prev = scored.get(doc_id)
-                    if prev is None or float(item.get("score") or 0.0) > float(prev.get("score") or 0.0):
-                        scored[doc_id] = item
+                    _upsert_scored(item)
 
                 for row in related_doc_rows:
                     doc_id = row[0]
@@ -7395,11 +7533,16 @@ class QueryEngine:
                         "matched_terms": list(must_contain),
                         "score": float(len(must_contain) + 1.25),
                     }
-                    prev = scored.get(doc_id)
-                    if prev is None or float(item.get("score") or 0.0) > float(prev.get("score") or 0.0):
-                        scored[doc_id] = item
+                    _upsert_scored(item)
             except Exception:
                 pass
+
+        if require_all_terms and scored:
+            scored = {
+                doc_id: item
+                for doc_id, item in scored.items()
+                if _has_full_term_coverage(list(item.get("matched_terms") or []))
+            }
 
         ranked = sorted(scored.values(), key=lambda x: (-float(x.get("score") or 0.0), str(x.get("entity_name") or "")))
         matches = ranked[: max(1, int(limit))]
@@ -7478,6 +7621,16 @@ class QueryEngine:
         if not must_contain:
             return None
 
+        require_all_terms = bool(criteria.get("require_all_terms"))
+
+        def _primary_term_matches(haystack: str, term: str) -> bool:
+            return self._criteria_term_matches_haystack(term, haystack)
+
+        def _all_primary_terms_match(haystack: str) -> bool:
+            if not require_all_terms:
+                return True
+            return all(_primary_term_matches(haystack, term) for term in must_contain)
+
         phrases, tokens = self._criteria_terms(must_contain)
         entity_type = str(criteria.get("entity_type") or "").strip().lower()
 
@@ -7519,6 +7672,8 @@ class QueryEngine:
                     matched.add(token)
 
             if score <= 0:
+                continue
+            if not _all_primary_terms_match(haystack):
                 continue
 
             doc_scores[doc_id] = max(float(doc_scores.get(doc_id) or 0.0), score)
@@ -7569,7 +7724,10 @@ class QueryEngine:
         if not rows:
             return None
 
-        by_object: dict[str, dict[str, Any]] = {}
+        document_hint = str(criteria.get("document_hint") or "").strip().lower()
+        is_document_oriented = document_hint in {"document", "note", "all"} or str(criteria.get("semantic_frame") or "").strip().lower() == "document_about_entity"
+
+        by_bucket: dict[str, dict[str, Any]] = {}
         for row in rows:
             object_name = str(row[1] or "").strip()
             if not object_name:
@@ -7584,11 +7742,17 @@ class QueryEngine:
                     name_boost += 0.5
 
             total_score = base_score + name_boost
-            current = by_object.get(object_name)
+            if is_document_oriented and doc_id is not None:
+                bucket_key = f"doc:{doc_id}"
+            else:
+                bucket_key = f"obj:{object_name}"
+
+            display_name = str(row[4] or object_name or "").strip() if is_document_oriented else object_name
+            current = by_bucket.get(bucket_key)
             candidate = {
                 "object_id": row[0],
-                "entity_name": object_name,
-                "entity_type": row[2],
+                "entity_name": display_name,
+                "entity_type": "document" if is_document_oriented else row[2],
                 "doc_id": row[3],
                 "doc_name": row[4],
                 "doc_path": row[5],
@@ -7597,9 +7761,9 @@ class QueryEngine:
                 "score": total_score,
             }
             if current is None or float(candidate["score"]) > float(current.get("score") or 0.0):
-                by_object[object_name] = candidate
+                by_bucket[bucket_key] = candidate
 
-        ranked = sorted(by_object.values(), key=lambda x: (-float(x.get("score") or 0.0), str(x.get("entity_name") or "")))
+        ranked = sorted(by_bucket.values(), key=lambda x: (-float(x.get("score") or 0.0), str(x.get("entity_name") or "")))
         matches = ranked[: max(1, int(limit))]
         if not matches:
             return None
@@ -7619,6 +7783,17 @@ class QueryEngine:
         tokens: list[str],
         limit: int,
     ) -> dict[str, Any] | None:
+        must_contain = [str(item).strip() for item in list(criteria.get("must_contain") or []) if str(item).strip()]
+        require_all_terms = bool(criteria.get("require_all_terms"))
+
+        def _primary_term_matches(haystack: str, term: str) -> bool:
+            return self._criteria_term_matches_haystack(term, haystack)
+
+        def _all_primary_terms_match(haystack: str) -> bool:
+            if not require_all_terms:
+                return True
+            return all(_primary_term_matches(haystack, term) for term in must_contain)
+
         entity_type = str(criteria.get("entity_type") or "").strip().lower()
         try:
             with self._get_connection() as conn:
@@ -7686,6 +7861,8 @@ class QueryEngine:
                     matched.add(token)
 
             if score <= 0:
+                continue
+            if not _all_primary_terms_match(blob):
                 continue
 
             item = {
@@ -9110,11 +9287,7 @@ class QueryEngine:
         text = str(path_text or "").strip()
         if not text:
             return False
-        if QueryEngine._looks_like_temp_upload_path(text):
-            return False
         if QueryEngine._is_absolute_or_uri_path(text):
-            if re.match(r"^[A-Za-z]:[\\/].*", text):
-                return Path(text).exists()
             return True
         return False
 
@@ -9605,6 +9778,36 @@ class QueryEngine:
         variants.add(t.replace("oe", "o"))
         variants.add(t.replace("ue", "u"))
         return [v for v in variants if v]
+
+    def _criteria_term_matches_haystack(self, term: str, haystack: str) -> bool:
+        normalized_term = self._normalize_semantic_text(term)
+        if not normalized_term:
+            return False
+
+        variant_set: set[str] = set(self._semantic_token_variants(normalized_term))
+        pieces = [
+            tok
+            for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9]{2,}", normalized_term)
+            if tok not in self.SEMANTIC_STOPWORDS
+        ]
+        for token in pieces:
+            variant_set.update(self._semantic_token_variants(token))
+
+        # Domain aliasing for travel intent so queries with "travelling" match
+        # ticket/reise/fahrt style document language.
+        travel_aliases = {
+            "travel", "travelling", "traveling", "trip", "journey", "reisen", "reise", "fahrt", "ticket", "tickets",
+            "booking", "booked", "reservation", "itinerary",
+        }
+        if normalized_term in travel_aliases or any(tok in travel_aliases for tok in pieces):
+            variant_set.update(travel_aliases)
+
+        if any(v in haystack for v in variant_set if v):
+            return True
+
+        if len(pieces) < 2:
+            return False
+        return all(any(v in haystack for v in self._semantic_token_variants(tok)) for tok in pieces)
 
     def _document_file_info_from_semantic_text(self, conn, hint_text: str) -> dict[str, Any] | None:
         tokens = self._semantic_tokens(hint_text)

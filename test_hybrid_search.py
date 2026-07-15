@@ -36,7 +36,7 @@ decision_tests = [
 
 for query in decision_tests:
     use_hybrid = should_use_hybrid_search(query)
-    status = "✓ HYBRID" if use_hybrid else "✗ DENSE"
+    status = "[HYBRID]" if use_hybrid else "[DENSE]"
     print(f"{status:15} | {query}")
 
 # Test 3: Result merging
@@ -76,4 +76,9 @@ print("\nMerged Results (weighted hybrid):")
 for r in merged:
     print(f"  {r['id']:6} | Combined: {r['score']:.4f} (Sparse: {r['sparse_score']:.2f}, Dense: {r['dense_score']:.2f})")
 
-print("\n✓ Hybrid search system fully tested and working!")
+print("\n[OK] Hybrid search system fully tested and working!")
+
+
+def test_hybrid_search_module_smoke() -> None:
+    assert should_use_hybrid_search("CHE-399.737.068") is True
+    assert isinstance(merge_hybrid_results([], [], limit=1), list)

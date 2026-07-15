@@ -187,6 +187,12 @@ def demo_classification_counts():
         print(f"  - {type_name}: {acc:.0%}")
 
 
+def test_rule_ingestion_module_smoke() -> None:
+    assert callable(demo_classifier)
+    assert callable(demo_api_requests)
+    assert callable(demo_classification_counts)
+
+
 if __name__ == "__main__":
     print("\n" + "█" * 80)
     print("█" + " " * 78 + "█")

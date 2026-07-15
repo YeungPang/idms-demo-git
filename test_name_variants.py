@@ -7,8 +7,6 @@ from collections import defaultdict
 sys.path.insert(0, '.')
 from query_engine import QueryEngine
 
-engine = QueryEngine()
-
 def _active_person_names(query_engine: QueryEngine) -> list[str]:
     with query_engine._get_connection() as conn:
         with conn.cursor() as cur:
@@ -77,39 +75,35 @@ def _build_generic_queries(query_engine: QueryEngine) -> list[str]:
     return deduped
 
 
-test_queries = _build_generic_queries(engine)
 
-if not test_queries:
-    print("No active person names found; skipped name-variant checks.")
-    raise SystemExit(0)
 
-print("Testing generic entity extraction and resolution for name variants:\n")
-for q in test_queries:
-    print(f"Query: '{q}'")
-    
-    # Step 1: Entity extraction (what the parser finds)
-    entity_hint = engine._best_entity_hint(q)
-    print(f"  [1] Entity extraction: '{entity_hint}'")
-    
-    # Step 2: SQL resolution (what gets looked up)
-    if entity_hint:
-        try:
-            with engine._get_connection() as conn:
-                details = engine._resolve_entity_name_for_lookup_details(conn, q)
-                resolved = details.get("resolved_name") if isinstance(details, dict) else None
-                ambiguous = bool(details.get("ambiguous")) if isinstance(details, dict) else False
-                candidates = list(details.get("candidates") or []) if isinstance(details, dict) else []
-                print(f"  [2] SQL resolution: '{resolved}'")
-                if ambiguous:
-                    print(f"  [2a] Ambiguous candidates: {candidates}")
-                
-                # Also check what partial matches return
-                with conn.cursor() as cur:
-                    # Extract last token (surname usually)
-                    tokens = re.findall(r"[a-zA-Z0-9äöüÄÖÜß]{3,}", entity_hint)
-                    if tokens:
-                        last_token = tokens[-1]
-                        cur.execute("""
+def run_name_variants_demo() -> int:
+    engine = QueryEngine()
+    test_queries = _build_generic_queries(engine)
+    if not test_queries:
+        print("No active person names found; skipped name-variant checks.")
+        return 0
+
+    print("Testing generic entity extraction and resolution for name variants:\n")
+    for q in test_queries:
+        print(f"Query: '{q}'")
+        entity_hint = engine._best_entity_hint(q)
+        print(f"  [1] Entity extraction: '{entity_hint}'")
+        if entity_hint:
+            try:
+                with engine._get_connection() as conn:
+                    details = engine._resolve_entity_name_for_lookup_details(conn, q)
+                    resolved = details.get("resolved_name") if isinstance(details, dict) else None
+                    ambiguous = bool(details.get("ambiguous")) if isinstance(details, dict) else False
+                    candidates = list(details.get("candidates") or []) if isinstance(details, dict) else []
+                    print(f"  [2] SQL resolution: '{resolved}'")
+                    if ambiguous:
+                        print(f"  [2a] Ambiguous candidates: {candidates}")
+                    with conn.cursor() as cur:
+                        tokens = re.findall(r"[a-zA-Z0-9äöüÄÖÜß]{3,}", entity_hint)
+                        if tokens:
+                            last_token = tokens[-1]
+                            cur.execute("""
                                                         SELECT object_name, class_name
                             FROM object_instance
                             WHERE LOWER(object_name) LIKE LOWER(%s)
@@ -118,13 +112,23 @@ for q in test_queries:
                               AND (valid_until IS NULL OR valid_until > CURRENT_DATE)
                             ORDER BY object_name
                         """, (f"%{last_token}%",))
-                        matches = cur.fetchall()
-                        if matches:
-                            print(f"  [3] Partial matches (%{last_token}%): {len(matches)} results")
-                            for name, otype in matches[:3]:
-                                print(f"       - {name} ({otype})")
-                            if len(matches) > 3:
-                                print(f"       ... and {len(matches) - 3} more")
-        except Exception as e:
-            print(f"  Error: {e}")
-    print()
+                            matches = cur.fetchall()
+                            if matches:
+                                print(f"  [3] Partial matches (%{last_token}%): {len(matches)} results")
+                                for name, otype in matches[:3]:
+                                    print(f"       - {name} ({otype})")
+                                if len(matches) > 3:
+                                    print(f"       ... and {len(matches) - 3} more")
+            except Exception as e:
+                print(f"  Error: {e}")
+        print()
+    return 0
+
+
+def test_name_variants_module_smoke() -> None:
+    assert callable(_extract_tokens)
+    assert _extract_tokens("Chung Yeung Pang")[-1] == "Pang"
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_name_variants_demo())

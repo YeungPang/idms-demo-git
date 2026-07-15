@@ -6,6 +6,7 @@ creating per-workflow custom Python functions.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from workflow_pipeline_executor import PipelineStepPauseRequired
@@ -321,3 +322,124 @@ def invoke_solf_action(context: dict[str, Any], config: dict[str, Any]) -> dict[
         save_as: result,
         "last_action": action,
     }
+
+
+def prepare_reference_driven_document_generation(context: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Generic helper for workflow-driven document/report generation preparation.
+
+    Supported config:
+      - required_context_fields: list[str]
+      - required_field_prompt: str
+      - payload_updates: dict
+      - context_to_payload_fields: list[{context_field, payload_field}] or dict[payload_field]=context_field
+      - date_payload_fields: list[str]
+      - generation_date: str
+      - reference_policy: dict
+      - workflow_template_kind: str
+    """
+    payload = dict(context.get("payload") or {}) if isinstance(context.get("payload"), dict) else {}
+    qr_data = dict(context.get("qr_data") or {}) if isinstance(context.get("qr_data"), dict) else {}
+
+    required_fields = _to_text_list(config.get("required_context_fields"))
+    missing_fields: list[str] = []
+    for field_name in required_fields:
+        value = context.get(field_name)
+        if value in (None, "", []):
+            value = payload.get(field_name)
+        if value in (None, "", []):
+            missing_fields.append(field_name)
+
+    if missing_fields:
+        prompt = str(config.get("required_field_prompt") or "").strip()
+        if not prompt:
+            prompt = f"Please provide required field(s) for document generation: {', '.join(missing_fields)}"
+        raise PipelineStepPauseRequired(
+            reason="missing_data",
+            prompt=prompt,
+            missing_data_desc=f"Missing required field(s): {', '.join(missing_fields)}",
+            required_doc_types=[],
+        )
+
+    generation_date = str(
+        context.get("generation_date")
+        or config.get("generation_date")
+        or date.today().isoformat()
+    ).strip() or date.today().isoformat()
+
+    payload_updates = config.get("payload_updates") if isinstance(config.get("payload_updates"), dict) else {}
+    if payload_updates:
+        payload.update(payload_updates)
+
+    mappings_raw = config.get("context_to_payload_fields")
+    mappings: list[tuple[str, str]] = []
+    if isinstance(mappings_raw, dict):
+        for payload_field, context_field in mappings_raw.items():
+            payload_field_text = str(payload_field or "").strip()
+            context_field_text = str(context_field or "").strip()
+            if payload_field_text and context_field_text:
+                mappings.append((context_field_text, payload_field_text))
+    elif isinstance(mappings_raw, list):
+        for item in mappings_raw:
+            if not isinstance(item, dict):
+                continue
+            context_field_text = str(item.get("context_field") or "").strip()
+            payload_field_text = str(item.get("payload_field") or "").strip()
+            if context_field_text and payload_field_text:
+                mappings.append((context_field_text, payload_field_text))
+
+    for context_field, payload_field in mappings:
+        value = context.get(context_field)
+        if value in (None, "", []):
+            value = payload.get(context_field)
+        if value not in (None, "", []):
+            payload[payload_field] = value
+
+    for field_name in _to_text_list(config.get("date_payload_fields")):
+        payload[field_name] = generation_date
+
+    reference_policy = dict(config.get("reference_policy") or {}) if isinstance(config.get("reference_policy"), dict) else {}
+
+    return {
+        "payload": payload,
+        "qr_data": qr_data,
+        "generation_date": generation_date,
+        "reference_policy": reference_policy,
+        "workflow_prepared": True,
+        "workflow_template_kind": str(config.get("workflow_template_kind") or "reference_driven_document_generation").strip() or "reference_driven_document_generation",
+    }
+
+
+def prepare_balm_invoice_generation(context: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility wrapper for existing balm-invoice workflows.
+
+    Prefer prepare_reference_driven_document_generation for new workflows.
+    """
+
+    merged_config = {
+        "required_context_fields": ["service_period"],
+        "required_field_prompt": "Please provide Wartung/Serv. Periode for the new balm_invoice.",
+        "context_to_payload_fields": {"service_period": "service_period"},
+        "date_payload_fields": ["invoice_date", "issue_date", "document_date", "date"],
+        "reference_policy": {
+            "mode": "next_from_reference_fixed_segments",
+            "fixed_segments": [{"start": 21, "value": str(config.get("invoice_id_segment") or "26")}],
+            "derived_reference_fields": [
+                {
+                    "field": str(config.get("rechnung_field") or "RECHNUNG").strip() or "RECHNUNG",
+                    "source": "payload_digits",
+                    "start": 1,
+                    "end": 26,
+                    "trim_leading_zeros": True,
+                }
+            ],
+        },
+        "workflow_template_kind": "balm_invoice",
+    }
+    for key, value in config.items():
+        if key == "reference_policy" and isinstance(value, dict):
+            merged_policy = dict(merged_config["reference_policy"])
+            merged_policy.update(value)
+            merged_config["reference_policy"] = merged_policy
+        else:
+            merged_config[key] = value
+    return prepare_reference_driven_document_generation(context, merged_config)

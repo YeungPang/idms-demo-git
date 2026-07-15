@@ -5,7 +5,7 @@ import requests
 import json
 import sys
 
-def test_query(query_text: str) -> dict:
+def run_query(query_text: str) -> dict:
     """Execute a single query via the live API."""
     payload = {"question": query_text, "limit": 10}
     try:
@@ -45,7 +45,7 @@ if __name__ == "__main__":
     results = []
     for i, query in enumerate(adhoc_queries, 1):
         print(f"\n[{i}/{len(adhoc_queries)}] Testing: {query}")
-        result = test_query(query)
+        result = run_query(query)
         results.append(result)
         
         if result["success"]:
@@ -82,3 +82,10 @@ if __name__ == "__main__":
         for r in results:
             if not r["success"]:
                 print(f"  - {r['query']}")
+
+
+def test_adhoc_query_module_smoke() -> None:
+    """Ensure helper is importable under pytest collection."""
+    result = run_query("health check")
+    assert isinstance(result, dict)
+    assert "success" in result

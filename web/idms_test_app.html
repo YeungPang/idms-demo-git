@@ -93,6 +93,58 @@
     .status { margin-top: 8px; font-size: .86rem; }
     .ok { color: var(--ok); }
     .err { color: var(--err); }
+    .hidden { display: none !important; }
+    .result-card {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      padding: 12px;
+    }
+    .result-card h3 {
+      margin: 0 0 8px;
+      font-size: .96rem;
+    }
+    .result-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    @media (min-width: 700px) {
+      .result-grid.two {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+    .result-item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fffaf2;
+      padding: 8px 10px;
+    }
+    .result-item .k {
+      display: block;
+      font-size: .8rem;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .result-item .v {
+      display: block;
+      font-family: var(--mono);
+      font-size: .84rem;
+      word-break: break-word;
+    }
+    .result-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .hint {
+      margin-top: 8px;
+      margin-bottom: 8px;
+      font-size: .84rem;
+      color: var(--muted);
+    }
 
     pre {
       margin: 10px 0 0;
@@ -248,6 +300,19 @@
     <div class="grid">
       <section class="panel half">
         <h2>File Upload Ingestion</h2>
+        <div class="row two">
+          <div>
+            <label>Upload mode</label>
+            <select id="uploadMode">
+              <option value="document">Regular document</option>
+              <option value="template_reference">Reference template</option>
+            </select>
+          </div>
+          <div id="templateNameWrap" class="hidden">
+            <label>Template name</label>
+            <input id="uploadTemplateName" type="text" placeholder="quotation_template_ch" />
+          </div>
+        </div>
         <div class="row">
           <div>
             <label>Select local file</label>
@@ -271,6 +336,65 @@
         <div>
           <label>Note / processing instructions</label>
           <textarea id="uploadNote" placeholder="Use as reference for image processing, map to product catalog, extract VAT information..."></textarea>
+        </div>
+        <div id="templateFields" class="hidden">
+          <div class="row two">
+            <div>
+              <label>Document kind</label>
+              <select id="uploadTemplateDocumentKind">
+                <option value="invoice">invoice</option>
+                <option value="quotation">quotation</option>
+                <option value="ledger_journal">ledger_journal</option>
+              </select>
+            </div>
+            <div>
+              <label>Template description</label>
+              <input id="uploadTemplateDescription" type="text" placeholder="Swiss maintenance invoice template" />
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>QR IBAN (optional)</label>
+              <input id="uploadTemplateQrIban" type="text" placeholder="CH44..." />
+            </div>
+            <div>
+              <label>Initial Swiss reference (optional)</label>
+              <input id="uploadTemplateInitialReference" type="text" placeholder="00 00000 00000 00000 00026 30181" />
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Reference occurrences</label>
+              <input id="uploadTemplateReferenceOccurrences" type="number" min="1" step="1" value="2" />
+            </div>
+            <div>
+              <label>Field labels JSON (optional)</label>
+              <textarea id="uploadTemplateFieldLabelsJson" placeholder='{"invoice_date":"Datum"}'></textarea>
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Reference keys JSON (optional)</label>
+              <textarea id="uploadTemplateReferenceKeysJson" placeholder='["reference","qr_reference"]'></textarea>
+            </div>
+            <div>
+              <label>Reuse existing SOLF rule</label>
+              <select id="uploadTemplateReuseSolfRule">
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Linked workflow key (optional)</label>
+              <input id="uploadTemplateWorkflowKey" type="text" placeholder="template::balm_invoice_generation" />
+            </div>
+            <div>
+              <label>Linked workflow ID (optional)</label>
+              <input id="uploadTemplateWorkflowId" type="number" min="1" step="1" placeholder="12" />
+            </div>
+          </div>
         </div>
         <div class="row two">
           <div>
@@ -363,6 +487,125 @@
         </div>
         <div id="pathStatus" class="status"></div>
         <pre id="pathOut"></pre>
+      </section>
+
+      <section class="panel half">
+        <h2>Generate Document From Template</h2>
+        <div class="row two">
+          <div>
+            <label>Reference template</label>
+            <select id="templateGenerateReferenceName">
+              <option value="">Loading template references...</option>
+            </select>
+          </div>
+          <div>
+            <label>Output format</label>
+            <select id="templateGenerateOutputFormat">
+              <option value="pdf">pdf</option>
+              <option value="docx">docx</option>
+            </select>
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Linked workflow key</label>
+            <input id="templateGenerateLinkedWorkflowKey" type="text" readonly placeholder="Not linked" />
+          </div>
+          <div>
+            <label>Linked workflow version</label>
+            <input id="templateGenerateLinkedWorkflowVersion" type="text" readonly placeholder="Not linked" />
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Payload overrides JSON (optional)</label>
+            <textarea id="templateGeneratePayloadOverrides" placeholder='{"service_period":"01.04.2026 bis 30.06.2026"}'></textarea>
+          </div>
+          <div>
+            <label>Override fields (comma separated, optional)</label>
+            <input id="templateGenerateOverrideFields" type="text" placeholder="invoice_date,customer_name,line_items,body_paragraph_1" />
+            <div id="templateGenerateOverrideHint" class="hint">Tip: Workflow overwrite targets automatically switch the template to preserve_template. Use Load Field Schema or Use Suggested Fields to pull fields like service_period.</div>
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Persist reference state</label>
+            <select id="templateGeneratePersistReferenceState">
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Reuse existing SOLF rule</label>
+            <select id="templateGenerateReuseSolfRule">
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </div>
+          <div>
+            <label>Existing rule name (optional)</label>
+            <input id="templateGenerateExistingRuleName" type="text" placeholder="quotation_workflow_v1" />
+          </div>
+        </div>
+        <div>
+          <label>Workflow definition / instruction text</label>
+          <textarea id="templateGenerateInstructionText" placeholder="Generate a new invoice from the selected template with the provided payload overrides."></textarea>
+        </div>
+        <div class="hint">Define workflow behavior here. Overwrite mode is selected automatically from linked workflow overwrite targets; this text is sent as instruction_text to runtime SOLF generation for this template run.</div>
+        <div class="btns">
+          <button id="btnTemplateRefresh" class="alt" type="button">Refresh Templates</button>
+          <button id="btnTemplateLoadFieldSchema" class="alt" type="button">Load Field Schema</button>
+          <button id="btnTemplateApplySuggestedFields" class="alt" type="button">Use Suggested Fields</button>
+          <button id="btnTemplateAnalyzePdfLabels" class="alt" type="button">Analyze PDF Labels (LLM)</button>
+          <button id="btnTemplateApplyLabelSuggestions" class="alt" type="button">Apply Label Suggestions</button>
+          <button id="btnTemplateFillInstruction" class="alt" type="button">Build Instruction</button>
+          <button id="btnTemplateGenerate" type="button">Generate Document From Template</button>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Suggestion min confidence</label>
+            <input id="templateLabelSuggestionMinConfidence" type="number" min="0" max="1" step="0.01" value="0.5" />
+          </div>
+          <div>
+            <label>Apply only workflow overwrite targets</label>
+            <select id="templateLabelSuggestionOnlyWorkflowTargets">
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </div>
+        </div>
+        <pre id="templateFieldSchemaOut"></pre>
+        <pre id="templateAnalyzeOut"></pre>
+        <div id="templateGenerateStatus" class="status"></div>
+        <div id="templateGenerateSummary" class="result-card hidden">
+          <h3>Generation Summary</h3>
+          <div class="result-grid two">
+            <div class="result-item">
+              <span class="k">Saved file</span>
+              <span id="templateSummarySavedPath" class="v"></span>
+            </div>
+            <div class="result-item">
+              <span class="k">Output filename</span>
+              <span id="templateSummaryFilename" class="v"></span>
+            </div>
+            <div class="result-item">
+              <span class="k">Generated Swiss reference</span>
+              <span id="templateSummaryReference" class="v"></span>
+            </div>
+            <div class="result-item">
+              <span class="k">Visual Swiss reference</span>
+              <span id="templateSummaryReferenceVisual" class="v"></span>
+            </div>
+          </div>
+          <div class="result-actions">
+            <button id="btnTemplateOpenFile" class="alt" type="button">Open File</button>
+            <button id="btnTemplateDownloadFile" type="button">Download File</button>
+            <button id="btnTemplateCopySavedPath" class="alt" type="button">Copy Saved Path</button>
+          </div>
+        </div>
+        <pre id="templateGenerateOut"></pre>
       </section>
 
       <section class="panel half">
@@ -1064,6 +1307,167 @@
           <button id="btnUpdateSolfScriptRule" class="alt">Update SOLF Script Rule</button>
           <button id="btnCompareRuleSimulations" class="alt">Compare Persisted vs Draft</button>
         </div>
+
+        <div class="result-card" style="margin-top:12px;">
+          <h3>Workflow Design Registry (Integrated)</h3>
+          <div class="row two">
+            <div>
+              <label>Workflow key (optional, auto-generated)</label>
+              <input id="workflowRegistryKey" type="text" placeholder="template::sales_full_cycle" />
+            </div>
+            <div>
+              <label>Workflow name (display)</label>
+              <input id="workflowRegistryName" type="text" placeholder="Sales Full Cycle" />
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Domain</label>
+              <input id="workflowRegistryDomain" type="text" placeholder="sales" />
+            </div>
+            <div>
+              <label>Status</label>
+              <select id="workflowRegistryStatusValue">
+                <option value="all" selected>all</option>
+                <option value="draft">draft</option>
+                <option value="review">review</option>
+                <option value="published">published</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label>Description</label>
+            <textarea id="workflowRegistryDescription" placeholder="End-to-end template workflow definition for quotation, order confirmation, delivery, invoice, payment."></textarea>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Created by</label>
+              <input id="workflowRegistryCreatedBy" type="text" value="web:user" />
+            </div>
+            <div>
+              <label>Is active</label>
+              <select id="workflowRegistryIsActive">
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Edit target workflow_id</label>
+              <input id="workflowRegistryEditId" type="number" min="1" placeholder="12" />
+            </div>
+            <div>
+              <label>Activation target workflow_id</label>
+              <input id="workflowRegistryActivateId" type="number" min="1" placeholder="12" />
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Set active</label>
+              <select id="workflowRegistryActivateState">
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </div>
+            <div>
+              <label>Recent workflows</label>
+              <select id="workflowRegistryRecent">
+                <option value="">-- refresh to load --</option>
+              </select>
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Version target workflow_id</label>
+              <input id="workflowRegistryVersionWorkflowId" type="number" min="1" placeholder="14" />
+            </div>
+            <div>
+              <label>Publish workflow_version_id (NOT workflow_id)</label>
+              <input id="workflowRegistryPublishVersionId" type="number" min="1" placeholder="31" />
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>New version status</label>
+              <select id="workflowRegistryVersionStatus">
+                <option value="draft">draft</option>
+                <option value="review">review</option>
+                <option value="published">published</option>
+              </select>
+            </div>
+            <div>
+              <label>Active version by key</label>
+              <input id="workflowRegistryActiveVersionSummary" type="text" readonly placeholder="unknown" />
+            </div>
+          </div>
+          <div>
+            <label>Workflow steps JSON for new version</label>
+            <textarea id="workflowRegistryVersionStepsJson" placeholder='[{"step_order":1,"step_key":"prepare_generation","step_kind":"python_binding","python_module":"workflow_pipeline_builtin_steps","python_function":"prepare_reference_driven_document_generation","config":{"required_context_fields":["service_period"],"context_to_payload_fields":{"service_period":"service_period"},"date_payload_fields":["invoice_date","issue_date","document_date","date"],"reference_policy":{"mode":"next_from_reference_fixed_segments","fixed_segments":[{"start":21,"value":"26"}],"derived_reference_fields":[{"field":"RECHNUNG","source":"payload_digits","start":1,"end":26,"trim_leading_zeros":true}]}}}]'></textarea>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Workflow execution input context JSON (optional)</label>
+              <textarea id="workflowRegistryExecutionInputContext" placeholder='{"employee_name":"Tom Miller","monthly_salary_chf":6000,"children_ages":[10,12,14],"work_permit":"B"}'></textarea>
+            </div>
+            <div>
+              <label>Execution output directory (optional)</label>
+              <input id="workflowRegistryExecutionOutputDir" type="text" value="generated/workflow-runs" />
+            </div>
+          </div>
+          <div>
+            <label>Filter workflows (id/key/name)</label>
+            <input id="workflowRegistryFilter" type="text" placeholder="sales, template::, 12" />
+          </div>
+          <div class="row two">
+            <div>
+              <label>Workflow design request (for /api/workflow/design)</label>
+              <textarea id="workflowRegistryDesignRequest" placeholder="Design a quotation-to-invoice workflow with approval gate when grand_total exceeds threshold."></textarea>
+            </div>
+            <div>
+              <label>Workflow design context JSON</label>
+              <textarea id="workflowRegistryDesignContext" placeholder='{"country":"switzerland","document_kind":"quotation"}'></textarea>
+            </div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Workflow design max iterations</label>
+              <input id="workflowRegistryDesignMaxIterations" type="number" min="1" max="8" value="3" />
+            </div>
+            <div></div>
+          </div>
+          <div class="row two">
+            <div>
+              <label>Clarification question (auto from parser)</label>
+              <textarea id="workflowRegistryClarificationQuestion" readonly placeholder="Appears when parser needs clarification."></textarea>
+            </div>
+            <div>
+              <label>Clarification answer</label>
+              <textarea id="workflowRegistryClarificationAnswer" placeholder="Provide the missing detail and click Apply Clarification And Re-parse."></textarea>
+            </div>
+          </div>
+          <div class="btns">
+            <button id="btnWorkflowRegistrySave" class="alt" type="button">Create Or Update Workflow Registry Entry</button>
+            <button id="btnWorkflowRegistryList" class="alt" type="button">List Workflows</button>
+            <button id="btnWorkflowRegistryLoad" class="alt" type="button">Load Workflow For Edit</button>
+            <button id="btnWorkflowRegistryActivate" class="alt" type="button">Set Workflow Activation</button>
+            <button id="btnWorkflowRegistryCreateVersion" class="alt" type="button">Create Workflow Version</button>
+            <button id="btnWorkflowRegistryListVersions" class="alt" type="button">List Workflow Versions</button>
+            <button id="btnWorkflowRegistryPublishVersion" class="alt" type="button">Publish Workflow Version</button>
+            <button id="btnWorkflowRegistryWireProduction" type="button">Publish & Wire To Production</button>
+            <button id="btnWorkflowRegistryAutoRegisterPublishWire" type="button">Auto Register + Publish + Wire</button>
+            <button id="btnWorkflowRegistryExecuteAndSaveOutput" type="button">Execute Active Workflow & Save Output</button>
+            <button id="btnWorkflowRegistryCheckActiveVersion" class="alt" type="button">Check Active Version</button>
+            <button id="btnWorkflowRegistryRefreshRecent" class="alt" type="button">Refresh Workflow Dropdown</button>
+            <button id="btnWorkflowRegistryDesign" class="alt" type="button">Run Workflow Design</button>
+            <button id="btnWorkflowRegistryParseSolf" class="alt" type="button">Parse Workflow To SOLF Draft</button>
+            <button id="btnWorkflowRegistryClarifyParse" class="alt" type="button">Apply Clarification And Re-parse</button>
+          </div>
+          <div id="workflowRegistryGuide" class="status">Recommended flow: click Auto Register + Publish + Wire for one-step setup, then Execute Active Workflow & Save Output to persist a generic artifact for any workflow.</div>
+          <div id="workflowRegistryStatus" class="status"></div>
+          <pre id="workflowRegistryOut"></pre>
+        </div>
+
         <div id="ruleClarificationCard" class="clarification-card">
           <h3>Clarification needed</h3>
           <div id="ruleClarificationMeta" class="meta"></div>
@@ -1116,6 +1520,7 @@
         </div>
         <div class="btns">
           <button id="btnWorkflowDesign" class="alt">Run Workflow Design</button>
+          <button id="btnAdvancedExecuteAndSaveOutput" class="alt">Execute Active Workflow & Save Output</button>
         </div>
 
         <div class="row two" style="margin-top: 12px;">
@@ -1513,6 +1918,14 @@
         .split(",")
         .map((item) => item.trim())
         .filter(Boolean);
+    }
+
+    function parseIntInRange(value, fallback, minValue, maxValue) {
+      const n = Number.parseInt(String(value ?? "").trim(), 10);
+      if (!Number.isFinite(n)) return fallback;
+      if (Number.isFinite(minValue) && n < minValue) return minValue;
+      if (Number.isFinite(maxValue) && n > maxValue) return maxValue;
+      return n;
     }
 
     function getPersonSimilarityReview(payload) {
@@ -1961,7 +2374,7 @@
             <td>${similarity}</td>
             <td>${escapeHtml(overlap)}</td>
             <td>
-              <button class="mini-btn" type="button" data-role="canonical" data-object-id="${id}">Set Canonical</button>
+                <option value="all">all</option>
               <button class="mini-btn alt" type="button" data-role="duplicate" data-object-id="${id}">Set Duplicate</button>
             </td>
           </tr>
@@ -2286,6 +2699,7 @@
     }
 
     let cachedRuleEditRules = [];
+    let cachedWorkflowRegistryEntries = [];
     let ruleApiCapabilities = {
       supportsDetailById: false,
       supportsDetailNl: false,
@@ -2396,6 +2810,284 @@
       return rule;
     }
 
+    function populateWorkflowRegistryOptions(rows, preferredId = null) {
+      const select = document.getElementById("workflowRegistryRecent");
+      if (!select) return;
+
+      select.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "-- select a workflow --";
+      select.appendChild(placeholder);
+
+      const list = Array.isArray(rows) ? rows : [];
+      for (const row of list) {
+        const id = Number(row?.workflow_id || 0);
+        if (!id) continue;
+        const key = String(row?.workflow_key || "");
+        const name = String(row?.workflow_name || "");
+        const state = row?.is_active ? "active" : "inactive";
+        const option = document.createElement("option");
+        option.value = String(id);
+        option.textContent = `${id} | ${key || "(no-key)"} | ${name || "(unnamed)"} | ${state}`;
+        select.appendChild(option);
+      }
+
+      if (preferredId) {
+        const preferred = String(preferredId);
+        if ([...select.options].some((opt) => opt.value === preferred)) {
+          select.value = preferred;
+        }
+      }
+    }
+
+    function applyWorkflowRegistryFilter(preferredId = null) {
+      const filterValue = String(document.getElementById("workflowRegistryFilter")?.value || "").trim().toLowerCase();
+      const rows = cachedWorkflowRegistryEntries.filter((row) => {
+        if (!filterValue) return true;
+        const idText = String(row?.workflow_id || "").toLowerCase();
+        const keyText = String(row?.workflow_key || "").toLowerCase();
+        const nameText = String(row?.workflow_name || "").toLowerCase();
+        return idText.includes(filterValue) || keyText.includes(filterValue) || nameText.includes(filterValue);
+      });
+      populateWorkflowRegistryOptions(rows, preferredId);
+    }
+
+    async function refreshWorkflowRegistryList(preferredId = null) {
+      const data = await getJson("/api/business-rules/workflow-registry/list?limit=200");
+      const rows = Array.isArray(data?.result) ? data.result : [];
+      cachedWorkflowRegistryEntries = rows;
+      applyWorkflowRegistryFilter(preferredId);
+      return rows.length;
+    }
+
+    async function findWorkflowRegistryByIdFromList(workflowId) {
+      const id = Number(workflowId || 0);
+      if (id < 1) return null;
+
+      if (!cachedWorkflowRegistryEntries.length) {
+        await refreshWorkflowRegistryList();
+      }
+
+      let row = cachedWorkflowRegistryEntries.find((item) => Number(item?.workflow_id || 0) === id) || null;
+      if (row) return row;
+
+      const data = await getJson("/api/business-rules/workflow-registry/list?limit=500");
+      const rows = Array.isArray(data?.result) ? data.result : [];
+      cachedWorkflowRegistryEntries = rows;
+      applyWorkflowRegistryFilter(id);
+      row = rows.find((item) => Number(item?.workflow_id || 0) === id) || null;
+      return row;
+    }
+
+    async function refreshWorkflowRegistryActiveVersionByKey(workflowKey) {
+      const summary = document.getElementById("workflowRegistryActiveVersionSummary");
+      if (!summary) return null;
+      const key = String(workflowKey || "").trim();
+      if (!key) {
+        summary.value = "unknown";
+        return null;
+      }
+      try {
+        const data = await getJson(`/api/business-rules/workflow-registry/by-key/${encodeURIComponent(key)}/active-version`);
+        const result = data?.result || {};
+        const hasActive = !!result?.has_active_version;
+        const versionId = Number(result?.workflow_version_id || 0);
+        summary.value = hasActive && versionId > 0 ? `active_version=${versionId}` : "has_active_version=false";
+        return data;
+      } catch (_err) {
+        summary.value = "lookup_failed";
+        return null;
+      }
+    }
+
+    function slugWorkflowKey(text) {
+      return String(text || "")
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .replace(/_+/g, "_");
+    }
+
+    function deriveWorkflowIdentity() {
+      const rawKey = String(document.getElementById("workflowRegistryKey")?.value || "").trim();
+      const rawName = String(document.getElementById("workflowRegistryName")?.value || "").trim();
+
+      let workflowKey = rawKey;
+      let workflowName = rawName;
+
+      if (!workflowName && workflowKey) {
+        const tail = workflowKey.includes("::") ? workflowKey.split("::").pop() : workflowKey;
+        workflowName = String(tail || "workflow").replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+      }
+
+      if (!workflowKey && workflowName) {
+        const slug = slugWorkflowKey(workflowName) || "workflow";
+        workflowKey = `workflow::${slug}`;
+      }
+
+      return {
+        workflowKey: String(workflowKey || "").trim(),
+        workflowName: String(workflowName || "").trim(),
+      };
+    }
+
+    function buildDefaultBalmInvoiceWorkflowSteps() {
+      return [
+        {
+          step_order: 1,
+          step_key: "prepare_generation",
+          step_kind: "python_binding",
+          python_module: "workflow_pipeline_builtin_steps",
+          python_function: "prepare_reference_driven_document_generation",
+          config: {
+            required_context_fields: ["service_period"],
+            context_to_payload_fields: {
+              service_period: "service_period",
+            },
+            date_payload_fields: ["invoice_date", "issue_date", "document_date", "date"],
+            reference_policy: {
+              mode: "next_from_reference_fixed_segments",
+              fixed_segments: [
+                {
+                  start: 21,
+                  value: "26",
+                },
+              ],
+              derived_reference_fields: [
+                {
+                  field: "RECHNUNG",
+                  source: "payload_digits",
+                  start: 1,
+                  end: 26,
+                  trim_leading_zeros: true,
+                },
+              ],
+            },
+          },
+        },
+      ];
+    }
+
+    function normalizeWorkflowStepKind(value) {
+      const allowed = new Set(["clause", "class_transform", "class_generate", "class_iterate", "python_binding"]);
+      const kind = String(value || "").trim().toLowerCase();
+      return allowed.has(kind) ? kind : "clause";
+    }
+
+    function normalizeWorkflowStepsFromDesignPayload(payload) {
+      const fromResult = payload && payload.result && Array.isArray(payload.result.workflow_steps)
+        ? payload.result.workflow_steps
+        : [];
+      const direct = Array.isArray(payload?.workflow_steps) ? payload.workflow_steps : [];
+      const source = fromResult.length ? fromResult : direct;
+      if (!Array.isArray(source) || !source.length) return [];
+
+      return source
+        .map((raw, idx) => {
+          if (!raw || typeof raw !== "object") return null;
+
+          const inferredKey = slugWorkflowKey(raw.step_key || raw.step_id || raw.name || `step_${idx + 1}`) || `step_${idx + 1}`;
+          const explicitKind = normalizeWorkflowStepKind(raw.step_kind);
+          const hasPipelineShape = !!(
+            raw.step_kind || raw.clause_name || raw.python_module || raw.python_function || raw.operation
+          );
+
+          if (hasPipelineShape) {
+            return {
+              step_order: Number(raw.step_order || idx + 1),
+              step_key: inferredKey,
+              step_kind: explicitKind,
+              clause_id: raw.clause_id != null ? Number(raw.clause_id) : null,
+              clause_name: String(raw.clause_name || "").trim() || null,
+              input_class: String(raw.input_class || "").trim() || null,
+              output_class: String(raw.output_class || "").trim() || null,
+              operation: String(raw.operation || "").trim() || null,
+              python_module: String(raw.python_module || "").trim() || null,
+              python_function: String(raw.python_function || "").trim() || null,
+              config: raw.config && typeof raw.config === "object" ? raw.config : {},
+            };
+          }
+
+          const clauseName = slugWorkflowKey(raw.name || raw.step_id || raw.step_key || `step_${idx + 1}`) || `step_${idx + 1}`;
+          return {
+            step_order: idx + 1,
+            step_key: inferredKey,
+            step_kind: "clause",
+            clause_name: clauseName,
+            config: {
+              source: "workflow_design",
+              name: String(raw.name || "").trim() || null,
+              purpose: String(raw.purpose || "").trim() || null,
+              required_inputs: Array.isArray(raw.required_inputs) ? raw.required_inputs : [],
+              expected_outputs: Array.isArray(raw.expected_outputs) ? raw.expected_outputs : [],
+              retrieval_or_action: String(raw.retrieval_or_action || "").trim() || null,
+            },
+          };
+        })
+        .filter(Boolean);
+    }
+
+    function buildMinimalWorkflowStepsFromNarrative(narrative, workflowKey) {
+      const key = slugWorkflowKey(workflowKey || "workflow") || "workflow";
+      const narrativeText = String(narrative || "").trim();
+      return [
+        {
+          step_order: 1,
+          step_key: "auto_generated_step_1",
+          step_kind: "clause",
+          clause_name: `auto_generated_${key}`,
+          config: {
+            source: "workflow_narrative",
+            narrative: narrativeText || "Auto-generated workflow step",
+          },
+        },
+      ];
+    }
+
+    function inferExecutionContextFromNarrative(text) {
+      const source = String(text || "").trim();
+      if (!source) return {};
+
+      const inferred = {};
+      const nameEmployer = source.match(/([A-Z][a-z]+\s+[A-Z][a-z]+)\s+is\s+working\s+for\s+([^\.\n]+)/i);
+      if (nameEmployer) {
+        inferred.employee_name = String(nameEmployer[1] || "").trim();
+        inferred.employer = String(nameEmployer[2] || "").trim();
+      }
+
+      const permit = source.match(/(?:has|holding)\s+(?:a\s+)?([A-Za-z])\s+work(?:ing)?\s+permit/i);
+      if (permit && permit[1]) {
+        inferred.work_permit = String(permit[1]).trim().toUpperCase();
+      }
+
+      const childrenAges = source.match(/children\s+age\s+([0-9\s,]+(?:and\s+[0-9]+)?)/i);
+      if (childrenAges && childrenAges[1]) {
+        const ages = String(childrenAges[1])
+          .replace(/and/gi, ",")
+          .split(",")
+          .map((item) => Number(String(item || "").trim()))
+          .filter((n) => Number.isFinite(n) && n > 0);
+        if (ages.length) {
+          inferred.children_ages = ages;
+          inferred.children_count = ages.length;
+        }
+      }
+
+      const salary = source.match(/(?:monthly\s+salary\s+is|salary\s+is|salary\s+of)\s*(?:CHF\s*)?([0-9]+(?:\.[0-9]+)?)/i);
+      if (salary && salary[1]) {
+        const value = Number(salary[1]);
+        if (Number.isFinite(value)) {
+          inferred.monthly_salary_chf = value;
+          inferred.gross_salary_monthly = value;
+          inferred.currency = "CHF";
+        }
+      }
+
+      return inferred;
+    }
+
     document.getElementById("uploadFile").addEventListener("change", (e) => {
       const file = e.target?.files && e.target.files[0] ? e.target.files[0] : null;
       if (!file) return;
@@ -2406,41 +3098,681 @@
       uploadPathEl.value = file.name;
     });
 
+    function syncUploadModeUI() {
+      const mode = String(document.getElementById("uploadMode")?.value || "document").trim();
+      const isTemplate = mode === "template_reference";
+      document.getElementById("templateNameWrap")?.classList.toggle("hidden", !isTemplate);
+      document.getElementById("templateFields")?.classList.toggle("hidden", !isTemplate);
+      const uploadPath = document.getElementById("uploadPath");
+      if (uploadPath) {
+        uploadPath.placeholder = isTemplate
+          ? "Optional source label for this template PDF"
+          : "invoice/2025-09-25-aphotonix.jpg";
+      }
+      const uploadButton = document.getElementById("btnUpload");
+      if (uploadButton) {
+        uploadButton.textContent = isTemplate ? "Ingest Reference Template" : "Ingest Uploaded File";
+      }
+    }
+
+    const templateReferenceIndex = new Map();
+  let lastTemplatePdfAnalysisResult = null;
+
+    function renderSelectedTemplateReferenceMeta() {
+      const select = document.getElementById("templateGenerateReferenceName");
+      const workflowKeyInput = document.getElementById("templateGenerateLinkedWorkflowKey");
+      const workflowVersionInput = document.getElementById("templateGenerateLinkedWorkflowVersion");
+      if (!select || !workflowKeyInput || !workflowVersionInput) return;
+
+      const refName = String(select.value || "").trim();
+      const row = templateReferenceIndex.get(refName) || {};
+      const linkedWorkflowKey = String(row.linked_workflow_key || "").trim();
+      const linkedWorkflowId = Number(row.linked_workflow_id || 0);
+      const linkedVersionId = Number(row.linked_workflow_version_id || 0);
+
+      if (!linkedWorkflowKey && !linkedWorkflowId) {
+        workflowKeyInput.value = "";
+        workflowVersionInput.value = "";
+        workflowKeyInput.placeholder = "Not linked";
+        workflowVersionInput.placeholder = "Not linked";
+        return;
+      }
+
+      workflowKeyInput.value = linkedWorkflowKey || (linkedWorkflowId > 0 ? `workflow_id:${linkedWorkflowId}` : "");
+      workflowVersionInput.value = linkedVersionId > 0 ? String(linkedVersionId) : "(unpublished)";
+    }
+
+    function buildTemplateGenerationInstruction() {
+      const referenceName = String(document.getElementById("templateGenerateReferenceName")?.value || "").trim();
+      const payloadOverridesText = String(document.getElementById("templateGeneratePayloadOverrides")?.value || "").trim();
+      const overrideFieldsText = String(document.getElementById("templateGenerateOverrideFields")?.value || "").trim();
+      if (!referenceName && !payloadOverridesText) return "";
+      if (!payloadOverridesText) return `Generate a new ${referenceName}.`;
+      if (!referenceName) {
+        return overrideFieldsText
+          ? `Generate a new invoice. Overwrite only fields [${overrideFieldsText}] with payload: ${payloadOverridesText}`
+          : `Generate a new invoice with payload overrides: ${payloadOverridesText}`;
+      }
+      return overrideFieldsText
+        ? `Generate a new ${referenceName}. Overwrite only fields [${overrideFieldsText}] with payload: ${payloadOverridesText}`
+        : `Generate a new ${referenceName} with payload overrides: ${payloadOverridesText}`;
+    }
+
+    function renderTemplateGenerationSummary(data) {
+      const card = document.getElementById("templateGenerateSummary");
+      const result = data && typeof data === "object" ? (data.result || {}) : {};
+      const invoiceGeneration = result && typeof result === "object" ? (result.invoice_generation || {}) : {};
+      const generatedReference = invoiceGeneration && typeof invoiceGeneration === "object"
+        ? (invoiceGeneration.generated_reference || {})
+        : {};
+      const savedPath = String(invoiceGeneration.saved_path || "").trim();
+      const filename = String(invoiceGeneration.filename || "").trim();
+      const reference = String(generatedReference.storage_string || "").trim();
+      const referenceVisual = String(generatedReference.visual_string || "").trim();
+
+      if (!savedPath && !filename && !reference && !referenceVisual) {
+        card?.classList.add("hidden");
+        return;
+      }
+
+      document.getElementById("templateSummarySavedPath").textContent = savedPath || "-";
+      document.getElementById("templateSummaryFilename").textContent = filename || "-";
+      document.getElementById("templateSummaryReference").textContent = reference || "-";
+      document.getElementById("templateSummaryReferenceVisual").textContent = referenceVisual || "-";
+      card.dataset.savedPath = savedPath || "";
+      card?.classList.remove("hidden");
+    }
+
+    function buildGeneratedFileUrl(savedPath, disposition = "attachment") {
+      const params = new URLSearchParams();
+      params.set("path", String(savedPath || ""));
+      params.set("disposition", String(disposition || "attachment"));
+      return `/api/documents/generated-file?${params.toString()}`;
+    }
+
+    function getTemplateSummarySavedPath() {
+      return String(document.getElementById("templateGenerateSummary")?.dataset?.savedPath || "").trim();
+    }
+
+    async function loadTemplateFieldSchema() {
+      const referenceName = String(document.getElementById("templateGenerateReferenceName")?.value || "").trim();
+      if (!referenceName) {
+        throw new Error("Please select a reference template first.");
+      }
+      const resp = await fetch(`/api/documents/template-references/${encodeURIComponent(referenceName)}/field-schema`);
+      const data = await resp.json();
+      if (!resp.ok) throw makeApiError(resp.status, data, "/api/documents/template-references/{reference_name}/field-schema");
+      return data;
+    }
+
+    async function analyzeTemplatePdfLabelSuggestions() {
+      const referenceName = String(document.getElementById("templateGenerateReferenceName")?.value || "").trim();
+      if (!referenceName) {
+        throw new Error("Please select a reference template first.");
+      }
+
+      let payloadOverrides = {};
+      const payloadOverridesText = String(document.getElementById("templateGeneratePayloadOverrides")?.value || "").trim();
+      if (payloadOverridesText) {
+        payloadOverrides = parseJsonMaybe(payloadOverridesText, {});
+      }
+
+      const resp = await fetch(`/api/documents/template-references/${encodeURIComponent(referenceName)}/analyze-pdf`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          payload: payloadOverrides,
+          include_llm_suggestions: true,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw makeApiError(resp.status, data, "/api/documents/template-references/{reference_name}/analyze-pdf");
+      return data;
+    }
+
+    function collectTemplateOverrideSuggestions(schema) {
+      const suggested = Array.isArray(schema?.suggested_override_fields) ? schema.suggested_override_fields : [];
+      const linkedWorkflow = schema && typeof schema === "object" ? (schema.linked_workflow_schema || {}) : {};
+      const derived = Array.isArray(linkedWorkflow?.derived_fields) ? linkedWorkflow.derived_fields : [];
+      const seen = new Set();
+      const merged = [];
+      for (const raw of [...suggested, ...derived]) {
+        const field = String(raw || "").trim();
+        if (!field || seen.has(field)) continue;
+        seen.add(field);
+        merged.push(field);
+      }
+      return merged;
+    }
+
+    function applyTemplateOverrideSuggestions(schema, force = false) {
+      const input = document.getElementById("templateGenerateOverrideFields");
+      const hint = document.getElementById("templateGenerateOverrideHint");
+      if (!input) return [];
+
+      const suggestions = collectTemplateOverrideSuggestions(schema);
+      const current = String(input.value || "").trim();
+      if (force || !current) {
+        input.value = suggestions.join(",");
+      }
+
+      if (hint) {
+        const linked = schema && typeof schema === "object" ? (schema.linked_workflow_schema || {}) : {};
+        const derived = Array.isArray(linked?.derived_fields) ? linked.derived_fields : [];
+        hint.textContent = derived.length
+          ? `Workflow overwrite targets detected: ${derived.join(", ")} (overwrite mode is automatic).`
+          : "Tip: Use Load Field Schema or Use Suggested Fields to pull workflow-derived fields like service_period.";
+      }
+      return suggestions;
+    }
+
+    function _setNestedTemplateValue(target, path, value) {
+      const parts = String(path || "").split(".").map((p) => p.trim()).filter(Boolean);
+      if (!parts.length) return;
+      let current = target;
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        const key = parts[i];
+        if (!current[key] || typeof current[key] !== "object" || Array.isArray(current[key])) {
+          current[key] = {};
+        }
+        current = current[key];
+      }
+      current[parts[parts.length - 1]] = value;
+    }
+
+    function _getNestedTemplateValue(target, path) {
+      const parts = String(path || "").split(".").map((p) => p.trim()).filter(Boolean);
+      if (!parts.length) return undefined;
+      let current = target;
+      for (const key of parts) {
+        if (!current || typeof current !== "object" || !(key in current)) {
+          return undefined;
+        }
+        current = current[key];
+      }
+      return current;
+    }
+
+    function _defaultTemplateValueForField(fieldName) {
+      const name = String(fieldName || "").trim().toLowerCase();
+      if (!name) return "";
+      if (name === "service_period") return "01.04.2026 bis 30.06.2026";
+      if (name === "line_items") return [];
+      if (name.endsWith("_date") || name === "date") return "YYYY-MM-DD";
+      return "";
+    }
+
+    function applyTemplatePayloadSkeletonFromSuggestions(schema, force = false) {
+      const payloadEl = document.getElementById("templateGeneratePayloadOverrides");
+      if (!payloadEl) return { changed: false, inserted: [] };
+
+      const suggestions = collectTemplateOverrideSuggestions(schema);
+      if (!suggestions.length) return { changed: false, inserted: [] };
+
+      const raw = String(payloadEl.value || "").trim();
+      let payload = {};
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            payload = parsed;
+          } else if (!force) {
+            return { changed: false, inserted: [] };
+          }
+        } catch (_err) {
+          if (!force) {
+            return { changed: false, inserted: [] };
+          }
+        }
+      }
+
+      const inserted = [];
+      for (const field of suggestions) {
+        if (_getNestedTemplateValue(payload, field) !== undefined) continue;
+        const defaultValue = _defaultTemplateValueForField(field);
+        // Keep payload skeleton focused on fields that need explicit user input.
+        // Workflow-derived fields (for example RECHNUNG) should not be injected as empty strings.
+        if (defaultValue === "") continue;
+        _setNestedTemplateValue(payload, field, defaultValue);
+        inserted.push(field);
+      }
+
+      if (inserted.length > 0 || (force && !raw)) {
+        payloadEl.value = JSON.stringify(payload, null, 2);
+      }
+      return { changed: inserted.length > 0, inserted };
+    }
+
+    function applyTemplateOverrideFieldsFromWorkflowTargets(targets, force = false) {
+      const input = document.getElementById("templateGenerateOverrideFields");
+      if (!input) return [];
+      const fields = Array.isArray(targets?.fields) ? targets.fields : [];
+      const normalized = [];
+      const seen = new Set();
+      for (const raw of fields) {
+        const field = String(raw || "").trim();
+        if (!field || seen.has(field)) continue;
+        seen.add(field);
+        normalized.push(field);
+      }
+      if (!normalized.length) return [];
+      const current = String(input.value || "").trim();
+      if (force || !current) {
+        input.value = normalized.join(",");
+      }
+      return normalized;
+    }
+
+    document.getElementById("btnTemplateOpenFile")?.addEventListener("click", () => {
+      const savedPath = getTemplateSummarySavedPath();
+      const status = document.getElementById("templateGenerateStatus");
+      if (!savedPath) {
+        showStatus(status, false, "No generated file path is available yet.");
+        return;
+      }
+      window.open(buildGeneratedFileUrl(savedPath, "inline"), "_blank", "noopener");
+      showStatus(status, true, "Opened generated file in a new tab.");
+    });
+
+    document.getElementById("btnTemplateDownloadFile")?.addEventListener("click", () => {
+      const savedPath = getTemplateSummarySavedPath();
+      const status = document.getElementById("templateGenerateStatus");
+      if (!savedPath) {
+        showStatus(status, false, "No generated file path is available yet.");
+        return;
+      }
+      window.open(buildGeneratedFileUrl(savedPath, "attachment"), "_blank", "noopener");
+      showStatus(status, true, "Started file download.");
+    });
+
+    document.getElementById("btnTemplateCopySavedPath")?.addEventListener("click", async () => {
+      const savedPath = getTemplateSummarySavedPath();
+      const status = document.getElementById("templateGenerateStatus");
+      if (!savedPath) {
+        showStatus(status, false, "No generated file path is available yet.");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(savedPath);
+        showStatus(status, true, "Saved path copied to clipboard.");
+      } catch (err) {
+        showStatus(status, false, `Could not copy path: ${String(err)}`);
+      }
+    });
+
+    async function refreshTemplateReferenceOptions() {
+      const select = document.getElementById("templateGenerateReferenceName");
+      if (!select) return;
+      const currentValue = String(select.value || "").trim();
+      templateReferenceIndex.clear();
+      select.innerHTML = '<option value="">Loading template references...</option>';
+      try {
+        const resp = await fetch("/api/documents/template-references");
+        const data = await resp.json();
+        if (!resp.ok) throw makeApiError(resp.status, data, "/api/documents/template-references");
+        const rows = Array.isArray(data.result) ? data.result : [];
+        select.innerHTML = "";
+        if (!rows.length) {
+          select.innerHTML = '<option value="">No template references found</option>';
+          return;
+        }
+        for (const row of rows) {
+          const refName = String(row.reference_name || "").trim();
+          if (!refName) continue;
+          templateReferenceIndex.set(refName, row);
+          const wfKey = String(row.linked_workflow_key || "").trim();
+          const label = `${refName}${row.document_kind ? ` (${row.document_kind})` : ""}${wfKey ? ` [wf:${wfKey}]` : ""}`;
+          const option = document.createElement("option");
+          option.value = refName;
+          option.textContent = label;
+          if (currentValue && currentValue === refName) option.selected = true;
+          select.appendChild(option);
+        }
+        if (!select.value && rows[0] && rows[0].reference_name) {
+          select.value = String(rows[0].reference_name);
+        }
+        renderSelectedTemplateReferenceMeta();
+      } catch (err) {
+        select.innerHTML = '<option value="">Failed to load template references</option>';
+        renderSelectedTemplateReferenceMeta();
+      }
+    }
+
+    document.getElementById("uploadMode")?.addEventListener("change", syncUploadModeUI);
+    syncUploadModeUI();
+    refreshTemplateReferenceOptions();
+
+    document.getElementById("btnTemplateRefresh")?.addEventListener("click", async () => {
+      const status = document.getElementById("templateGenerateStatus");
+      try {
+        showStatus(status, true, "Refreshing template references...");
+        await refreshTemplateReferenceOptions();
+        showStatus(status, true, "Template references loaded.");
+      } catch (err) {
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnTemplateLoadFieldSchema")?.addEventListener("click", async () => {
+      const status = document.getElementById("templateGenerateStatus");
+      const out = document.getElementById("templateFieldSchemaOut");
+      try {
+        showStatus(status, true, "Loading template field schema...");
+        const data = await loadTemplateFieldSchema();
+        const schema = data?.result || {};
+        const suggested = applyTemplateOverrideSuggestions(schema, false);
+        const payloadResult = applyTemplatePayloadSkeletonFromSuggestions(schema, false);
+        out.textContent = JSON.stringify(data, null, 2);
+        if (payloadResult.changed) {
+          showStatus(status, true, `Field schema loaded. Added payload keys: ${payloadResult.inserted.join(", ")}.`);
+        } else {
+          showStatus(status, true, suggested.length ? "Field schema loaded." : "Field schema loaded (no override suggestions).");
+        }
+      } catch (err) {
+        const errText = String(err || "");
+        const workflowId = Number(document.getElementById("workflowRegistryVersionWorkflowId")?.value || document.getElementById("workflowRegistryEditId")?.value || 0);
+        if (/workflow\s+\d+\s+or\s+version\s+not\s+found/i.test(errText) && workflowId > 0) {
+          try {
+            const versions = await getJson(`/api/business-rules/workflow-registry/${workflowId}/versions?limit=20`);
+            const rows = Array.isArray(versions?.result) ? versions.result : [];
+            const versionIds = rows
+              .map((row) => Number(row?.workflow_version_id || 0))
+              .filter((id) => id > 0)
+              .join(", ");
+            out.textContent = JSON.stringify(versions, null, 2);
+            showStatus(
+              status,
+              false,
+              versionIds
+                ? `workflow_id=${workflowId} exists, but that workflow_version_id was not found. Use one of: ${versionIds}`
+                : `workflow_id=${workflowId} has no versions yet. Create a workflow version first, then publish.`
+            );
+            return;
+          } catch (_lookupErr) {
+            // Fall through to default message.
+          }
+        }
+        out.textContent = "";
+        showStatus(status, false, errText);
+      }
+    });
+
+    document.getElementById("btnTemplateApplySuggestedFields")?.addEventListener("click", async () => {
+      const status = document.getElementById("templateGenerateStatus");
+      const out = document.getElementById("templateFieldSchemaOut");
+      try {
+        const data = await loadTemplateFieldSchema();
+        const schema = data && typeof data === "object" ? (data.result || {}) : {};
+        const suggested = applyTemplateOverrideSuggestions(schema, true);
+        const payloadResult = applyTemplatePayloadSkeletonFromSuggestions(schema, true);
+        out.textContent = JSON.stringify(data, null, 2);
+        if (!suggested.length) {
+          showStatus(status, true, "No suggested fields available for this template.");
+        } else if (payloadResult.changed) {
+          showStatus(status, true, `Suggested fields applied and payload starter updated (${payloadResult.inserted.length} key(s) added).`);
+        } else {
+          showStatus(status, true, "Suggested fields applied.");
+        }
+      } catch (err) {
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnTemplateAnalyzePdfLabels")?.addEventListener("click", async () => {
+      const status = document.getElementById("templateGenerateStatus");
+      const analyzeOut = document.getElementById("templateAnalyzeOut");
+      try {
+        showStatus(status, true, "Analyzing PDF labels and workflow overwrite targets...");
+        const data = await analyzeTemplatePdfLabelSuggestions();
+        const result = data?.result || {};
+        lastTemplatePdfAnalysisResult = result;
+        if (analyzeOut) {
+          analyzeOut.textContent = JSON.stringify(data, null, 2);
+        }
+        const applied = applyTemplateOverrideFieldsFromWorkflowTargets(result?.workflow_overwrite_targets || {}, false);
+        const suggestionCount = Array.isArray(result?.llm_overwrite_suggestions?.suggestions)
+          ? result.llm_overwrite_suggestions.suggestions.length
+          : 0;
+        showStatus(
+          status,
+          true,
+          `Analysis complete. workflow_fields=${applied.length}, label_suggestions=${suggestionCount}.`
+        );
+      } catch (err) {
+        if (analyzeOut) analyzeOut.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnTemplateApplyLabelSuggestions")?.addEventListener("click", async () => {
+      const status = document.getElementById("templateGenerateStatus");
+      const analyzeOut = document.getElementById("templateAnalyzeOut");
+      try {
+        const referenceName = String(document.getElementById("templateGenerateReferenceName")?.value || "").trim();
+        if (!referenceName) {
+          throw new Error("Please select a reference template first.");
+        }
+
+        let analysis = lastTemplatePdfAnalysisResult;
+        if (!analysis) {
+          showStatus(status, true, "No cached analysis found. Running analysis first...");
+          const fresh = await analyzeTemplatePdfLabelSuggestions();
+          analysis = fresh?.result || {};
+          lastTemplatePdfAnalysisResult = analysis;
+          if (analyzeOut) {
+            analyzeOut.textContent = JSON.stringify(fresh, null, 2);
+          }
+        }
+
+        const suggestions = Array.isArray(analysis?.llm_overwrite_suggestions?.suggestions)
+          ? analysis.llm_overwrite_suggestions.suggestions
+          : [];
+        const minConfidence = Number.parseFloat(String(document.getElementById("templateLabelSuggestionMinConfidence")?.value || "0.5"));
+        const onlyWorkflowTargets = String(document.getElementById("templateLabelSuggestionOnlyWorkflowTargets")?.value || "true") !== "false";
+
+        showStatus(status, true, "Applying accepted label suggestions to template metadata...");
+        const resp = await fetch(`/api/documents/template-references/${encodeURIComponent(referenceName)}/apply-field-label-suggestions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            suggestions,
+            min_confidence: Number.isFinite(minConfidence) ? minConfidence : 0.5,
+            only_workflow_targets: onlyWorkflowTargets,
+          }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw makeApiError(resp.status, data, "/api/documents/template-references/{reference_name}/apply-field-label-suggestions");
+
+        if (analyzeOut) {
+          analyzeOut.textContent = JSON.stringify(data, null, 2);
+        }
+
+        const applied = Array.isArray(data?.result?.applied_fields) ? data.result.applied_fields : [];
+        const skipped = Array.isArray(data?.result?.skipped_fields) ? data.result.skipped_fields : [];
+        showStatus(status, true, `Label suggestions persisted. applied=${applied.length}, skipped=${skipped.length}.`);
+      } catch (err) {
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("templateGenerateReferenceName")?.addEventListener("change", async () => {
+      const out = document.getElementById("templateFieldSchemaOut");
+      const analyzeOut = document.getElementById("templateAnalyzeOut");
+      if (out) out.textContent = "";
+      if (analyzeOut) analyzeOut.textContent = "";
+      lastTemplatePdfAnalysisResult = null;
+      renderSelectedTemplateReferenceMeta();
+      try {
+        const data = await loadTemplateFieldSchema();
+        const schema = data?.result || {};
+        applyTemplateOverrideSuggestions(schema, false);
+        applyTemplatePayloadSkeletonFromSuggestions(schema, false);
+        out.textContent = JSON.stringify(data, null, 2);
+      } catch (_err) {
+        if (out) out.textContent = "";
+      }
+    });
+
+    document.getElementById("btnTemplateFillInstruction")?.addEventListener("click", () => {
+      const instruction = buildTemplateGenerationInstruction();
+      document.getElementById("templateGenerateInstructionText").value = instruction;
+      const status = document.getElementById("templateGenerateStatus");
+      showStatus(status, true, instruction ? "Instruction text built from selected template and payload overrides." : "Nothing to build yet.");
+    });
+
     document.getElementById("btnUpload").addEventListener("click", async () => {
       const status = document.getElementById("uploadStatus");
       const out = document.getElementById("uploadOut");
       const fileInput = document.getElementById("uploadFile");
       const file = fileInput.files[0];
+      const uploadMode = String(document.getElementById("uploadMode")?.value || "document").trim();
+      const isTemplate = uploadMode === "template_reference";
       if (!file) {
         showStatus(status, false, "Please select a local file first.");
         return;
       }
-      const form = new FormData();
       const metadata = parseJsonMaybe(document.getElementById("uploadMetadata").value, {});
       const uploadMarkdownRule = String(document.getElementById("uploadMarkdownRule")?.value || "").trim();
       if (uploadMarkdownRule) {
         metadata.ingestion_markdown_rule = uploadMarkdownRule;
       }
-      form.append("file", file);
-      form.append("source_path", document.getElementById("uploadPath").value || "");
-      form.append("note", document.getElementById("uploadNote").value || "");
-      form.append("tags", document.getElementById("uploadTags").value || "");
-      form.append("metadata_json", JSON.stringify(metadata));
 
       try {
-        showStatus(status, true, "Uploading and ingesting...");
-        const resp = await fetch("/api/ingest/upload", { method: "POST", body: form });
-        const data = await resp.json();
-        if (!resp.ok) throw makeApiError(resp.status, data, "/api/ingest/path");
-        out.textContent = JSON.stringify(data, null, 2);
-        const review = prependIngestionAttention(out, data);
-        if (review) {
-          showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
-          return;
+        let resp;
+        if (isTemplate) {
+          const templateName = String(document.getElementById("uploadTemplateName")?.value || "").trim();
+          if (!templateName) {
+            showStatus(status, false, "Template name is required for reference template ingestion.");
+            return;
+          }
+
+          const tagList = String(document.getElementById("uploadTags").value || "")
+            .split(",")
+            .map(item => item.trim())
+            .filter(Boolean);
+          const noteText = String(document.getElementById("uploadNote").value || "").trim();
+          const templatePayload = {
+            processing_instruction: noteText,
+            tags: tagList,
+            metadata,
+            source_reference: String(document.getElementById("uploadPath").value || "").trim(),
+            qr_data: {
+              qr_iban: String(document.getElementById("uploadTemplateQrIban")?.value || "").trim(),
+              reference: String(document.getElementById("uploadTemplateInitialReference")?.value || "").trim(),
+              reference_type: "QRR",
+            },
+            field_rules: {
+              reference_occurrences: Math.max(1, parseInt(String(document.getElementById("uploadTemplateReferenceOccurrences")?.value || "2"), 10) || 2),
+              field_labels: parseJsonMaybe(String(document.getElementById("uploadTemplateFieldLabelsJson")?.value || ""), {}),
+              reference_keys: parseJsonMaybe(String(document.getElementById("uploadTemplateReferenceKeysJson")?.value || ""), []),
+            },
+            template_defaults: {
+              document_kind: String(document.getElementById("uploadTemplateDocumentKind")?.value || "invoice").trim(),
+            },
+            template_rule_options: {
+              reuse_existing_solf_rule: String(document.getElementById("uploadTemplateReuseSolfRule")?.value || "true").trim() !== "false",
+            },
+          };
+          if (!templatePayload.qr_data.qr_iban) delete templatePayload.qr_data.qr_iban;
+          if (!templatePayload.qr_data.reference) delete templatePayload.qr_data.reference;
+
+          const form = new FormData();
+          form.append("reference_file", file);
+          form.append("reference_name", templateName);
+          form.append("doc_name", String(document.getElementById("uploadTemplateDescription")?.value || templateName).trim() || templateName);
+          form.append("document_kind", String(document.getElementById("uploadTemplateDocumentKind")?.value || "invoice").trim());
+          form.append("description", String(document.getElementById("uploadTemplateDescription")?.value || "").trim());
+          form.append("payload_json", JSON.stringify(templatePayload));
+          form.append("workflow_key", String(document.getElementById("uploadTemplateWorkflowKey")?.value || "").trim());
+          form.append("workflow_id", String(document.getElementById("uploadTemplateWorkflowId")?.value || "").trim());
+
+          showStatus(status, true, "Uploading reference template...");
+          resp = await fetch("/api/documents/template-references/ingest", { method: "POST", body: form });
+        } else {
+          const form = new FormData();
+          form.append("file", file);
+          form.append("source_path", document.getElementById("uploadPath").value || "");
+          form.append("note", document.getElementById("uploadNote").value || "");
+          form.append("tags", document.getElementById("uploadTags").value || "");
+          form.append("metadata_json", JSON.stringify(metadata));
+
+          showStatus(status, true, "Uploading and ingesting...");
+          resp = await fetch("/api/ingest/upload", { method: "POST", body: form });
         }
-        showStatus(status, true, "Ingestion completed.");
+        const data = await resp.json();
+        if (!resp.ok) throw makeApiError(resp.status, data, isTemplate ? "/api/documents/template-references/ingest" : "/api/ingest/upload");
+        out.textContent = JSON.stringify(data, null, 2);
+        if (!isTemplate) {
+          const review = prependIngestionAttention(out, data);
+          if (review) {
+            showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
+            return;
+          }
+        }
+        showStatus(status, true, isTemplate ? "Reference template ingested." : "Ingestion completed.");
       } catch (err) {
         out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnTemplateGenerate")?.addEventListener("click", async () => {
+      const status = document.getElementById("templateGenerateStatus");
+      const out = document.getElementById("templateGenerateOut");
+      const summary = document.getElementById("templateGenerateSummary");
+      try {
+        summary?.classList.add("hidden");
+        const referenceName = String(document.getElementById("templateGenerateReferenceName")?.value || "").trim();
+        if (!referenceName) {
+          showStatus(status, false, "Please select a reference template.");
+          return;
+        }
+
+        const payloadOverridesRaw = parseJsonMaybe(String(document.getElementById("templateGeneratePayloadOverrides")?.value || ""), {});
+        const payloadOverrides = payloadOverridesRaw && typeof payloadOverridesRaw === "object" && !Array.isArray(payloadOverridesRaw)
+          ? payloadOverridesRaw
+          : (() => { throw new Error("Payload overrides must be a JSON object."); })();
+        const overrideFields = parseCsvStrings(String(document.getElementById("templateGenerateOverrideFields")?.value || ""));
+        const instructionTextEl = document.getElementById("templateGenerateInstructionText");
+        const instructionText = String(instructionTextEl?.value || "").trim() || buildTemplateGenerationInstruction();
+        if (instructionTextEl && !String(instructionTextEl.value || "").trim() && instructionText) {
+          instructionTextEl.value = instructionText;
+        }
+        if (!instructionText) {
+          showStatus(status, false, "Please enter an instruction text or provide payload overrides to build one.");
+          return;
+        }
+
+        const existingRuleName = String(document.getElementById("templateGenerateExistingRuleName")?.value || "").trim();
+        const payload = {
+          instruction_text: instructionText,
+          reuse_existing_solf_rule: String(document.getElementById("templateGenerateReuseSolfRule")?.value || "true").trim() !== "false",
+          existing_rule_name: existingRuleName,
+          invoice_request: {
+            reference_name: referenceName,
+            output_format: String(document.getElementById("templateGenerateOutputFormat")?.value || "pdf").trim(),
+            reference_mode: "next_from_reference",
+            persist_reference_state: String(document.getElementById("templateGeneratePersistReferenceState")?.value || "true").trim() !== "false",
+            override_fields: overrideFields,
+            payload: payloadOverrides,
+          },
+        };
+
+        showStatus(status, true, `Generating invoice from template ${referenceName}...`);
+        const resp = await fetch("/api/documents/template-references/generate-invoice-from-instruction", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw makeApiError(resp.status, data, "/api/documents/template-references/generate-invoice-from-instruction");
+        out.textContent = JSON.stringify(data, null, 2);
+        renderTemplateGenerationSummary(data);
+        showStatus(status, true, "Invoice generation completed.");
+      } catch (err) {
+        out.textContent = "";
+        summary?.classList.add("hidden");
+        if (summary) summary.dataset.savedPath = "";
         showStatus(status, false, String(err));
       }
     });
@@ -3550,6 +4882,7 @@
       try {
         await detectRuleApiCapabilities();
         await refreshRuleEditList();
+        await refreshWorkflowRegistryList();
       } catch (_err) {
         // Keep UI usable if endpoint is temporarily unavailable.
         const capEl = document.getElementById("ruleCapabilities");
@@ -3801,6 +5134,670 @@
       }
     });
 
+    document.getElementById("workflowRegistryFilter")?.addEventListener("input", () => {
+      applyWorkflowRegistryFilter();
+    });
+
+    document.getElementById("workflowRegistryRecent")?.addEventListener("change", (event) => {
+      const selected = Number(event.target.value || 0);
+      if (selected > 0) {
+        document.getElementById("workflowRegistryEditId").value = String(selected);
+        document.getElementById("workflowRegistryActivateId").value = String(selected);
+        document.getElementById("workflowRegistryVersionWorkflowId").value = String(selected);
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryRefreshRecent")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const count = await refreshWorkflowRegistryList();
+        showStatus(status, true, `Loaded ${count} workflows into dropdown.`);
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryList")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const qs = new URLSearchParams();
+        qs.set("limit", "200");
+        const domain = String(document.getElementById("workflowRegistryDomain")?.value || "").trim();
+        const statusValue = String(document.getElementById("workflowRegistryStatusValue")?.value || "").trim();
+        if (domain) qs.set("domain", domain);
+        if (statusValue && statusValue !== "all") qs.set("status", statusValue);
+        const data = await getJson(`/api/business-rules/workflow-registry/list?${qs.toString()}`);
+        out.textContent = JSON.stringify(data, null, 2);
+        cachedWorkflowRegistryEntries = Array.isArray(data?.result) ? data.result : [];
+        applyWorkflowRegistryFilter();
+        const select = document.getElementById("workflowRegistryRecent");
+        const visibleCount = Math.max(0, Number(select?.options?.length || 0) - 1);
+        const activeFilter = String(document.getElementById("workflowRegistryFilter")?.value || "").trim();
+        const firstKey = String((cachedWorkflowRegistryEntries?.[0] || {})?.workflow_key || "").trim();
+        if (firstKey) await refreshWorkflowRegistryActiveVersionByKey(firstKey);
+        if (cachedWorkflowRegistryEntries.length > 0 && visibleCount === 0 && activeFilter) {
+          showStatus(status, false, `Loaded ${cachedWorkflowRegistryEntries.length} workflow(s), but filter '${activeFilter}' hides all results. Clear filter to see entries.`);
+        } else {
+          showStatus(status, true, `Workflow registry entries loaded (${visibleCount}/${cachedWorkflowRegistryEntries.length} visible).`);
+        }
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistrySave")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const identity = deriveWorkflowIdentity();
+        const workflowKey = identity.workflowKey;
+        const workflowName = identity.workflowName;
+        if (!workflowKey) {
+          showStatus(status, false, "workflow_key could not be derived. Provide workflow name or key.");
+          return;
+        }
+        if (!workflowName) {
+          showStatus(status, false, "workflow_name could not be derived. Provide workflow name or key.");
+          return;
+        }
+
+        document.getElementById("workflowRegistryKey").value = workflowKey;
+        document.getElementById("workflowRegistryName").value = workflowName;
+
+        const data = await postJson("/api/business-rules/workflow-registry", {
+          workflow_key: workflowKey,
+          workflow_name: workflowName,
+          description: String(document.getElementById("workflowRegistryDescription")?.value || "").trim() || null,
+          domain: String(document.getElementById("workflowRegistryDomain")?.value || "").trim() || null,
+          status: String(document.getElementById("workflowRegistryStatusValue")?.value || "draft").trim() || "draft",
+          metadata: {},
+          is_active: String(document.getElementById("workflowRegistryIsActive")?.value || "true").trim() !== "false",
+          created_by: String(document.getElementById("workflowRegistryCreatedBy")?.value || "web:user").trim() || "web:user",
+        });
+
+        const workflowId = Number(data?.result?.workflow_id || 0);
+        if (workflowId > 0) {
+          document.getElementById("workflowRegistryEditId").value = String(workflowId);
+          document.getElementById("workflowRegistryActivateId").value = String(workflowId);
+          document.getElementById("workflowRegistryVersionWorkflowId").value = String(workflowId);
+        }
+        out.textContent = JSON.stringify(data, null, 2);
+        await refreshWorkflowRegistryList(workflowId > 0 ? workflowId : null);
+        await refreshWorkflowRegistryActiveVersionByKey(workflowKey);
+        showStatus(status, true, "Workflow registry entry saved (upsert by workflow_key).");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryLoad")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const workflowId = Number(document.getElementById("workflowRegistryEditId")?.value || 0);
+        if (!workflowId || workflowId < 1) {
+          showStatus(status, false, "Edit target workflow_id is required.");
+          return;
+        }
+
+        let data;
+        try {
+          data = await getJson(`/api/business-rules/workflow-registry/${workflowId}`);
+        } catch (_err) {
+          const fallback = await findWorkflowRegistryByIdFromList(workflowId);
+          if (!fallback) throw _err;
+          data = { success: true, result: fallback, source: "fallback:/api/business-rules/workflow-registry" };
+        }
+
+        const row = data?.result || {};
+        document.getElementById("workflowRegistryKey").value = String(row?.workflow_key || "");
+        document.getElementById("workflowRegistryName").value = String(row?.workflow_name || "");
+        document.getElementById("workflowRegistryDescription").value = String(row?.description || "");
+        document.getElementById("workflowRegistryDomain").value = String(row?.domain || "");
+        document.getElementById("workflowRegistryStatusValue").value = String(row?.status || "draft") || "draft";
+        document.getElementById("workflowRegistryIsActive").value = row?.is_active ? "true" : "false";
+        document.getElementById("workflowRegistryActivateId").value = String(workflowId);
+        document.getElementById("workflowRegistryVersionWorkflowId").value = String(workflowId);
+        await refreshWorkflowRegistryActiveVersionByKey(String(row?.workflow_key || ""));
+
+        out.textContent = JSON.stringify(data, null, 2);
+        showStatus(status, true, "Workflow loaded into registry editor fields.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryActivate")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const workflowId = Number(document.getElementById("workflowRegistryActivateId")?.value || 0);
+        if (!workflowId || workflowId < 1) {
+          showStatus(status, false, "Activation target workflow_id is required.");
+          return;
+        }
+        const data = await postJson(`/api/business-rules/workflow-registry/${workflowId}/activation`, {
+          is_active: String(document.getElementById("workflowRegistryActivateState")?.value || "true").trim() !== "false",
+        });
+        out.textContent = JSON.stringify(data, null, 2);
+        await refreshWorkflowRegistryList(workflowId);
+        const row = await findWorkflowRegistryByIdFromList(workflowId);
+        await refreshWorkflowRegistryActiveVersionByKey(String(row?.workflow_key || ""));
+        showStatus(status, true, "Workflow activation updated.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryCreateVersion")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const workflowId = Number(document.getElementById("workflowRegistryVersionWorkflowId")?.value || document.getElementById("workflowRegistryEditId")?.value || 0);
+        if (!workflowId || workflowId < 1) {
+          showStatus(status, false, "Version target workflow_id is required.");
+          return;
+        }
+
+        const workflowKey = String(document.getElementById("workflowRegistryKey")?.value || "").trim().toLowerCase();
+        const stepsInput = document.getElementById("workflowRegistryVersionStepsJson");
+        let steps = parseJsonMaybe(String(stepsInput?.value || ""), []);
+        const isBalmInvoiceWorkflow = workflowKey.includes("balm_invoice_wf") || workflowKey.includes("balm_invoice");
+        if ((!Array.isArray(steps) || !steps.length) && isBalmInvoiceWorkflow) {
+          steps = buildDefaultBalmInvoiceWorkflowSteps();
+          if (stepsInput) {
+            stepsInput.value = JSON.stringify(steps, null, 2);
+          }
+        }
+        if (!Array.isArray(steps) || !steps.length) {
+          showStatus(status, false, "Workflow steps JSON must be a non-empty list.");
+          return;
+        }
+
+        const payload = {
+          steps,
+          graph_spec: {},
+          input_contract: {},
+          output_contract: {},
+          metadata: { source: "web:workflow_registry_panel" },
+          status: String(document.getElementById("workflowRegistryVersionStatus")?.value || "draft").trim() || "draft",
+          created_by: String(document.getElementById("workflowRegistryCreatedBy")?.value || "web:user").trim() || "web:user",
+        };
+
+        const data = await postJson(`/api/business-rules/workflow-registry/${workflowId}/versions`, payload);
+        out.textContent = JSON.stringify(data, null, 2);
+
+        const createdVersionId = Number(data?.result?.workflow_version_id || 0);
+        if (createdVersionId > 0) {
+          document.getElementById("workflowRegistryPublishVersionId").value = String(createdVersionId);
+        }
+
+        const row = await findWorkflowRegistryByIdFromList(workflowId);
+        await refreshWorkflowRegistryActiveVersionByKey(String(row?.workflow_key || ""));
+        showStatus(status, true, "Workflow version created.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryListVersions")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const workflowId = Number(document.getElementById("workflowRegistryVersionWorkflowId")?.value || document.getElementById("workflowRegistryEditId")?.value || 0);
+        if (!workflowId || workflowId < 1) {
+          showStatus(status, false, "Version target workflow_id is required.");
+          return;
+        }
+        const data = await getJson(`/api/business-rules/workflow-registry/${workflowId}/versions?limit=200`);
+        out.textContent = JSON.stringify(data, null, 2);
+        showStatus(status, true, "Workflow versions loaded.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryPublishVersion")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const workflowId = Number(document.getElementById("workflowRegistryVersionWorkflowId")?.value || document.getElementById("workflowRegistryEditId")?.value || 0);
+        const workflowVersionId = Number(document.getElementById("workflowRegistryPublishVersionId")?.value || 0);
+        if (!workflowId || workflowId < 1) {
+          showStatus(status, false, "Version target workflow_id is required.");
+          return;
+        }
+        if (!workflowVersionId || workflowVersionId < 1) {
+          showStatus(status, false, "Publish workflow_version_id is required.");
+          return;
+        }
+        const data = await postJson(`/api/business-rules/workflow-registry/${workflowId}/publish`, {
+          workflow_version_id: workflowVersionId,
+          published_by: String(document.getElementById("workflowRegistryCreatedBy")?.value || "web:user").trim() || "web:user",
+        });
+        out.textContent = JSON.stringify(data, null, 2);
+        const row = await findWorkflowRegistryByIdFromList(workflowId);
+        await refreshWorkflowRegistryActiveVersionByKey(String(row?.workflow_key || ""));
+        showStatus(status, true, "Workflow version published and activated.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryWireProduction")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const workflowId = Number(document.getElementById("workflowRegistryVersionWorkflowId")?.value || document.getElementById("workflowRegistryEditId")?.value || 0);
+        const workflowVersionId = Number(document.getElementById("workflowRegistryPublishVersionId")?.value || 0);
+        if (!workflowId || workflowId < 1) {
+          showStatus(status, false, "Workflow_id is required to wire production.");
+          return;
+        }
+        if (!workflowVersionId || workflowVersionId < 1) {
+          showStatus(status, false, "Publish workflow_version_id is required before wiring to production.");
+          return;
+        }
+
+        const published = await postJson(`/api/business-rules/workflow-registry/${workflowId}/publish`, {
+          workflow_version_id: workflowVersionId,
+          published_by: String(document.getElementById("workflowRegistryCreatedBy")?.value || "web:user").trim() || "web:user",
+        });
+        const activated = await postJson(`/api/business-rules/workflow-registry/${workflowId}/activation`, {
+          is_active: true,
+        });
+
+        const row = await findWorkflowRegistryByIdFromList(workflowId);
+        await refreshWorkflowRegistryList(workflowId);
+        await refreshWorkflowRegistryActiveVersionByKey(String(row?.workflow_key || ""));
+
+        out.textContent = JSON.stringify({ published, activated }, null, 2);
+        showStatus(status, true, "Workflow published and wired to production layer.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryAutoRegisterPublishWire")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const identity = deriveWorkflowIdentity();
+        const workflowKey = String(identity?.workflowKey || "").trim();
+        const workflowName = String(identity?.workflowName || "").trim();
+        if (!workflowKey || !workflowName) {
+          showStatus(status, false, "workflow_key and workflow_name are required for automation.");
+          return;
+        }
+
+        document.getElementById("workflowRegistryKey").value = workflowKey;
+        document.getElementById("workflowRegistryName").value = workflowName;
+
+        const rawStatusValue = String(document.getElementById("workflowRegistryStatusValue")?.value || "draft").trim();
+        const normalizedStatusValue = rawStatusValue && rawStatusValue !== "all" ? rawStatusValue : "draft";
+        const createdBy = String(document.getElementById("workflowRegistryCreatedBy")?.value || "web:user").trim() || "web:user";
+
+        const upserted = await postJson("/api/business-rules/workflow-registry", {
+          workflow_key: workflowKey,
+          workflow_name: workflowName,
+          description: String(document.getElementById("workflowRegistryDescription")?.value || "").trim() || null,
+          domain: String(document.getElementById("workflowRegistryDomain")?.value || "").trim() || null,
+          status: normalizedStatusValue,
+          metadata: { source: "web:workflow_registry_auto" },
+          is_active: String(document.getElementById("workflowRegistryIsActive")?.value || "true").trim() !== "false",
+          created_by: createdBy,
+        });
+
+        const workflowId = Number(upserted?.result?.workflow_id || 0);
+        if (!workflowId || workflowId < 1) {
+          showStatus(status, false, "Could not resolve workflow_id after registry upsert.");
+          return;
+        }
+
+        document.getElementById("workflowRegistryEditId").value = String(workflowId);
+        document.getElementById("workflowRegistryActivateId").value = String(workflowId);
+        document.getElementById("workflowRegistryVersionWorkflowId").value = String(workflowId);
+
+        const workflowKeyLower = workflowKey.toLowerCase();
+        const stepsInput = document.getElementById("workflowRegistryVersionStepsJson");
+        let steps = parseJsonMaybe(String(stepsInput?.value || ""), []);
+        const isBalmInvoiceWorkflow = workflowKeyLower.includes("balm_invoice_wf") || workflowKeyLower.includes("balm_invoice");
+        if ((!Array.isArray(steps) || !steps.length) && isBalmInvoiceWorkflow) {
+          steps = buildDefaultBalmInvoiceWorkflowSteps();
+          if (stepsInput) {
+            stepsInput.value = JSON.stringify(steps, null, 2);
+          }
+        }
+
+        const designRequest = String(document.getElementById("workflowRegistryDesignRequest")?.value || "").trim();
+        const description = String(document.getElementById("workflowRegistryDescription")?.value || "").trim();
+        const workflowNarrative = designRequest || description;
+        let designGenerated = null;
+        if ((!Array.isArray(steps) || !steps.length) && workflowNarrative) {
+          designGenerated = await postJson("/api/workflow/design", {
+            request: workflowNarrative,
+            context: parseJsonMaybe(String(document.getElementById("workflowRegistryDesignContext")?.value || ""), {}),
+            max_iterations: parseIntInRange(
+              document.getElementById("workflowRegistryDesignMaxIterations")?.value,
+              3,
+              1,
+              8,
+            ),
+          });
+          steps = normalizeWorkflowStepsFromDesignPayload(designGenerated);
+          if (Array.isArray(steps) && steps.length && stepsInput) {
+            stepsInput.value = JSON.stringify(steps, null, 2);
+          }
+        }
+
+        if (!Array.isArray(steps) || !steps.length) {
+          steps = buildMinimalWorkflowStepsFromNarrative(workflowNarrative || workflowName, workflowKey);
+          if (stepsInput) {
+            stepsInput.value = JSON.stringify(steps, null, 2);
+          }
+        }
+
+        let workflowVersionId = Number(document.getElementById("workflowRegistryPublishVersionId")?.value || 0);
+        let createdVersion = null;
+        let listedVersions = null;
+        if (Array.isArray(steps) && steps.length > 0) {
+          createdVersion = await postJson(`/api/business-rules/workflow-registry/${workflowId}/versions`, {
+            steps,
+            graph_spec: {},
+            input_contract: {},
+            output_contract: {},
+            metadata: { source: "web:workflow_registry_auto" },
+            status: String(document.getElementById("workflowRegistryVersionStatus")?.value || "draft").trim() || "draft",
+            created_by: createdBy,
+          });
+          workflowVersionId = Number(createdVersion?.result?.workflow_version_id || 0);
+        } else {
+          listedVersions = await getJson(`/api/business-rules/workflow-registry/${workflowId}/versions?limit=200`);
+          const versions = Array.isArray(listedVersions?.result) ? listedVersions.result : [];
+          if (workflowVersionId < 1 && versions.length > 0) {
+            const sorted = versions
+              .map((row) => Number(row?.workflow_version_id || 0))
+              .filter((id) => Number.isFinite(id) && id > 0)
+              .sort((a, b) => b - a);
+            workflowVersionId = sorted.length ? sorted[0] : 0;
+          }
+        }
+
+        if (!workflowVersionId || workflowVersionId < 1) {
+          showStatus(status, false, "Automation could not resolve a workflow_version_id. Provide non-empty steps JSON or create a version manually once.");
+          out.textContent = JSON.stringify({ upserted, createdVersion, listedVersions }, null, 2);
+          return;
+        }
+
+        document.getElementById("workflowRegistryPublishVersionId").value = String(workflowVersionId);
+
+        const published = await postJson(`/api/business-rules/workflow-registry/${workflowId}/publish`, {
+          workflow_version_id: workflowVersionId,
+          published_by: createdBy,
+        });
+        const activated = await postJson(`/api/business-rules/workflow-registry/${workflowId}/activation`, {
+          is_active: true,
+        });
+
+        await refreshWorkflowRegistryList(workflowId);
+        await refreshWorkflowRegistryActiveVersionByKey(workflowKey);
+
+        out.textContent = JSON.stringify({ upserted, designGenerated, createdVersion, listedVersions, published, activated }, null, 2);
+        showStatus(status, true, `Automation complete. Workflow ${workflowId} is active on version ${workflowVersionId}.`);
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    async function executeActiveWorkflowAndSaveOutput(options = {}) {
+      const status = options.statusEl || document.getElementById("workflowRegistryStatus");
+      const out = options.outEl || document.getElementById("workflowRegistryOut");
+      try {
+        let workflowKey = String(options.workflowKey || "").trim();
+        if (!workflowKey) {
+          const identity = deriveWorkflowIdentity();
+          workflowKey = String(identity?.workflowKey || "").trim();
+        }
+        if (!workflowKey) {
+          const workflowId = Number(document.getElementById("workflowRegistryVersionWorkflowId")?.value || document.getElementById("workflowRegistryEditId")?.value || 0);
+          if (workflowId > 0) {
+            const row = await findWorkflowRegistryByIdFromList(workflowId);
+            workflowKey = String(row?.workflow_key || "").trim();
+          }
+        }
+        if (!workflowKey) {
+          showStatus(status, false, "workflow_key is required. Load a workflow first or provide key/name.");
+          return { success: false, reason: "missing_workflow_key" };
+        }
+
+        const inputContext = options.inputContext && typeof options.inputContext === "object"
+          ? options.inputContext
+          : parseJsonMaybe(String(document.getElementById("workflowRegistryExecutionInputContext")?.value || ""), {});
+        const createdBy = String(document.getElementById("workflowRegistryCreatedBy")?.value || "web:user").trim() || "web:user";
+
+        const started = await postJson("/api/pipeline-runs/start-by-key", {
+          workflow_key: workflowKey,
+          input_context: inputContext,
+          started_by: createdBy,
+        });
+
+        const run = started?.run || {};
+        const runId = Number(run?.run_id || 0);
+        const runStatus = String(run?.run_status || "").trim().toLowerCase();
+        if (!runId || runId < 1) {
+          showStatus(status, false, "Workflow execution did not return a run_id.");
+          out.textContent = JSON.stringify({ started }, null, 2);
+          return { success: false, started };
+        }
+
+        const saved = await postJson(`/api/pipeline-runs/${runId}/output/save`, {
+          output_dir: String(document.getElementById("workflowRegistryExecutionOutputDir")?.value || "").trim() || "generated/workflow-runs",
+          format: "json",
+          payload_source: "auto",
+          include_steps: true,
+          pretty: true,
+        });
+
+        const steps = Array.isArray(run?.steps) ? run.steps : [];
+        const failedStep = steps.find((item) => String(item?.step_status || "").trim().toLowerCase() === "failed") || null;
+        const errorMessage = String(failedStep?.error_message || "").trim();
+        out.textContent = JSON.stringify({ started, saved }, null, 2);
+
+        if (runStatus === "failed") {
+          showStatus(
+            status,
+            false,
+            `Workflow run failed${errorMessage ? `: ${errorMessage}` : ""}. Output snapshot saved: ${String(saved?.saved_path || "(unknown path)")}`,
+          );
+          return { success: false, started, saved };
+        }
+
+        if (runStatus === "paused") {
+          showStatus(
+            status,
+            false,
+            `Workflow run paused at step ${String(run?.paused_at_step_key || "(unknown)")}. Output snapshot saved: ${String(saved?.saved_path || "(unknown path)")}`,
+          );
+          return { success: false, started, saved };
+        }
+
+        showStatus(
+          status,
+          true,
+          `Workflow executed (${runStatus || "completed"}) and output saved: ${String(saved?.saved_path || "(unknown path)")}`,
+        );
+        return { success: true, started, saved };
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+        return { success: false, error: String(err) };
+      }
+    }
+
+    document.getElementById("btnWorkflowRegistryExecuteAndSaveOutput")?.addEventListener("click", async () => {
+      await executeActiveWorkflowAndSaveOutput({
+        statusEl: document.getElementById("workflowRegistryStatus"),
+        outEl: document.getElementById("workflowRegistryOut"),
+      });
+    });
+
+    document.getElementById("btnWorkflowRegistryCheckActiveVersion")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const workflowId = Number(document.getElementById("workflowRegistryVersionWorkflowId")?.value || document.getElementById("workflowRegistryEditId")?.value || 0);
+        let workflowKey = String(document.getElementById("workflowRegistryKey")?.value || "").trim();
+        if (!workflowKey && workflowId > 0) {
+          const row = await findWorkflowRegistryByIdFromList(workflowId);
+          workflowKey = String(row?.workflow_key || "").trim();
+        }
+        if (!workflowKey) {
+          showStatus(status, false, "workflow_key is required to check active version.");
+          return;
+        }
+        const data = await refreshWorkflowRegistryActiveVersionByKey(workflowKey);
+        out.textContent = JSON.stringify(data || { success: false, detail: "active version lookup failed" }, null, 2);
+        showStatus(status, true, "Active version status checked.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnWorkflowRegistryDesign")?.addEventListener("click", async () => {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const request = String(document.getElementById("workflowRegistryDesignRequest")?.value || "").trim();
+        if (!request) {
+          showStatus(status, false, "Workflow design request is required.");
+          return;
+        }
+        const maxIterations = parseIntInRange(
+          document.getElementById("workflowRegistryDesignMaxIterations")?.value,
+          3,
+          1,
+          8,
+        );
+        const data = await postJson("/api/workflow/design", {
+          request,
+          context: parseJsonMaybe(String(document.getElementById("workflowRegistryDesignContext")?.value || ""), {}),
+          max_iterations: maxIterations,
+        });
+        const generatedSteps = normalizeWorkflowStepsFromDesignPayload(data);
+        if (generatedSteps.length) {
+          const stepsInput = document.getElementById("workflowRegistryVersionStepsJson");
+          if (stepsInput) {
+            stepsInput.value = JSON.stringify(generatedSteps, null, 2);
+          }
+        }
+        out.textContent = JSON.stringify(data, null, 2);
+        showStatus(
+          status,
+          true,
+          generatedSteps.length
+            ? `Workflow design completed. Auto-generated ${generatedSteps.length} workflow step(s) into Steps JSON.`
+            : "Workflow design completed.",
+        );
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    async function runWorkflowRegistrySolfDraftParse(requireClarificationAnswer = false) {
+      const status = document.getElementById("workflowRegistryStatus");
+      const out = document.getElementById("workflowRegistryOut");
+      try {
+        const identity = deriveWorkflowIdentity();
+        const description = String(document.getElementById("workflowRegistryDescription")?.value || "").trim();
+        const domain = String(document.getElementById("workflowRegistryDomain")?.value || "").trim();
+        const designRequest = String(document.getElementById("workflowRegistryDesignRequest")?.value || "").trim();
+        const workflowNarrative = designRequest || description;
+        if (!workflowNarrative) {
+          showStatus(status, false, "Provide workflow design request or description to parse into SOLF draft.");
+          return;
+        }
+
+        const clarificationQuestion = String(document.getElementById("workflowRegistryClarificationQuestion")?.value || "").trim();
+        const clarificationAnswer = String(document.getElementById("workflowRegistryClarificationAnswer")?.value || "").trim();
+        if (requireClarificationAnswer && !clarificationAnswer) {
+          showStatus(status, false, "Please provide a clarification answer before re-parsing.");
+          return;
+        }
+
+        const ruleTextParts = [
+          `Workflow key: ${identity.workflowKey || "workflow::auto"}`,
+          `Workflow name: ${identity.workflowName || "workflow"}`,
+          domain ? `Domain: ${domain}` : "",
+          `Workflow definition: ${workflowNarrative}`,
+          "Generate SOLF-ready predicates, clauses, and class definitions for this workflow.",
+          "If ambiguous or missing information, request clarification.",
+        ].filter(Boolean);
+
+        if (clarificationAnswer) {
+          ruleTextParts.push(`Clarification question: ${clarificationQuestion || "(unspecified)"}`);
+          ruleTextParts.push(`Clarification answer: ${clarificationAnswer}`);
+          ruleTextParts.push("Use this clarification to resolve missing details and finalize predicate-ready SOLF clauses.");
+        }
+
+        const data = await postJson("/api/business-rules/simulate-draft", {
+          rule_text: ruleTextParts.join("\n"),
+          rule_name: identity.workflowKey || identity.workflowName || "workflow_auto",
+          requested_attribute: "workflow_design",
+          application_mode: "general",
+          context: {
+            domain,
+            workflow_key: identity.workflowKey,
+            workflow_name: identity.workflowName,
+            source: "workflow_registry_panel",
+          },
+          sample_attributes: {},
+        });
+
+        out.textContent = JSON.stringify(data, null, 2);
+        const result = data?.result || {};
+        if (result?.needs_clarification && result?.clarification) {
+          const question = String(result?.clarification?.clarification_question || result?.clarification?.message || "Clarification required");
+          document.getElementById("workflowRegistryClarificationQuestion").value = question;
+          showStatus(status, false, `Clarification required: ${question}`);
+          return;
+        }
+        document.getElementById("workflowRegistryClarificationQuestion").value = "";
+        showStatus(status, true, "Workflow parsed into SOLF draft successfully.");
+      } catch (err) {
+        const clarification = extractBusinessRuleClarification(err);
+        if (clarification) {
+          document.getElementById("workflowRegistryClarificationQuestion").value = String(clarification.clarification_question || clarification.message || "");
+          out.textContent = JSON.stringify({ clarification_required: true, clarification }, null, 2);
+          showStatus(status, false, clarification.clarification_question || clarification.message || "Clarification required.");
+          return;
+        }
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    }
+
+    document.getElementById("btnWorkflowRegistryParseSolf")?.addEventListener("click", async () => {
+      await runWorkflowRegistrySolfDraftParse(false);
+    });
+
+    document.getElementById("btnWorkflowRegistryClarifyParse")?.addEventListener("click", async () => {
+      await runWorkflowRegistrySolfDraftParse(true);
+    });
+
     document.getElementById("btnSolfPredicate").addEventListener("click", async () => {
       const status = document.getElementById("advancedInteractionStatus");
       const out = document.getElementById("advancedInteractionOut");
@@ -3832,13 +5829,60 @@
           showStatus(status, false, "Workflow request is required.");
           return;
         }
+        const maxIterations = parseIntInRange(document.getElementById("workflowMaxIterations").value, 3, 1, 8);
         const data = await postJson("/api/workflow/design", {
           request,
           context: parseJsonMaybe(document.getElementById("workflowContext").value, {}),
-          max_iterations: Number(document.getElementById("workflowMaxIterations").value || 3),
+          max_iterations: maxIterations,
         });
         out.textContent = JSON.stringify(data, null, 2);
         showStatus(status, true, "Workflow design completed.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnAdvancedExecuteAndSaveOutput")?.addEventListener("click", async () => {
+      const status = document.getElementById("advancedInteractionStatus");
+      const out = document.getElementById("advancedInteractionOut");
+      try {
+        const workflowRequest = String(document.getElementById("workflowRequest")?.value || "").trim();
+        const workflowContextRaw = String(document.getElementById("workflowContext")?.value || "").trim();
+
+        let workflowKey = "";
+        const match = workflowRequest.match(/workflow\s+([a-zA-Z0-9_:-]+)/i);
+        if (match && match[1]) {
+          const rawKey = String(match[1]).trim();
+          workflowKey = rawKey.includes("::") ? rawKey : `workflow::${rawKey}`;
+        }
+
+        const registryKeyInput = document.getElementById("workflowRegistryKey");
+        if (registryKeyInput && workflowKey) {
+          registryKeyInput.value = workflowKey;
+        }
+
+        let inputContext = parseJsonMaybe(workflowContextRaw, {});
+        if ((!inputContext || !Object.keys(inputContext).length) && workflowRequest) {
+          inputContext = inferExecutionContextFromNarrative(workflowRequest);
+        }
+        const result = await executeActiveWorkflowAndSaveOutput({
+          statusEl: status,
+          outEl: out,
+          workflowKey,
+          inputContext,
+        });
+
+        if (!result?.success && !workflowContextRaw) {
+          const runStatus = String(result?.started?.run?.run_status || "").trim().toLowerCase();
+          if (!runStatus) {
+            showStatus(
+              status,
+              false,
+              "Execution attempted. If this workflow needs specific fields, provide Workflow context JSON explicitly (the app also inferred context from your NL sentence when possible).",
+            );
+          }
+        }
       } catch (err) {
         out.textContent = "";
         showStatus(status, false, String(err));

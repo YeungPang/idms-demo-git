@@ -53,7 +53,7 @@ def validate_answer_quality(query_text: str, answer: str, answer_source: str) ->
 
     return issues
 
-def test_query(query_text: str) -> dict:
+def run_query(query_text: str) -> dict:
     """Execute a single query via the live API."""
     payload = {"question": query_text, "limit": 10}
     try:
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     results = []
     for i, query in enumerate(untested_queries, 1):
         print(f"[{i:2d}/{len(untested_queries)}] {query[:90]}")
-        result = test_query(query)
+        result = run_query(query)
         results.append(result)
         
         if result["success"]:
@@ -262,3 +262,9 @@ if __name__ == "__main__":
     
     # Exit with appropriate code
     sys.exit(0 if failed == 0 else 1)
+
+
+def test_historical_queries_comprehensive_module_smoke() -> None:
+    result = run_query("health check")
+    assert isinstance(result, dict)
+    assert "success" in result

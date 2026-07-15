@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import difflib
 import json
 import os
 import re
@@ -1937,7 +1936,33 @@ def apply_business_rules_to_attributes(
 
 
 _RULE_VALUE_ATTR_ALIASES: dict[str, set[str]] = {
-    "vendor": {"vendor", "vendor_name", "merchant", "merchant_name", "supplier", "supplier_name", "issuer", "issuer_name", "payee", "payee_name", "seller", "seller_name", "creditor", "creditor_name"},
+    "vendor": {
+        "vendor",
+        "vendor_name",
+        "vendor_ref",
+        "merchant",
+        "merchant_name",
+        "merchant_ref",
+        "supplier",
+        "supplier_name",
+        "supplier_ref",
+        "issuer",
+        "issuer_name",
+        "issuer_ref",
+        "payee",
+        "payee_name",
+        "payee_ref",
+        "seller",
+        "seller_name",
+        "seller_ref",
+        "creditor",
+        "creditor_name",
+        "creditor_ref",
+        "legal_name",
+        "counterparty_name",
+        "counterparty_ref",
+        "vendor_candidates",
+    },
     "company": {"company", "company_name", "legal_entity_ref", "company_ref", "bill_to", "bill_to_name", "payer_company", "payable_by"},
     "particulars": {"particulars", "booking_particulars", "expense_particulars", "description", "memo", "purpose"},
 }
@@ -1988,6 +2013,31 @@ def _get_attribute_values_for_terms(attributes: dict[str, Any], attribute_terms:
         elif value not in (None, "", {}, []):
             values.append(str(value).strip())
     return values
+
+
+def _is_ticket_like_financial_entity(entity_class_norm: str, attributes: dict[str, Any]) -> bool:
+    if entity_class_norm == "ticket":
+        return True
+    if entity_class_norm not in {"invoice", "bill", "receipt", "document", "entity"}:
+        return False
+
+    invoice_type = _normalize_class_token(str(attributes.get("invoice_type") or ""))
+    if invoice_type in {"ticket", "travel_ticket", "rail_ticket"}:
+        return True
+
+    for key in (
+        "ticket_id",
+        "ticket_type",
+        "fare_type",
+        "journey_type",
+        "origin",
+        "destination",
+        "departure_time",
+        "arrival_time",
+    ):
+        if attributes.get(key) not in (None, "", [], {}):
+            return True
+    return False
 
 
 def _matches_rule_condition(attributes: dict[str, Any], condition: dict[str, Any]) -> bool:
@@ -2316,6 +2366,13 @@ def apply_post_extraction_business_rules(
     document_attrs = dict(document)
     patched_entities: list[Any] = []
     entity_name_by_id = _build_entity_name_by_id(entities)
+    peer_vendor_candidates = [
+        str(entity.get("entity_name") or entity.get("name") or "").strip()
+        for entity in entities
+        if isinstance(entity, dict)
+        and _normalize_class_token(str(entity.get("class_name") or entity.get("entity_type") or "")) in {"organization", "company", "service"}
+        and str(entity.get("entity_name") or entity.get("name") or "").strip()
+    ]
     explicit_rule_stats: dict[int, dict[str, Any]] = {}
     for rule in explicit_rules:
         rule_id = int(rule.get("rule_id") or 0)
@@ -2402,6 +2459,7 @@ def apply_post_extraction_business_rules(
         item = dict(entity)
         attrs = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
         attrs = dict(attrs)
+        condition_attrs = dict(attrs)
         entity_context = dict(base_context)
         entity_context["entity_class"] = item.get("class_name") or item.get("entity_type")
         entity_class_norm = _normalize_class_token(str(entity_context.get("entity_class") or ""))
@@ -2429,6 +2487,19 @@ def apply_post_extraction_business_rules(
             # to receipt scope so selected invoice/bill/receipt booking rules can still apply.
             entity_context["document_type"] = "receipt"
 
+        # Some ticket-like financial entities do not carry explicit issuer/vendor fields,
+        # while the vendor appears in sibling organization/service entities.
+        # Expose those names as condition-only candidates so contains_any vendor rules can match.
+        if _is_ticket_like_financial_entity(entity_class_norm, condition_attrs):
+            has_direct_vendor_fields = bool(
+                _get_attribute_values_for_terms(
+                    condition_attrs,
+                    ["vendor", "issuer", "supplier", "legal_name"],
+                )
+            )
+            if not has_direct_vendor_fields and peer_vendor_candidates:
+                condition_attrs["vendor_candidates"] = list(peer_vendor_candidates)
+
         for rule in explicit_rules:
             rule_id = int(rule.get("rule_id") or 0) or None
             attrs = apply_business_rules_to_attributes(attrs, context=entity_context, rule_id=rule_id, include_inactive=include_inactive)
@@ -2442,7 +2513,7 @@ def apply_post_extraction_business_rules(
                 for directive in directives:
                     if str(directive.get("target_scope") or "entity").strip().lower() != "entity":
                         continue
-                    if not _directive_matches_entity(directive, attrs, entity_context, explicit_selected=explicit_selected):
+                    if not _directive_matches_entity(directive, condition_attrs, entity_context, explicit_selected=explicit_selected):
                         continue
                     if explicit_selected:
                         rid = int(rule.get("rule_id") or 0)
@@ -3735,6 +3806,249 @@ def get_solf_workflow_active_version_by_key(workflow_key: str) -> dict[str, Any]
         }
     finally:
         connection.close()
+
+
+def _extract_first_code_block(text: str) -> str:
+    raw = str(text or "")
+    match = re.search(r"```(?:[a-zA-Z0-9_+-]+)?\s*\n([\s\S]*?)```", raw)
+    if match:
+        return str(match.group(1) or "").strip()
+    return raw.strip()
+
+
+def _get_existing_clause_id_by_name(connection: Any, clause_name: str) -> int | None:
+    normalized = str(clause_name or "").strip()
+    if not normalized:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT clause_id
+            FROM solf_clauses
+            WHERE clause_name = %s
+            ORDER BY is_active DESC, modified_at DESC, clause_id DESC
+            LIMIT 1
+            """,
+            (normalized,),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except Exception:
+        return None
+
+
+def _build_fallback_workflow_clause_body(
+    *,
+    clause_name: str,
+    workflow_key: str,
+    workflow_name: str,
+    narrative: str,
+) -> str:
+    safe_clause = _slug(clause_name) or "auto_generated_workflow_clause"
+    prompt_lines = [
+        f"Workflow key: {workflow_key or 'workflow::auto'}",
+        f"Workflow name: {workflow_name or 'workflow'}",
+        f"Workflow narrative: {narrative or 'No narrative provided.'}",
+        "Task: execute workflow steps from the narrative and return strict JSON.",
+        "JSON contract: include fields result, assumptions, actions_taken, and artifact (format, title, columns, rows).",
+        "When tabular output is suitable, provide artifact.format as xlsx and include artifact.columns/artifact.rows.",
+        "Input context JSON: {context}",
+    ]
+    prompt_template = "\\n".join(prompt_lines).replace('"', '\\"')
+    return (
+        f"{safe_clause}(_ctx) ⦃\n"
+        f"    (_workflow_prompt ≔ \"{prompt_template}\") ⋀\n"
+        f"    ↲(workflow_compose_operations({{\n"
+        f"        context: _ctx,\n"
+        f"        stop_on_error: true,\n"
+        f"        operations: [\n"
+        f"            {{\n"
+        f"                action: workflow_llm_call,\n"
+        f"                payload: {{\n"
+        f"                    prompt_template: _workflow_prompt,\n"
+        f"                    variables: {{ context: _ctx }},\n"
+        f"                    parse_json: true,\n"
+        f"                    temperature: 0.0,\n"
+        f"                    complexity: \"complex\"\n"
+        f"                }},\n"
+        f"                save_as: workflow_llm_result,\n"
+        f"                merge_result_json: true\n"
+        f"            }},\n"
+        f"            {{\n"
+        f"                action: workflow_generate_artifact,\n"
+        f"                payload: {{ output_dir: \"generated/doc\", default_format: \"xlsx\", force_format: \"xlsx\" }},\n"
+        f"                save_as: generated_artifact,\n"
+        f"                merge_result_json: true\n"
+        f"            }}\n"
+        f"        ]\n"
+        f"    }}))\n"
+        f"⦄"
+    )
+
+
+def _generate_workflow_clause_body_from_narrative(
+    *,
+    clause_name: str,
+    workflow_key: str,
+    workflow_name: str,
+    narrative: str,
+) -> str:
+    fallback = _build_fallback_workflow_clause_body(
+        clause_name=clause_name,
+        workflow_key=workflow_key,
+        workflow_name=workflow_name,
+        narrative=narrative,
+    )
+
+    client = _make_genai_client()
+    if client is None:
+        return fallback
+
+    requires_excel = bool(re.search(r"\b(excel|xlsx|spreadsheet)\b", str(narrative or ""), flags=re.IGNORECASE))
+    excel_requirement_line = (
+        "3b) Because workflow narrative requires spreadsheet output, set workflow_generate_artifact payload force_format to xlsx.\\n"
+        if requires_excel
+        else ""
+    )
+
+    prompt = (
+        "Generate exactly one executable SOLF clause for an IDMS workflow.\\n"
+        "Hard requirements:\\n"
+        f"1) Clause name MUST be exactly: {clause_name}\\n"
+        "2) Single clause only, no class blocks, no markdown fences, no explanation text.\\n"
+        "3) The clause must call workflow_compose_operations and include workflow_llm_call + workflow_generate_artifact operations.\\n"
+        f"{excel_requirement_line}"
+        "4) Return a JSON-like result via ↲(...).\\n"
+        "5) Keep syntax valid for SOLF parser.\\n\\n"
+        f"Workflow key: {workflow_key or 'workflow::auto'}\\n"
+        f"Workflow name: {workflow_name or 'workflow'}\\n"
+        f"Workflow narrative: {narrative or 'No narrative provided.'}\\n"
+    )
+
+    try:
+        response = generate_content_with_openrouter_fallback(
+            primary_call=lambda: client.models.generate_content(
+                model=EXTRACT_MODEL,
+                contents=[prompt],
+            ),
+            model=EXTRACT_MODEL,
+            contents=[prompt],
+            temperature=0.0,
+            call_name="workflow_clause_generation",
+            complexity="medium",
+        )
+        raw_text = str(getattr(response, "text", "") or "")
+        candidate = _extract_first_code_block(raw_text)
+        if not candidate:
+            return fallback
+
+        required_tokens = [
+            "workflow_compose_operations",
+            "workflow_llm_call",
+            "workflow_generate_artifact",
+        ]
+        lowered_candidate = candidate.lower()
+        if any(token.lower() not in lowered_candidate for token in required_tokens):
+            return fallback
+
+        if requires_excel:
+            requires_excel_tokens = ["force_format", "xlsx"]
+            if any(token not in lowered_candidate for token in requires_excel_tokens):
+                return fallback
+
+        parsed_clauses = _extract_solf_clauses_from_script(candidate)
+        if not parsed_clauses:
+            return fallback
+        first_name = str(parsed_clauses[0].get("clause_name") or "").strip()
+        if first_name != str(clause_name or "").strip():
+            return fallback
+
+        syntax_errors = _validate_solf_clause_syntax(parsed_clauses)
+        if syntax_errors:
+            return fallback
+        return candidate
+    except Exception:
+        return fallback
+
+
+def _ensure_workflow_clauses_for_steps(
+    connection: Any,
+    *,
+    workflow_id: int,
+    workflow_key: str,
+    workflow_name: str,
+    steps: list[dict[str, Any]],
+    workflow_description: str | None,
+    created_by: str | None,
+) -> dict[str, Any]:
+    pattern_library = PatternLibrary(connection)
+    generated: list[dict[str, Any]] = []
+    existing: list[str] = []
+
+    for index, step in enumerate(steps or [], start=1):
+        if not isinstance(step, dict):
+            continue
+        step_kind = str(step.get("step_kind") or "clause").strip().lower()
+        if step_kind != "clause":
+            continue
+
+        clause_name = str(step.get("clause_name") or "").strip()
+        if not clause_name:
+            continue
+
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        source = str(config.get("source") or "").strip().lower()
+        narrative = str(config.get("narrative") or workflow_description or "").strip()
+        should_generate = source == "workflow_narrative" or clause_name.startswith("auto_generated_")
+
+        clause_id = _get_existing_clause_id_by_name(connection, clause_name)
+        if clause_id is not None and not should_generate:
+            step["clause_id"] = clause_id
+            existing.append(clause_name)
+            continue
+
+        if not should_generate:
+            continue
+
+        clause_body = _generate_workflow_clause_body_from_narrative(
+            clause_name=clause_name,
+            workflow_key=workflow_key,
+            workflow_name=workflow_name,
+            narrative=narrative,
+        )
+        clause_id = pattern_library.upsert_solf_clause(
+            clause_name=clause_name,
+            clause_type="resolve_policy",
+            clause_body=clause_body,
+            entity_class=None,
+            metadata={
+                "source": "workflow_registry_auto_clause",
+                "workflow_id": int(workflow_id),
+                "workflow_key": workflow_key,
+                "workflow_name": workflow_name,
+                "step_key": str(step.get("step_key") or f"step_{index}"),
+            },
+            is_active=True,
+            created_by=created_by or "api:user",
+        )
+        if isinstance(clause_id, int):
+            step["clause_id"] = clause_id
+            generated.append(
+                {
+                    "step_key": str(step.get("step_key") or f"step_{index}"),
+                    "clause_name": clause_name,
+                    "clause_id": clause_id,
+                }
+            )
+
+    return {
+        "generated_clause_count": len(generated),
+        "generated_clauses": generated,
+        "existing_clause_count": len(existing),
+    }
 
 
 def _normalize_generated_extension_rule(rule: dict[str, Any], index: int) -> dict[str, Any]:
@@ -6866,6 +7180,118 @@ def create_business_rule_with_workflow_registry(
     }
 
 
+def list_workflow_versions(
+    workflow_id: int,
+    is_active: bool | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    connection = object_db.get_connection()
+    try:
+        workflow = object_db.get_solf_workflow_registry_by_id(connection, workflow_id=workflow_id)
+        if workflow is None:
+            return []
+
+        versions = object_db.list_solf_workflow_versions(
+            connection=connection,
+            workflow_id=int(workflow_id),
+            is_active=is_active,
+            limit=limit,
+        )
+        out: list[dict[str, Any]] = []
+        for row in versions:
+            version = dict(row)
+            workflow_version_id = int(version.get("workflow_version_id") or 0)
+            steps = object_db.list_solf_workflow_steps(connection, workflow_version_id=workflow_version_id)
+            version["steps"] = steps
+            version["step_count"] = len(steps)
+            metadata = version.get("metadata") if isinstance(version.get("metadata"), dict) else {}
+            version["status"] = str(metadata.get("status") or ("published" if bool(version.get("is_active")) else "draft"))
+            out.append(version)
+        return out
+    finally:
+        connection.close()
+
+
+def create_workflow_version(
+    workflow_id: int,
+    *,
+    steps: list[dict[str, Any]],
+    graph_spec: dict[str, Any] | None = None,
+    input_contract: dict[str, Any] | None = None,
+    output_contract: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    status: str = "draft",
+    created_by: str | None = None,
+) -> dict[str, Any] | None:
+    connection = object_db.get_connection()
+    try:
+        workflow = object_db.get_solf_workflow_registry_by_id(connection, workflow_id=workflow_id)
+        if workflow is None:
+            return None
+
+        normalized_steps = [dict(item) for item in (steps or []) if isinstance(item, dict)]
+        clause_resolution = _ensure_workflow_clauses_for_steps(
+            connection,
+            workflow_id=int(workflow_id),
+            workflow_key=str(workflow.get("workflow_key") or "").strip(),
+            workflow_name=str(workflow.get("workflow_name") or "").strip(),
+            steps=normalized_steps,
+            workflow_description=str(workflow.get("description") or "").strip() or None,
+            created_by=created_by,
+        )
+
+        workflow_version_id = object_db.create_solf_workflow_version(
+            connection=connection,
+            workflow_id=int(workflow_id),
+            rule_id=None,
+            graph_spec=graph_spec if isinstance(graph_spec, dict) else {},
+            input_contract=input_contract if isinstance(input_contract, dict) else {},
+            output_contract=output_contract if isinstance(output_contract, dict) else {},
+            metadata=metadata if isinstance(metadata, dict) else {},
+            is_active=False,
+            created_by=created_by,
+        )
+
+        step_count = object_db.replace_solf_workflow_steps(
+            connection=connection,
+            workflow_version_id=int(workflow_version_id),
+            steps=normalized_steps,
+        )
+
+        normalized_status = str(status or "draft").strip().lower() or "draft"
+        if normalized_status != "draft":
+            object_db.set_solf_workflow_version_status(
+                connection=connection,
+                workflow_version_id=int(workflow_version_id),
+                status=normalized_status,
+            )
+
+        versions = object_db.list_solf_workflow_versions(
+            connection=connection,
+            workflow_id=int(workflow_id),
+            is_active=None,
+            limit=500,
+        )
+        created_version = next(
+            (item for item in versions if int(item.get("workflow_version_id") or 0) == int(workflow_version_id)),
+            None,
+        )
+        steps_row = object_db.list_solf_workflow_steps(connection, workflow_version_id=int(workflow_version_id))
+
+        return {
+            "workflow_id": int(workflow_id),
+            "workflow_key": workflow.get("workflow_key"),
+            "workflow_version_id": int(workflow_version_id),
+            "step_count": int(step_count),
+            "clause_resolution": clause_resolution,
+            "status": normalized_status,
+            "version": created_version,
+            "steps": steps_row,
+        }
+    finally:
+        connection.close()
+
+
 def publish_workflow_version(
     workflow_id: int,
     workflow_version_id: int,
@@ -6889,6 +7315,17 @@ def publish_workflow_version(
         )
         if target_version is None:
             return None
+
+        version_steps = object_db.list_solf_workflow_steps(connection, workflow_version_id=int(workflow_version_id))
+        clause_resolution = _ensure_workflow_clauses_for_steps(
+            connection,
+            workflow_id=int(workflow_id),
+            workflow_key=str(workflow.get("workflow_key") or "").strip(),
+            workflow_name=str(workflow.get("workflow_name") or "").strip(),
+            steps=[dict(item) for item in version_steps if isinstance(item, dict)],
+            workflow_description=str(workflow.get("description") or "").strip() or None,
+            created_by=published_by,
+        )
 
         object_db.deactivate_workflow_versions_except(
             connection=connection,
@@ -6920,6 +7357,7 @@ def publish_workflow_version(
             "published_version_id": workflow_version_id,
             "published_version_no": int(target_version.get("version_no") or 0),
             "status": "published",
+            "clause_resolution": clause_resolution,
             "active_version": updated_version,
             "resource_aliases": aliases,
             "resource_alias_count": len(aliases),

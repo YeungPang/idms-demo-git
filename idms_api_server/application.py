@@ -39,6 +39,7 @@ from idms_api_server.routers.domain_definitions import router as domain_definiti
 from idms_api_server.routers.pipeline_runs import router as pipeline_runs_router
 from idms_api_server.routers.matching import router as matching_router
 from idms_api_server.routers.nl_gateway import router as nl_gateway_router
+from idms_api_server.routers.source_databases import router as source_databases_router
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ app.include_router(domain_definitions_router)
 app.include_router(pipeline_runs_router)
 app.include_router(matching_router)
 app.include_router(nl_gateway_router)
+app.include_router(source_databases_router)
 
 
 @app.on_event("startup")

@@ -696,6 +696,54 @@ auf:
         self.assertEqual(log_info.call_args[0][2], "router")
         self.assertEqual(log_info.call_args[0][3], "router-model")
 
+    def test_generate_json_parses_fenced_json_response(self):
+        response = MagicMock()
+        response.text = "```json\n{\"document\": {\"doc_key\": \"x.pdf\", \"doc_type\": \"invoice\"}}\n```"
+        client = MagicMock()
+        client.models.generate_content.return_value = response
+
+        with patch.object(ingest, "build_model_contents", return_value=["prompt"]), patch.object(
+            ingest,
+            "generate_content_with_openrouter_fallback",
+            return_value=response,
+        ):
+            parsed = ingest.generate_json(
+                client=client,
+                model="extract-model",
+                source_path_or_uri="x.pdf",
+                gcs_uri="gs://bucket/x.pdf",
+                prompt="extract",
+                call_name="extract",
+                run_id="run-fenced",
+            )
+
+        self.assertEqual(str((parsed.get("document") or {}).get("doc_type") or ""), "invoice")
+
+    def test_generate_json_autocloses_truncated_object(self):
+        response = MagicMock()
+        response.text = "```json\n{\"document\": {\"doc_key\": \"x.pdf\", \"doc_type\": \"invoice\", \"keywords\": [\"travel\", \"booking\", \"train\",\n"
+        client = MagicMock()
+        client.models.generate_content.return_value = response
+
+        with patch.object(ingest, "build_model_contents", return_value=["prompt"]), patch.object(
+            ingest,
+            "generate_content_with_openrouter_fallback",
+            return_value=response,
+        ):
+            parsed = ingest.generate_json(
+                client=client,
+                model="extract-model",
+                source_path_or_uri="x.pdf",
+                gcs_uri="gs://bucket/x.pdf",
+                prompt="extract",
+                call_name="extract",
+                run_id="run-truncated",
+            )
+
+        document = parsed.get("document") if isinstance(parsed.get("document"), dict) else {}
+        self.assertEqual(str(document.get("doc_type") or ""), "invoice")
+        self.assertEqual(document.get("keywords"), ["travel", "booking", "train"])
+
     def test_localize_user_description_logs_json_response(self):
         response = MagicMock()
         response.text = '{"localized_description":"Hallo"}'

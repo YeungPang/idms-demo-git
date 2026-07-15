@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -20,7 +21,7 @@ LOGGER = logging.getLogger("idms.domain_function")
 ENFORCE_REQUIRED_DOMAIN_ACTIONS = os.getenv("IDMS_ENFORCE_REQUIRED_DOMAIN_ACTIONS", "true").strip().lower() in {"1", "true", "yes", "on"}
 REQUIRED_DOMAIN_ACTION_POLICY = os.getenv(
     "IDMS_REQUIRED_DOMAIN_ACTION_POLICY",
-    "invoice:fail,bill:fail,receipt:warn,employment_contract:fail,employment_pattern:fail",
+    "invoice:fail,bill:fail,receipt:warn,purchase_order:warn,bank_statement:warn,employment_contract:fail,employment_pattern:fail",
 )
 
 
@@ -33,7 +34,7 @@ def _allowed_attributes(class_defs: dict[str, Any], class_name: str) -> list[str
 
 def _build_accounting_prompt_guidance(class_defs: dict[str, Any], routed: dict[str, Any]) -> str:
     document_type = str(routed.get("document_type") or "").strip().lower()
-    if document_type not in {"invoice", "bill", "receipt"}:
+    if document_type not in {"invoice", "bill", "receipt", "purchase_order", "bank_statement", "payment_confirmation"}:
         return ""
     if "accounting_transaction" not in class_defs:
         return ""
@@ -42,7 +43,7 @@ def _build_accounting_prompt_guidance(class_defs: dict[str, Any], routed: dict[s
     return (
         "Accounting extraction rules for this financial document:\n"
         "- Include one accounting_transaction entity when enough evidence exists for posting.\n"
-        "- When the routed document type is invoice, bill, or receipt, prefer outputting accounting_transaction rather than leaving booking implicit.\n"
+        "- When the routed document type is invoice, bill, receipt, purchase_order, bank_statement, or payment_confirmation, prefer outputting accounting_transaction rather than leaving booking implicit.\n"
         "- accounting_transaction.attributes must include ledger_lines array with at least one debit and one credit line.\n"
         "- Each ledger_lines item should include: account_number, direction (debit|credit), amount_source_currency, source_currency, exchange_rate_to_chf, amount_chf, swiss_vat_code.\n"
         "- Enforce double-entry consistency: total debit amount_chf must equal total credit amount_chf.\n"
@@ -271,6 +272,64 @@ def _collect_reference_hints_from_entities(entities: list[Any]) -> dict[str, str
     return hints
 
 
+def _collect_booking_hints_from_entities(entities: list[Any]) -> dict[str, Any]:
+    booking_keys = (
+        "booking_debit_account_number",
+        "booking_debit_account_name",
+        "booking_particulars",
+        "expense_account_number",
+        "expense_account_name",
+        "debit_account_number",
+        "account_number",
+        "particulars",
+    )
+    hints: dict[str, Any] = {}
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        attrs = entity.get("attributes") if isinstance(entity.get("attributes"), dict) else {}
+        for key in booking_keys:
+            value = attrs.get(key)
+            if value in (None, "", [], {}):
+                continue
+            hints.setdefault(key, value)
+    return hints
+
+
+def _extract_booking_override_attributes(attrs: dict[str, Any]) -> dict[str, Any]:
+    booking_keys = (
+        "booking_debit_account_number",
+        "booking_debit_account_name",
+        "booking_particulars",
+        "expense_account_number",
+        "expense_account_name",
+        "debit_account_number",
+        "account_number",
+        "particulars",
+    )
+    out: dict[str, Any] = {}
+    for key in booking_keys:
+        value = attrs.get(key)
+        if value in (None, "", [], {}):
+            continue
+        out[key] = value
+    return out
+
+
+def _extract_forced_currency(document_payload: dict[str, Any]) -> str:
+    metadata = document_payload.get("metadata") if isinstance(document_payload.get("metadata"), dict) else {}
+    user_metadata = metadata.get("user_metadata") if isinstance(metadata.get("user_metadata"), dict) else {}
+
+    for container in (document_payload, metadata, user_metadata):
+        if not isinstance(container, dict):
+            continue
+        for key in ("force_currency", "booking_currency_override"):
+            raw = str(container.get(key) or "").strip().upper()
+            if raw and re.fullmatch(r"[A-Z]{3}", raw):
+                return raw
+    return ""
+
+
 def _to_decimal_amount(value: Any) -> Decimal:
     if value is None:
         return Decimal("0")
@@ -296,6 +355,31 @@ def _to_decimal_amount(value: Any) -> Decimal:
         return Decimal(text)
     except InvalidOperation:
         return Decimal("0")
+
+
+def _extract_first_positive_amount(attrs: dict[str, Any], keys: tuple[str, ...]) -> Decimal:
+    for key in keys:
+        amount = _to_decimal_amount(attrs.get(key))
+        if amount > 0:
+            return amount
+    return Decimal("0")
+
+
+TICKET_AMOUNT_KEYS: tuple[str, ...] = (
+    "ticket_amount",
+    "fare_amount",
+    "gross_amount",
+    "total_amount",
+    "total_gross_amount",
+    "amount_total",
+    "amount",
+    "price",
+    "standard_price",
+    "price_total",
+    "total_price",
+    "paid_amount",
+    "charge_amount",
+)
 
 
 def _normalize_party_value(value: Any, entity_name_by_id: dict[str, str] | None = None) -> str:
@@ -385,7 +469,7 @@ def _ledger_lines_need_normalization(ledger_lines: Any) -> bool:
     if not isinstance(ledger_lines, list) or not ledger_lines:
         return True
 
-    allowed_accounts = {1060, 1100, 2000, 2200, 3000, 3010, 3200, 4200, 6400, 6500}
+    allowed_accounts = {1020, 1060, 1100, 2000, 2200, 2900, 3000, 3010, 3200, 4200, 6400, 6500, 9100}
     for line in ledger_lines:
         if not isinstance(line, dict):
             return True
@@ -410,6 +494,9 @@ def _resolve_booking_debit_account_number(source_attrs: dict[str, Any], document
         if account_number > 0:
             return account_number
 
+    if document_type == "purchase_order":
+        return 9100
+
     account_name = str(
         source_attrs.get("booking_debit_account_name")
         or source_attrs.get("expense_account_name")
@@ -427,6 +514,9 @@ def _resolve_booking_debit_account_number(source_attrs: dict[str, Any], document
             "general and administrative expense": 6500,
             "office and admin expense": 6500,
             "purchases": 4200,
+            "commitment expense": 9100,
+            "commitment expenses": 9100,
+            "purchase commitment": 9100,
         }
         for alias, account_number in account_aliases.items():
             if alias in account_name:
@@ -434,6 +524,8 @@ def _resolve_booking_debit_account_number(source_attrs: dict[str, Any], document
 
     if document_type in {"invoice", "bill", "receipt"}:
         return 4200
+    if document_type == "purchase_order":
+        return 9100
     if document_type == "ticket":
         return 6400
     return 6500
@@ -456,6 +548,9 @@ def _resolve_booking_credit_account_number(
         if account_number > 0:
             return account_number
 
+    if document_type == "purchase_order":
+        return 2900
+
     account_name = str(
         source_attrs.get("booking_credit_account_name")
         or source_attrs.get("revenue_account_name")
@@ -471,6 +566,8 @@ def _resolve_booking_credit_account_number(
             "sales revenue": 3000,
             "export revenue": 3200,
             "export sales": 3200,
+            "commitment reserve": 2900,
+            "purchase commitment reserve": 2900,
         }
         for alias, account_number in account_aliases.items():
             if alias in account_name:
@@ -478,6 +575,8 @@ def _resolve_booking_credit_account_number(
 
     if role == "sales_invoice":
         return 3000
+    if document_type == "purchase_order":
+        return 2900
     if document_type in {"invoice", "bill", "receipt"}:
         return 2000
     if document_type == "ticket":
@@ -564,18 +663,7 @@ def _is_payable_ticket_entity(entity: dict[str, Any] | None) -> bool:
     )
     if not ticket_like:
         return False
-    for key in (
-        "ticket_amount",
-        "fare_amount",
-        "gross_amount",
-        "total_amount",
-        "amount",
-        "price",
-        "fare",
-    ):
-        if _to_decimal_amount(attrs.get(key)) > 0:
-            return True
-    return False
+    return _extract_first_positive_amount(attrs, TICKET_AMOUNT_KEYS + ("fare",)) > 0
 
 
 def _is_ticket_like_entity(entity: dict[str, Any] | None) -> bool:
@@ -616,6 +704,11 @@ def _entity_has_positive_amount(entity: dict[str, Any] | None) -> bool:
         "ticket_amount",
         "fare_amount",
         "price",
+        "standard_price",
+        "price_total",
+        "total_price",
+        "paid_amount",
+        "charge_amount",
         "fare",
     ):
         if _to_decimal_amount(attrs.get(key)) > 0:
@@ -623,7 +716,179 @@ def _entity_has_positive_amount(entity: dict[str, Any] | None) -> bool:
     return False
 
 
-def _extract_chf_amount_from_structured_tables(document_payload: dict[str, Any]) -> Decimal:
+def _has_travel_booking_context(source_attrs: dict[str, Any], document_payload: dict[str, Any]) -> bool:
+    text_parts = [
+        str(document_payload.get("doc_theme") or ""),
+        str(document_payload.get("doc_desc") or ""),
+        str(document_payload.get("doc_name") or ""),
+        str(document_payload.get("doc_key") or ""),
+        str(source_attrs.get("description") or ""),
+        str(source_attrs.get("invoice_description") or ""),
+        str(source_attrs.get("line_item_description") or ""),
+        str(source_attrs.get("service_description") or ""),
+    ]
+    text_blob = " ".join(part.strip().lower() for part in text_parts if str(part).strip())
+
+    if any(
+        token in text_blob
+        for token in (
+            "ticket",
+            "train",
+            "rail",
+            "journey",
+            "travel",
+            "trip",
+            "itinerary",
+            "reservation",
+            "fahrt",
+            "seat reservation",
+        )
+    ):
+        return True
+
+    return any(
+        source_attrs.get(key) not in (None, "", [], {})
+        for key in (
+            "ticket_id",
+            "ticket_type",
+            "journey_type",
+            "origin",
+            "destination",
+            "departure_time",
+            "arrival_time",
+            "coach",
+            "seat",
+        )
+    )
+
+
+def _adjust_invoice_role_for_travel_context(
+    invoice_role: str,
+    source_attrs: dict[str, Any],
+    document_payload: dict[str, Any],
+    effective_document_type: str,
+) -> str:
+    role = str(invoice_role or "").strip().lower()
+    if str(effective_document_type or "").strip().lower() not in {"invoice", "bill"}:
+        return role
+    if _has_travel_booking_context(source_attrs, document_payload):
+        return "vendor_invoice"
+    return role
+
+
+def _infer_force_booking_document_type(document_payload: dict[str, Any], default_type: str) -> str:
+    preferred = str(default_type or "").strip().lower()
+    if preferred in {"invoice", "bill", "receipt", "purchase_order", "bank_statement", "payment_confirmation", "ticket"}:
+        return preferred
+
+    text = " ".join(
+        str(document_payload.get(key) or "").strip().lower()
+        for key in ("doc_theme", "doc_desc", "doc_name", "doc_key", "doc_type")
+    )
+
+    if any(
+        token in text
+        for token in (
+            "ticket",
+            "travel",
+            "journey",
+            "fahrt",
+            "rail",
+            "railway",
+            "train",
+            "booking",
+            "reservation",
+            "itinerary",
+            "trip",
+            "fare",
+        )
+    ):
+        return "ticket"
+    if any(token in text for token in ("receipt", "quittung")):
+        return "receipt"
+    if any(token in text for token in ("invoice", "fattura")):
+        return "invoice"
+    if any(token in text for token in ("bill",)):
+        return "bill"
+    return "receipt"
+
+
+_CURRENCY_SYMBOL_TO_CODE: dict[str, str] = {
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+}
+
+
+def _extract_amount_currency_candidates(text: str) -> list[tuple[Decimal, str]]:
+    if not text:
+        return []
+
+    candidates: list[tuple[Decimal, str]] = []
+
+    for code, amount_raw in re.findall(r"\b([A-Z]{3})\s*([0-9][0-9'.,]*)", text):
+        amount = _to_decimal_amount(amount_raw)
+        if amount > 0:
+            candidates.append((amount, str(code or "").upper()))
+
+    for amount_raw, code in re.findall(r"([0-9][0-9'.,]*)\s*([A-Z]{3})\b", text):
+        amount = _to_decimal_amount(amount_raw)
+        if amount > 0:
+            candidates.append((amount, str(code or "").upper()))
+
+    symbol_pattern = r"(" + "|".join(re.escape(symbol) for symbol in _CURRENCY_SYMBOL_TO_CODE.keys()) + r")\s*([0-9][0-9'.,]*)"
+    for symbol, amount_raw in re.findall(symbol_pattern, text):
+        amount = _to_decimal_amount(amount_raw)
+        currency = _CURRENCY_SYMBOL_TO_CODE.get(symbol, "")
+        if amount > 0 and currency:
+            candidates.append((amount, currency))
+
+    return candidates
+
+
+def _iter_existing_markdown_paths(candidates: list[str]) -> list[Path]:
+    module_dir = Path(__file__).resolve().parent
+    workspace_dir = module_dir.parent
+    discovered: list[Path] = []
+    seen: set[str] = set()
+
+    for raw in candidates:
+        candidate = str(raw or "").strip()
+        if not candidate:
+            continue
+
+        normalized = candidate.replace("\\", "/")
+        probe_paths: list[Path] = []
+
+        path_obj = Path(normalized)
+        probe_paths.append(path_obj)
+        if not path_obj.is_absolute():
+            probe_paths.append(module_dir / path_obj)
+            probe_paths.append(workspace_dir / path_obj)
+
+            if "generated/markdown/" in normalized.lower():
+                file_name = path_obj.name
+                if file_name:
+                    probe_paths.append(module_dir / "generated" / "markdown" / file_name)
+                    probe_paths.append(workspace_dir / "generated" / "markdown" / file_name)
+
+        for probe in probe_paths:
+            try:
+                resolved = probe.resolve()
+            except Exception:
+                continue
+            key = str(resolved).lower()
+            if key in seen:
+                continue
+            if resolved.exists() and resolved.is_file():
+                discovered.append(resolved)
+                seen.add(key)
+
+    return discovered
+
+
+def _extract_amount_and_currency_from_structured_tables(document_payload: dict[str, Any]) -> tuple[Decimal, str]:
     metadata = document_payload.get("metadata") if isinstance(document_payload.get("metadata"), dict) else {}
 
     structured_sources: list[dict[str, Any]] = []
@@ -636,8 +901,8 @@ def _extract_chf_amount_from_structured_tables(document_payload: dict[str, Any])
     if isinstance(nested_structured, dict):
         structured_sources.append(nested_structured)
 
-    chf_regex = re.compile(r"CHF\s*([0-9'.,]+)", re.IGNORECASE)
     best = Decimal("0")
+    best_currency = ""
 
     for source in structured_sources:
         tables = source.get("tables") if isinstance(source.get("tables"), list) else []
@@ -649,21 +914,112 @@ def _extract_chf_amount_from_structured_tables(document_payload: dict[str, Any])
                     text = str(cell or "").strip()
                     if not text:
                         continue
-                    for match in chf_regex.findall(text):
-                        amount = _to_decimal_amount(match)
+                    for amount, currency in _extract_amount_currency_candidates(text):
                         if amount > best:
                             best = amount
+                            best_currency = currency
 
-    return best
+    if best > 0:
+        return best, best_currency
+
+    metadata = document_payload.get("metadata") if isinstance(document_payload.get("metadata"), dict) else {}
+    user_metadata = metadata.get("user_metadata") if isinstance(metadata.get("user_metadata"), dict) else {}
+    source_reference = user_metadata.get("source_reference") if isinstance(user_metadata.get("source_reference"), dict) else {}
+    markdown_candidates = [
+        str(metadata.get("markdown_path") or "").strip(),
+        str(user_metadata.get("markdown_path") or "").strip(),
+        str(source_reference.get("markdown_cache_path") or "").strip(),
+        str(source_reference.get("source_path_or_uri") or "").strip(),
+    ]
+
+    markdown_candidates = [candidate for candidate in markdown_candidates if candidate.lower().endswith(".md")]
+
+    for path in _iter_existing_markdown_paths(markdown_candidates):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        for amount, currency in _extract_amount_currency_candidates(text):
+            if amount > best:
+                best = amount
+                best_currency = currency
+
+    return best, best_currency
 
 
 def _is_booking_relevant_financial_entity(entity: dict[str, Any] | None) -> bool:
     if not isinstance(entity, dict):
         return False
     class_name = _normalized_class(entity.get("class_name") or entity.get("entity_type"))
-    if class_name in {"invoice", "bill", "receipt"}:
+    if class_name in {"invoice", "bill", "receipt", "purchase_order", "bank_transaction", "payment", "payment_transaction"}:
         return True
     return _is_payable_ticket_entity(entity)
+
+
+def _has_purchase_order_reference(source_attrs: dict[str, Any]) -> bool:
+    for key in (
+        "purchase_order_ref",
+        "purchase_order_no",
+        "purchase_order_number",
+        "po_ref",
+        "po_no",
+        "po_number",
+        "related_purchase_order",
+    ):
+        value = str(source_attrs.get(key) or "").strip()
+        if value:
+            return True
+    return False
+
+
+def _is_likely_bank_payment_settlement(source_attrs: dict[str, Any], document_type: str) -> bool:
+    doc_type = str(document_type or "").strip().lower()
+    if doc_type in {"bank_statement", "payment_confirmation"}:
+        return True
+
+    if doc_type in {"ticket", "receipt"}:
+        return False
+
+    class_hint = str(source_attrs.get("document_type") or source_attrs.get("source_type") or "").strip().lower()
+    if class_hint in {"bank_statement", "payment_confirmation", "bank_transaction", "payment", "payment_transaction"}:
+        return True
+
+    payment_status = str(source_attrs.get("payment_status") or source_attrs.get("status") or "").strip().lower()
+    if payment_status in {"paid", "settled", "completed", "booked"}:
+        return True
+
+    return False
+
+
+def _should_apply_po_settlement(source_attrs: dict[str, Any], document_type: str) -> bool:
+    if document_type not in {"invoice", "bill"}:
+        return False
+    if not _has_purchase_order_reference(source_attrs):
+        return False
+
+    explicit_confidence_raw = source_attrs.get("po_match_confidence")
+    if explicit_confidence_raw not in (None, ""):
+        try:
+            return float(explicit_confidence_raw) >= 0.6
+        except Exception:
+            return False
+
+    vendor_hint = str(
+        source_attrs.get("issuer_name")
+        or source_attrs.get("seller_name")
+        or source_attrs.get("supplier_ref")
+        or source_attrs.get("vendor_ref")
+        or ""
+    ).strip()
+    buyer_hint = str(
+        source_attrs.get("bill_to")
+        or source_attrs.get("legal_entity_ref")
+        or source_attrs.get("company_ref")
+        or source_attrs.get("employer_ref")
+        or ""
+    ).strip()
+    return bool(vendor_hint and buyer_hint)
 
 
 def _derive_summary_ledger_lines_from_amounts(
@@ -682,6 +1038,15 @@ def _derive_summary_ledger_lines_from_amounts(
         "amount",
         "amount_chf",
         "price_chf",
+        "ticket_amount",
+        "fare_amount",
+        "price",
+        "standard_price",
+        "price_total",
+        "total_price",
+        "paid_amount",
+        "charge_amount",
+        "fare",
     ):
         total = _to_decimal_amount(source_attrs.get(key))
         if total > 0:
@@ -703,6 +1068,55 @@ def _derive_summary_ledger_lines_from_amounts(
 
     base_amount = total - vat_amount
     currency = str(source_attrs.get("currency") or "CHF").strip().upper() or "CHF"
+
+    if _is_likely_bank_payment_settlement(source_attrs, document_type):
+        payment_direction = str(source_attrs.get("payment_direction") or source_attrs.get("direction") or "outgoing").strip().lower()
+        if payment_direction in {"incoming", "inbound", "credit_in"}:
+            return [
+                {
+                    "account_number": 1020,
+                    "direction": "debit",
+                    "source_currency": currency,
+                    "amount_source_currency": str(total),
+                    "exchange_rate_to_chf": "1",
+                    "amount_chf": str(total),
+                    "swiss_vat_code": "NONE",
+                    "line_description": "Derived bank receipt from statement/payment confirmation",
+                },
+                {
+                    "account_number": 1100,
+                    "direction": "credit",
+                    "source_currency": currency,
+                    "amount_source_currency": str(total),
+                    "exchange_rate_to_chf": "1",
+                    "amount_chf": str(total),
+                    "swiss_vat_code": "NONE",
+                    "line_description": "Derived receivable settlement from bank receipt",
+                },
+            ]
+
+        return [
+            {
+                "account_number": 2000,
+                "direction": "debit",
+                "source_currency": currency,
+                "amount_source_currency": str(total),
+                "exchange_rate_to_chf": "1",
+                "amount_chf": str(total),
+                "swiss_vat_code": "NONE",
+                "line_description": "Derived AP settlement from bank statement/payment confirmation",
+            },
+            {
+                "account_number": 1020,
+                "direction": "credit",
+                "source_currency": currency,
+                "amount_source_currency": str(total),
+                "exchange_rate_to_chf": "1",
+                "amount_chf": str(total),
+                "swiss_vat_code": "NONE",
+                "line_description": "Derived bank cash movement from statement/payment confirmation",
+            },
+        ]
 
 
     if role == "sales_invoice":
@@ -792,6 +1206,35 @@ def _derive_summary_ledger_lines_from_amounts(
         }
     )
 
+    # Management accounting settlement: when an AP invoice/bill references a
+    # purchase order, reverse the earlier PO commitment in the same posting.
+    if role != "sales_invoice" and _should_apply_po_settlement(source_attrs, document_type):
+        commitment_amount = total
+        lines.append(
+            {
+                "account_number": 2900,
+                "direction": "debit",
+                "source_currency": currency,
+                "amount_source_currency": str(commitment_amount),
+                "exchange_rate_to_chf": "1",
+                "amount_chf": str(commitment_amount),
+                "swiss_vat_code": "NONE",
+                "line_description": "Reverse purchase commitment reserve on PO-linked invoice",
+            }
+        )
+        lines.append(
+            {
+                "account_number": 9100,
+                "direction": "credit",
+                "source_currency": currency,
+                "amount_source_currency": str(commitment_amount),
+                "exchange_rate_to_chf": "1",
+                "amount_chf": str(commitment_amount),
+                "swiss_vat_code": "NONE",
+                "line_description": "Reverse purchase commitment expense on PO-linked invoice",
+            }
+        )
+
     return lines
 
 
@@ -813,13 +1256,16 @@ def _append_enforcement_note(document_payload: dict[str, Any], note: dict[str, A
 
 def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[str, Any], class_defs: dict[str, Any]) -> None:
     document_type = str(routed.get("document_type") or "").strip().lower()
+    ticket_fallback_enabled = document_type == "email"
     if "accounting_transaction" not in class_defs:
         return
 
     entities = payload.get("entities") if isinstance(payload.get("entities"), list) else []
     document_payload = payload.get("document") if isinstance(payload.get("document"), dict) else {}
+    forced_currency = _extract_forced_currency(document_payload)
     force_booking_derivation = _has_rule_based_booking_context(document_payload)
     reference_hints = _collect_reference_hints_from_entities(entities)
+    booking_hints = _collect_booking_hints_from_entities(entities)
     entity_name_by_id = {
         str(entity.get("entity_id") or "").strip(): str(entity.get("entity_name") or entity.get("name") or "").strip()
         for entity in entities
@@ -833,23 +1279,36 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
     for entity in entities:
         if not isinstance(entity, dict):
             continue
-        if _is_booking_relevant_financial_entity(entity) or (force_booking_derivation and _is_ticket_like_entity(entity)):
+        if (
+            _is_booking_relevant_financial_entity(entity)
+            or (ticket_fallback_enabled and force_booking_derivation and _is_ticket_like_entity(entity))
+            or (force_booking_derivation and _entity_has_positive_amount(entity))
+        ):
             source_candidates.append(entity)
 
     if source_candidates:
-        source_entity = next((entity for entity in source_candidates if _entity_has_positive_amount(entity)), source_candidates[0])
+        exact_doc_type_candidates = [
+            entity
+            for entity in source_candidates
+            if _normalized_class(entity.get("class_name") or entity.get("entity_type")) == document_type
+        ]
+        prioritized = exact_doc_type_candidates or source_candidates
+        source_entity = next((entity for entity in prioritized if _entity_has_positive_amount(entity)), prioritized[0])
 
     if (
-        document_type not in {"invoice", "bill", "receipt"}
+        document_type not in {"invoice", "bill", "receipt", "purchase_order", "bank_statement", "payment_confirmation"}
         and not _is_booking_relevant_financial_entity(source_entity)
-        and not (force_booking_derivation and _is_ticket_like_entity(source_entity))
+        and not (ticket_fallback_enabled and force_booking_derivation and _is_ticket_like_entity(source_entity))
+        and not force_booking_derivation
     ):
         return
 
     source_entity_type = _normalized_class((source_entity or {}).get("class_name") or (source_entity or {}).get("entity_type"))
     effective_document_type = source_entity_type or document_type
-    if _is_payable_ticket_entity(source_entity) or (force_booking_derivation and _is_ticket_like_entity(source_entity)):
+    if ticket_fallback_enabled and (_is_payable_ticket_entity(source_entity) or (force_booking_derivation and _is_ticket_like_entity(source_entity))):
         effective_document_type = "ticket"
+    if force_booking_derivation and effective_document_type in {"", "document", "entity", "order", "service"}:
+        effective_document_type = _infer_force_booking_document_type(document_payload, effective_document_type or document_type)
 
     # If LLM already extracted accounting_transaction, keep it and normalize
     # derived refs/ledger lines when booking directives were applied.
@@ -868,6 +1327,34 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
             has_booking_override = _has_booking_rule_override(source_attrs)
             for accounting_entity in existing_accounting_entities:
                 accounting_attrs = _entity_attributes(accounting_entity)
+                for key in (
+                    "amount",
+                    "gross_amount",
+                    "total_amount",
+                    "total_gross_amount",
+                    "amount_total",
+                    "amount_chf",
+                    "price",
+                    "standard_price",
+                    "price_total",
+                    "total_price",
+                    "paid_amount",
+                    "charge_amount",
+                    "ticket_amount",
+                    "fare_amount",
+                    "fare",
+                    "currency",
+                    "transaction_date",
+                    "payment_date",
+                    "value_date",
+                    "description",
+                    "invoice_party_role",
+                    "invoice_flow",
+                ):
+                    value = accounting_attrs.get(key)
+                    if value not in (None, "", [], {}):
+                        merged_booking_attrs[key] = value
+
                 if not _has_booking_rule_override(accounting_attrs):
                     continue
                 has_booking_override = True
@@ -891,6 +1378,8 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
             )
             for key, value in reference_hints.items():
                 merged_booking_attrs.setdefault(key, value)
+            for key, value in booking_hints.items():
+                merged_booking_attrs.setdefault(key, value)
             should_normalize_existing = force_booking_derivation or any(
                 _ledger_lines_need_normalization(
                     (entity.get("attributes") if isinstance(entity.get("attributes"), dict) else {}).get("ledger_lines")
@@ -902,11 +1391,13 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
                 for key in ("legal_entity_ref", "company_ref", "employer_ref", "current_employer_ref")
             )
             if should_normalize_existing or has_booking_override or should_propagate_reference_context:
+                if forced_currency:
+                    merged_booking_attrs["currency"] = forced_currency
                 if _to_decimal_amount(merged_booking_attrs.get("amount")) <= 0:
-                    fallback_amount = _extract_chf_amount_from_structured_tables(document_payload)
+                    fallback_amount, fallback_currency = _extract_amount_and_currency_from_structured_tables(document_payload)
                     if fallback_amount > 0:
                         merged_booking_attrs["amount"] = str(fallback_amount)
-                        merged_booking_attrs["currency"] = merged_booking_attrs.get("currency") or "CHF"
+                        merged_booking_attrs["currency"] = forced_currency or merged_booking_attrs.get("currency") or fallback_currency or "CHF"
                 inferred_invoice_role = ""
                 if effective_document_type in {"invoice", "bill"}:
                     inferred_invoice_role = _infer_invoice_party_role(
@@ -920,9 +1411,17 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
                         ),
                         entity_name_by_id=entity_name_by_id,
                     )
+                    inferred_invoice_role = _adjust_invoice_role_for_travel_context(
+                        inferred_invoice_role,
+                        merged_booking_attrs,
+                        document_payload,
+                        effective_document_type,
+                    )
                 if inferred_invoice_role:
                     merged_booking_attrs["invoice_party_role"] = inferred_invoice_role
                     merged_booking_attrs.setdefault("invoice_flow", inferred_invoice_role)
+                if not _has_booking_rule_override(merged_booking_attrs) and _has_travel_booking_context(merged_booking_attrs, document_payload):
+                    merged_booking_attrs.setdefault("booking_debit_account_name", "travelling expenses")
                 normalized_lines = _derive_summary_ledger_lines_from_amounts(
                     merged_booking_attrs,
                     effective_document_type,
@@ -941,6 +1440,9 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
                             attrs["transaction_date"] = merged_booking_attrs.get("invoice_date") or document_payload.get("doc_date")
                         if merged_booking_attrs.get("booking_particulars") and not attrs.get("description"):
                             attrs["description"] = merged_booking_attrs.get("booking_particulars")
+                    booking_overrides = _extract_booking_override_attributes(merged_booking_attrs)
+                    for key, value in booking_overrides.items():
+                        attrs[key] = value
                     for key in ("legal_entity_ref", "company_ref", "employer_ref", "current_employer_ref"):
                         value = merged_booking_attrs.get(key)
                         if value not in (None, "", [], {}):
@@ -969,21 +1471,81 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
         return
 
     if source_entity is None:
+        fallback_attrs: dict[str, Any] = {}
+        for key in (
+            "currency",
+            "payment_status",
+            "payment_direction",
+            "purchase_order_ref",
+            "purchase_order_no",
+            "purchase_order_number",
+            "po_ref",
+            "po_no",
+            "po_number",
+            "bill_to",
+            "issuer_name",
+            "seller_name",
+            "supplier_ref",
+            "vendor_ref",
+            "legal_entity_ref",
+            "company_ref",
+            "employer_ref",
+            "current_employer_ref",
+            "invoice_no",
+            "bill_no",
+            "receipt_no",
+            "payment_date",
+            "value_date",
+            "transaction_date",
+            "doc_date",
+        ):
+            value = document_payload.get(key)
+            if value not in (None, "", [], {}):
+                fallback_attrs[key] = value
+
+        for key, value in reference_hints.items():
+            fallback_attrs.setdefault(key, value)
+        for key, value in booking_hints.items():
+            fallback_attrs.setdefault(key, value)
+
+        fallback_amount, fallback_currency = _extract_amount_and_currency_from_structured_tables(document_payload)
+        if fallback_amount > 0:
+            fallback_attrs.setdefault("amount", str(fallback_amount))
+            fallback_attrs.setdefault("gross_amount", str(fallback_amount))
+            fallback_attrs.setdefault("currency", forced_currency or fallback_currency or "CHF")
+
+        if (document_type in {"purchase_order", "bank_statement", "payment_confirmation"} or force_booking_derivation) and fallback_attrs:
+            fallback_class_name = document_type
+            if force_booking_derivation:
+                fallback_class_name = _infer_force_booking_document_type(document_payload, document_type)
+            source_entity = {
+                "entity_id": "",
+                "entity_name": str(document_payload.get("doc_key") or document_payload.get("doc_name") or fallback_class_name),
+                "class_name": fallback_class_name,
+                "attributes": fallback_attrs,
+            }
+
+    if source_entity is None:
         _append_policy_note(document_payload, {"policy": "accounting_transaction_required", "status": "not_derived", "reason": "missing_financial_source_entity"})
         payload["document"] = document_payload
         return
 
     source_attrs = _entity_attributes(source_entity)
+    for key, value in booking_hints.items():
+        source_attrs.setdefault(key, value)
     ledger_lines = source_attrs.get("ledger_lines") if isinstance(source_attrs.get("ledger_lines"), list) else None
     if ledger_lines is None and isinstance(source_attrs.get("lines"), list):
         ledger_lines = source_attrs.get("lines")
     if not ledger_lines and (force_booking_derivation or _has_booking_rule_override(source_attrs) or _is_booking_relevant_financial_entity(source_entity)):
+        if forced_currency:
+            source_attrs = dict(source_attrs)
+            source_attrs["currency"] = forced_currency
         if _to_decimal_amount(source_attrs.get("amount")) <= 0:
-            fallback_amount = _extract_chf_amount_from_structured_tables(document_payload)
+            fallback_amount, fallback_currency = _extract_amount_and_currency_from_structured_tables(document_payload)
             if fallback_amount > 0:
                 source_attrs = dict(source_attrs)
                 source_attrs["amount"] = str(fallback_amount)
-                source_attrs["currency"] = source_attrs.get("currency") or "CHF"
+                source_attrs["currency"] = forced_currency or source_attrs.get("currency") or fallback_currency or "CHF"
         inferred_invoice_role = ""
         if effective_document_type in {"invoice", "bill"}:
             inferred_invoice_role = _infer_invoice_party_role(
@@ -997,10 +1559,19 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
                 ),
                 entity_name_by_id=entity_name_by_id,
             )
+            inferred_invoice_role = _adjust_invoice_role_for_travel_context(
+                inferred_invoice_role,
+                source_attrs,
+                document_payload,
+                effective_document_type,
+            )
         if inferred_invoice_role:
             source_attrs = dict(source_attrs)
             source_attrs["invoice_party_role"] = inferred_invoice_role
             source_attrs.setdefault("invoice_flow", inferred_invoice_role)
+        if not _has_booking_rule_override(source_attrs) and _has_travel_booking_context(source_attrs, document_payload):
+            source_attrs = dict(source_attrs)
+            source_attrs.setdefault("booking_debit_account_name", "travelling expenses")
         ledger_lines = _derive_summary_ledger_lines_from_amounts(
             source_attrs,
             effective_document_type,
@@ -1111,6 +1682,8 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
         booking_context["invoice_party_role"] = inferred_invoice_role
         booking_context.setdefault("invoice_flow", inferred_invoice_role)
 
+    booking_overrides = _extract_booking_override_attributes(source_attrs)
+
     person_name = ""
     for key in ("person_ref", "employee_ref", "payer_ref", "owner_ref", "submitted_by_ref", "entered_by_ref"):
         value = str(booking_context.get(key) or source_attrs.get(key) or "").strip()
@@ -1180,6 +1753,7 @@ def _derive_accounting_transaction_entity(routed: dict[str, Any], payload: dict[
                 "invoice_flow": booking_context.get("invoice_flow"),
                 "debit_total": source_attrs.get("gross_amount"),
                 "credit_total": source_attrs.get("gross_amount"),
+                **booking_overrides,
                 **booking_context,
             },
             "confidence": source_entity.get("confidence"),
@@ -1452,7 +2026,7 @@ def enforce_required_domain_actions(
         failures.append(f"{policy_key}: {message}")
         _append_enforcement_note(document_payload, {"policy": policy_key, "mode": mode, "message": message})
 
-    if document_type in {"invoice", "bill", "receipt"} and "accounting_transaction" in class_defs:
+    if document_type in {"invoice", "bill", "receipt", "purchase_order", "bank_statement", "payment_confirmation"} and "accounting_transaction" in class_defs:
         if "accounting_transaction" not in entity_classes:
             reason = _find_policy_note_reason(document_payload, "accounting_transaction_required")
             handle_violation(document_type, f"{document_type} requires accounting_transaction ({reason})")

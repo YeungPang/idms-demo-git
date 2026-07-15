@@ -16,22 +16,95 @@ function Test-CommandAvailable {
     return $null -ne $cmd
 }
 
+function Find-PgDumpPath {
+    $cmd = Get-Command "pg_dump" -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        return [string]$cmd.Source
+    }
+
+    $candidates = Get-ChildItem -Path "C:/Program Files/PostgreSQL" -Filter "pg_dump.exe" -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending
+    if ($candidates -and $candidates.Count -gt 0) {
+        return [string]$candidates[0].FullName
+    }
+
+    return $null
+}
+
+function Get-DotEnvValue {
+    param(
+        [string]$FilePath,
+        [string]$Key
+    )
+
+    if (-not (Test-Path $FilePath)) {
+        return ""
+    }
+
+    $line = Get-Content -Path $FilePath -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match "^\s*$([Regex]::Escape($Key))\s*=" } |
+        Select-Object -First 1
+
+    if (-not $line) {
+        return ""
+    }
+
+    $value = ($line -replace "^\s*$([Regex]::Escape($Key))\s*=\s*", "").Trim()
+    if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+        $value = $value.Substring(1, $value.Length - 2)
+    }
+    return $value
+}
+
+function Assert-LastCommandSucceeded {
+    param([string]$Description)
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE."
+    }
+}
+
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $bundleDir = Join-Path $OutputDir "idms_demo_handoff_$timestamp"
 New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
 
-if (-not (Test-CommandAvailable -CommandName "pg_dump")) {
-    throw "pg_dump is not available in PATH. Install PostgreSQL client tools or add pg_dump to PATH."
+$pgDumpPath = Find-PgDumpPath
+if (-not $pgDumpPath) {
+    throw "pg_dump is not available. Install PostgreSQL client tools or add pg_dump.exe to PATH."
+}
+
+$dotenvPath = Join-Path (Get-Location) ".env"
+if (-not $env:PGPASSWORD) {
+    $dotenvPassword = Get-DotEnvValue -FilePath $dotenvPath -Key "IDMS_DB_PASSWORD"
+    if ($dotenvPassword) {
+        $env:PGPASSWORD = $dotenvPassword
+    }
+}
+
+if (-not $env:PGPASSWORD) {
+    throw "No PostgreSQL password available. Set PGPASSWORD or IDMS_DB_PASSWORD in .env before running export."
 }
 
 $dbDumpPath = Join-Path $bundleDir "idms_demo_data.dump"
 $dbSchemaPath = Join-Path $bundleDir "idms_demo_schema.sql"
 
+if (Test-Path $dbDumpPath) { Remove-Item -Path $dbDumpPath -Force }
+if (Test-Path $dbSchemaPath) { Remove-Item -Path $dbSchemaPath -Force }
+
 Write-Host "Exporting PostgreSQL data dump to $dbDumpPath"
-pg_dump -h $DbHost -p $DbPort -U $DbUser -d $DbName -Fc -f $dbDumpPath
+& $pgDumpPath -h $DbHost -p $DbPort -U $DbUser -d $DbName -Fc -f $dbDumpPath --no-password
+Assert-LastCommandSucceeded -Description "PostgreSQL data dump"
+
+if (-not (Test-Path $dbDumpPath) -or ((Get-Item $dbDumpPath).Length -le 0)) {
+    throw "PostgreSQL data dump was created as empty or missing: $dbDumpPath"
+}
 
 Write-Host "Exporting PostgreSQL schema to $dbSchemaPath"
-pg_dump -h $DbHost -p $DbPort -U $DbUser -d $DbName --schema-only -f $dbSchemaPath
+& $pgDumpPath -h $DbHost -p $DbPort -U $DbUser -d $DbName --schema-only -f $dbSchemaPath --no-password
+Assert-LastCommandSucceeded -Description "PostgreSQL schema dump"
+
+if (-not (Test-Path $dbSchemaPath) -or ((Get-Item $dbSchemaPath).Length -le 0)) {
+    throw "PostgreSQL schema dump was created as empty or missing: $dbSchemaPath"
+}
 
 $snapshotInfo = $null
 try {

@@ -24,11 +24,11 @@ print("Resolution Summary:")
 print("=" * 80)
 
 if info['file_exists']:
-    print(f"✓ SUCCESS - Credentials file found")
+    print("[OK] SUCCESS - Credentials file found")
     print(f"  Source: {info['priority_source']}")
     print(f"  Path: {info['resolved_path']}")
 else:
-    print("✗ ERROR - No valid credentials path found")
+    print("[ERR] ERROR - No valid credentials path found")
     if info['relative_path_configured']:
         print(f"  Relative path: {info['relative_path_value']} (not found)")
     if info['full_path_configured']:
@@ -42,6 +42,14 @@ print("=" * 80)
 try:
     path = resolve_google_credentials_path()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
-    print(f"✓ Set to: {path}")
+    print(f"[OK] Set to: {path}")
 except Exception as e:
-    print(f"✗ Error: {e}")
+    print(f"[ERR] Error: {e}")
+
+
+def test_credentials_path_info_shape() -> None:
+    """Smoke-test that resolver returns the expected diagnostic structure."""
+    details = get_credentials_path_info()
+    assert isinstance(details, dict)
+    assert "priority_source" in details
+    assert "file_exists" in details

@@ -180,6 +180,13 @@ def run_and_log(query: str, idx: int | None, model: str, output_path: Path) -> N
     print(f"\nAppended to: {output_path}")
 
 
+def test_idms_queries_module_smoke() -> None:
+    assert len(ALL_IDMS_QUERIES) >= len(REGRESSION_LOG_QUERIES)
+    idx, query_text = resolve_query("1")
+    assert idx == 1
+    assert isinstance(query_text, str)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

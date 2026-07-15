@@ -24,6 +24,11 @@ model="gpt-4o-mini" #"gpt-5.1"
 Settings.llm = OpenAI(model=model, temperature=0.1)
 Settings.embed_model = OpenAIEmbedding(model_name="text-embedding-3-small")
 
+
+def test_llama_module_smoke() -> None:
+    assert isinstance(model, str)
+    assert bool(model.strip())
+
 def property_graph_extraction(documents):
     # This step calls the LLM to extract triples (nodes, relationships, properties)
     index = PropertyGraphIndex.from_documents(

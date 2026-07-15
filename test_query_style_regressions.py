@@ -630,6 +630,77 @@ class TestInteractionStyleRoutingRegression(unittest.TestCase):
         self.assertEqual(criteria_result.get("count"), 1)
         self.assertEqual(criteria_result.get("matches", [])[0].get("entity_name"), "Max Mustermann")
 
+    def test_autonomous_query_reroutes_finalize_to_search_criteria_when_missing_result(self):
+        tools = self._new_tools()
+
+        parsed = ParsedQuery(
+            intent="criteria_lookup",
+            entity_name=None,
+            attribute_name=None,
+            confidence=0.92,
+            criteria={
+                "entity_type": "document",
+                "must_contain": ["travelling"],
+                "attribute_hints": ["description", "document"],
+            },
+        )
+
+        mock_query_engine = SimpleNamespace()
+        mock_query_engine.parse_query = lambda _q: parsed
+        mock_query_engine._is_value_document_context_question = lambda _q: False
+        mock_query_engine._criteria_question_prefers_listing = lambda _q, _rf="": True
+        tools.query_engine = mock_query_engine
+
+        tools._planner_step = lambda _question, _state, _step: {
+            "action": "finalize",
+            "attribute_name": None,
+            "entity_name": None,
+            "rationale": "planner asked to finalize early",
+        }
+
+        tools.search_criteria = MagicMock(
+            return_value={
+                "success": True,
+                "count": 1,
+                "matches": [
+                    {
+                        "entity_name": "2025-12-18_SBB_Kontanz_ticket_forward.pdf",
+                        "entity_type": "document",
+                        "matched_terms": ["travelling"],
+                    }
+                ],
+                "source": "criteria_scope_docs",
+            }
+        )
+
+        tools._invoke_solf_clause_raw = lambda _clause, _args: {
+            "mode": "allow",
+            "reason": "test",
+            "query_style": "criteria_list",
+            "initial_action": "search_criteria",
+            "message": "",
+        }
+
+        def _policy(clause_name, _payload):
+            if clause_name == "interaction_answer_policy":
+                return {"mode": "deny", "message": "stop before LLM"}
+            return {"mode": "allow", "message": ""}
+
+        tools._invoke_solf_policy = _policy
+
+        result = tools.autonomous_query(
+            "Show me all the documents that are related to travelling",
+            max_steps=1,
+            record_history=False,
+        )
+
+        self.assertEqual(result.get("answer_source"), "policy_blocked")
+        tools.search_criteria.assert_called_once()
+        grounding = result.get("grounding") if isinstance(result.get("grounding"), dict) else {}
+        criteria_result = grounding.get("criteria_result") if isinstance(grounding.get("criteria_result"), dict) else {}
+        self.assertEqual(int(criteria_result.get("count") or 0), 1)
+        self.assertEqual(str(criteria_result.get("source") or ""), "criteria_scope_docs")
+
 
 # ---------------------------------------------------------------------------
 # Temporal constraint tests

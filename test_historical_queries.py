@@ -5,7 +5,7 @@ import requests
 import json
 import sys
 
-def test_query(query_text: str) -> dict:
+def run_query(query_text: str) -> dict:
     """Execute a single query via the live API."""
     payload = {"question": query_text, "limit": 10}
     try:
@@ -75,7 +75,7 @@ if __name__ == "__main__":
     results = []
     for i, query in enumerate(untested_queries, 1):
         print(f"\n[{i:2d}/{len(untested_queries)}] Testing: {query[:80]}")
-        result = test_query(query)
+        result = run_query(query)
         results.append(result)
         
         if result["success"]:
@@ -110,3 +110,9 @@ if __name__ == "__main__":
             if not r["success"]:
                 query_preview = r['query'][:70]
                 print(f"  [{i:2d}] {query_preview}")
+
+
+def test_historical_queries_module_smoke() -> None:
+    result = run_query("health check")
+    assert isinstance(result, dict)
+    assert "success" in result

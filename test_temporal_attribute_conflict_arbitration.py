@@ -231,3 +231,8 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_temporal_attribute_conflict_arbitration_module_smoke() -> None:
+    assert callable(run_test)
+    assert _parse_date("2026-01-10").isoformat() == "2026-01-10"

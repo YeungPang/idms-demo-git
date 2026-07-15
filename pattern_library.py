@@ -649,6 +649,14 @@ class PatternLibrary:
 
     def match_pattern(self, query_text: str, entity_class: Optional[str] = None, language: str = "en") -> Optional[SemanticPattern]:
         text = self._normalize_for_matching(query_text)
+
+        # Guardrail: deterministic pattern DB scans are meant for compact phrase-like
+        # queries. For long natural-language questions this path can block parsing
+        # under DB contention and should defer to other parsers.
+        token_count = len(re.findall(r"\w+", text))
+        if len(text) > 120 or token_count > 20:
+            return None
+
         exact = self._match_exact(text, entity_class, language)
         if exact and exact.confidence >= 0.90:
             return exact
@@ -666,7 +674,7 @@ class PatternLibrary:
 
     def _match_exact(self, query_lower: str, entity_class: Optional[str], language: str) -> Optional[SemanticPattern]:
         try:
-            sql = """
+            exact_sql = """
             SELECT p.pattern_id, p.pattern_text, p.semantic_concept, p.mapped_attributes,
                    p.computation_rule, p.entity_class, p.source_type, p.confidence,
                    p.pattern_language, p.metadata, 1.0 as match_score
@@ -674,34 +682,65 @@ class PatternLibrary:
             WHERE LOWER(p.pattern_text) = %s
               AND (%s IS NULL OR p.entity_class IS NULL OR p.entity_class = %s)
               AND p.pattern_language = %s
-            UNION ALL
-            SELECT p.pattern_id, p.pattern_text, p.semantic_concept, p.mapped_attributes,
-                   p.computation_rule, p.entity_class, p.source_type, p.confidence,
-                   p.pattern_language, p.metadata, (1.0 - ps.semantic_distance) as match_score
-            FROM pattern_synonyms ps
-            JOIN semantic_patterns p ON ps.pattern_id = p.pattern_id
-            WHERE LOWER(ps.synonym_text) = %s
-              AND ps.language = %s
-              AND (%s IS NULL OR p.entity_class IS NULL OR p.entity_class = %s)
-            ORDER BY match_score DESC, confidence DESC
             LIMIT 1;
             """
             with self.connection.cursor() as cursor:
+                # Prevent parser stalls if semantic pattern tables are blocked.
+                cursor.execute("SET LOCAL lock_timeout = '1200ms';")
+                cursor.execute("SET LOCAL statement_timeout = '1800ms';")
                 cursor.execute(
-                    sql,
+                    exact_sql,
                     (
                         query_lower,
                         entity_class,
                         entity_class,
                         language,
-                        query_lower,
-                        language,
-                        entity_class,
-                        entity_class,
                     ),
                 )
                 row = cursor.fetchone()
             if not row:
+                # Best-effort synonym check. Keep this isolated so lock contention on
+                # pattern_synonyms cannot break or delay normal exact matching.
+                synonym_sql = """
+                SELECT p.pattern_id, p.pattern_text, p.semantic_concept, p.mapped_attributes,
+                       p.computation_rule, p.entity_class, p.source_type, p.confidence,
+                       p.pattern_language, p.metadata, (1.0 - ps.semantic_distance) as match_score
+                FROM pattern_synonyms ps
+                JOIN semantic_patterns p ON ps.pattern_id = p.pattern_id
+                WHERE LOWER(ps.synonym_text) = %s
+                  AND ps.language = %s
+                  AND (%s IS NULL OR p.entity_class IS NULL OR p.entity_class = %s)
+                ORDER BY match_score DESC, confidence DESC
+                LIMIT 1;
+                """
+                try:
+                    with self.connection.cursor() as cursor:
+                        cursor.execute("SET LOCAL lock_timeout = '800ms';")
+                        cursor.execute("SET LOCAL statement_timeout = '1200ms';")
+                        cursor.execute(
+                            synonym_sql,
+                            (
+                                query_lower,
+                                language,
+                                entity_class,
+                                entity_class,
+                            ),
+                        )
+                        row = cursor.fetchone()
+                except Exception:
+                    try:
+                        self.connection.rollback()
+                    except Exception:
+                        pass
+
+            if not row:
+                # Guardrail: full fallback scan is only useful for short, nearly-exact
+                # phrasing. For long natural-language questions, this path can become
+                # expensive and block query parsing.
+                query_token_count = len(re.findall(r"\w+", query_lower))
+                if len(query_lower) > 120 or query_token_count > 20:
+                    return None
+
                 # Fallback: tolerant exact matching over normalized text (umlauts/spacing).
                 scan_sql = """
                 SELECT p.pattern_id, p.pattern_text, p.semantic_concept, p.mapped_attributes,
@@ -710,26 +749,17 @@ class PatternLibrary:
                 FROM semantic_patterns p
                 WHERE (%s IS NULL OR p.entity_class IS NULL OR p.entity_class = %s)
                   AND p.pattern_language = %s
-                UNION ALL
-                SELECT p.pattern_id, p.pattern_text, p.semantic_concept, p.mapped_attributes,
-                       p.computation_rule, p.entity_class, p.source_type, p.confidence,
-                       p.pattern_language, p.metadata, (1.0 - ps.semantic_distance) as match_score
-                FROM pattern_synonyms ps
-                JOIN semantic_patterns p ON ps.pattern_id = p.pattern_id
-                WHERE ps.language = %s
-                  AND (%s IS NULL OR p.entity_class IS NULL OR p.entity_class = %s)
                 ORDER BY match_score DESC, confidence DESC;
                 """
                 with self.connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL lock_timeout = '1200ms';")
+                    cursor.execute("SET LOCAL statement_timeout = '1800ms';")
                     cursor.execute(
                         scan_sql,
                         (
                             entity_class,
                             entity_class,
                             language,
-                            language,
-                            entity_class,
-                            entity_class,
                         ),
                     )
                     rows = cursor.fetchall()
@@ -743,6 +773,10 @@ class PatternLibrary:
             return self._row_to_pattern(row, float(row[10]))
         except Exception as exc:
             logger.error("Exact match failed: %s", exc)
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass
             return None
 
     def _match_template(self, query_lower: str, entity_class: Optional[str], language: str) -> Optional[SemanticPattern]:
@@ -758,6 +792,8 @@ class PatternLibrary:
             ORDER BY confidence DESC, created_at DESC;
             """
             with self.connection.cursor() as cursor:
+                cursor.execute("SET LOCAL lock_timeout = '900ms';")
+                cursor.execute("SET LOCAL statement_timeout = '1400ms';")
                 cursor.execute(sql, (entity_class, entity_class, language))
                 rows = cursor.fetchall()
             for row in rows:
@@ -768,6 +804,10 @@ class PatternLibrary:
             return None
         except Exception as exc:
             logger.error("Template match failed: %s", exc)
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass
             return None
 
     def _match_regex(self, query_lower: str, entity_class: Optional[str], language: str) -> Optional[SemanticPattern]:
@@ -783,6 +823,8 @@ class PatternLibrary:
             LIMIT 20;
             """
             with self.connection.cursor() as cursor:
+                cursor.execute("SET LOCAL lock_timeout = '900ms';")
+                cursor.execute("SET LOCAL statement_timeout = '1400ms';")
                 cursor.execute(sql, (entity_class, entity_class, language))
                 rows = cursor.fetchall()
 
@@ -802,6 +844,10 @@ class PatternLibrary:
             return self._row_to_pattern(row, factor)
         except Exception as exc:
             logger.error("Regex match failed: %s", exc)
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass
             return None
 
     def _matches_template(self, text: str, template: str) -> bool:

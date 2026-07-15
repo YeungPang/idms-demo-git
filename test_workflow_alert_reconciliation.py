@@ -113,3 +113,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_workflow_alert_reconciliation_module_smoke() -> None:
+    assert callable(run_test)
+    assert callable(run_alert_reconciliation_suite)

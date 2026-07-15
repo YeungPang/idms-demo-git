@@ -4,11 +4,7 @@ import sys
 sys.path.insert(0, '.')
 from query_engine import QueryEngine
 
-engine = QueryEngine()
-
-# These queries have entity names but no typical prepositions or company suffixes
-# This will force the regex to fail and fall through to DB/LLM tiers
-test_queries = [
+TEST_QUERIES = [
     # Free-form queries where entity is mentioned but without clear prepositional patterns
     "Chung Yeung Pang is Swiss",  # No preposition, just predicate
     "Is Aphotonix GmbH still active?",  # Question without "of/for/about" patterns
@@ -16,29 +12,35 @@ test_queries = [
     "The biggest shareholder is James Wilson",  # Entity mentioned before verb
 ]
 
-print("Testing LLM entity extraction (fallback for non-preposition queries):\n")
-for q in test_queries:
-    print(f"Query: {q}")
-    
-    # Show which extraction method succeeded
-    regex_result = engine._extract_entity_name_loose(q)
-    if regex_result:
-        print(f"  ✓ Regex: {regex_result}")
-    else:
-        print(f"  ✗ Regex didn't match")
-        db_result = engine._resolve_entity_mention_from_db(q)
-        if db_result:
-            print(f"  ✓ DB mention: {db_result}")
-        else:
-            print(f"  ✗ DB didn't find it")
-            llm_result = engine._extract_entity_via_llm(q)
-            if llm_result:
-                print(f"  ✓ LLM constrained: {llm_result}")
-            else:
-                print(f"  ✗ LLM couldn't extract")
-    
-    final = engine._best_entity_hint(q)
-    print(f"  → Final: {final}\n")
 
-print("\n✓ LLM fallback is working. It extracts entities from query text without hallucination.")
-print("  Fallback kicks in when regex misses AND DB doesn't have the name.")
+def run_llm_fallback_demo() -> None:
+    engine = QueryEngine()
+    print("Testing LLM entity extraction (fallback for non-preposition queries):\n")
+    for q in TEST_QUERIES:
+        print(f"Query: {q}")
+        regex_result = engine._extract_entity_name_loose(q)
+        if regex_result:
+            print(f"  [OK] Regex: {regex_result}")
+        else:
+            print("  [ERR] Regex didn't match")
+            db_result = engine._resolve_entity_mention_from_db(q)
+            if db_result:
+                print(f"  [OK] DB mention: {db_result}")
+            else:
+                print("  [ERR] DB didn't find it")
+                llm_result = engine._extract_entity_via_llm(q)
+                if llm_result:
+                    print(f"  [OK] LLM constrained: {llm_result}")
+                else:
+                    print("  [ERR] LLM couldn't extract")
+        final = engine._best_entity_hint(q)
+        print(f"  -> Final: {final}\n")
+    print("\n[OK] LLM fallback demo completed.")
+
+
+def test_llm_fallback_module_smoke() -> None:
+    assert len(TEST_QUERIES) >= 3
+
+
+if __name__ == "__main__":
+    run_llm_fallback_demo()

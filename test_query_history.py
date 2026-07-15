@@ -22,6 +22,11 @@ ALL_QUERIES = load_all_queries()
 SUBSTANTIVE_QUERIES = load_substantive_queries()
 
 
+def test_query_history_module_smoke() -> None:
+    assert isinstance(ALL_QUERIES, list)
+    assert isinstance(SUBSTANTIVE_QUERIES, list)
+
+
 if __name__ == "__main__":
     print(f"All queries: {len(ALL_QUERIES)}")
     for idx, query in enumerate(ALL_QUERIES, start=1):

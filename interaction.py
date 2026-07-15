@@ -5,8 +5,10 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -118,7 +120,28 @@ class IDMSInteractionTools:
             "escalations": 0,
             "by_call_name": {},
         }
-        self.solf_interpreter = self._build_solf_policy_interpreter()
+        self._solf_init_lock = threading.Lock()
+        self._solf_load_attempted = False
+        self._solf_last_attempt_ts = 0.0
+        self._solf_last_error: str | None = None
+        self._solf_load_in_progress = False
+        self._solf_load_done_event = threading.Event()
+        self._solf_loader_thread: threading.Thread | None = None
+        self._solf_runtime_rules_loaded = False
+        self._solf_runtime_rules_in_progress = False
+        self._solf_runtime_lock = threading.Lock()
+        self._solf_retry_cooldown_seconds = max(
+            0,
+            int(str(os.getenv("IDMS_SOLF_RETRY_COOLDOWN_SEC", "30") or "30").strip() or "30"),
+        )
+        self._solf_load_timeout_seconds = max(
+            1,
+            int(str(os.getenv("IDMS_SOLF_LOAD_TIMEOUT_SEC", "8") or "8").strip() or "8"),
+        )
+        eager_solf_init = str(os.getenv("IDMS_EAGER_SOLF_POLICY_INIT", "false")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        self.solf_interpreter = None
         self.query_cache = QueryResultCache() if enable_query_cache else None
         self.event_bus = EventBus(solf_interpreter=self.solf_interpreter, db_connection_fn=self.get_connection)
         self.notifier = create_notifier_from_config(db_connection_fn=self.get_connection)
@@ -155,6 +178,8 @@ class IDMSInteractionTools:
             reliability_manager=self.workflow_reliability,
         )
         self.project_simulator = ProjectSimulator(db_connection_fn=self.get_connection)
+        if eager_solf_init:
+            self._ensure_solf_interpreter_loaded(force_retry=True)
         self._ensure_interaction_runtime_tables()
         self._wire_default_event_handlers()
 
@@ -268,6 +293,9 @@ class IDMSInteractionTools:
                     "name": item.get("name") or item.get("entity_name") or item.get("value"),
                     "value": item.get("attribute_value") if "attribute_value" in item else item.get("value"),
                     "score": item.get("score"),
+                    "object_id": item.get("object_id"),
+                    "class_name": item.get("class_name"),
+                    "similarity": item.get("similarity"),
                     "doc_id": item.get("doc_id"),
                     "doc_name": item.get("doc_name"),
                     "doc_path": item.get("doc_path"),
@@ -386,6 +414,19 @@ class IDMSInteractionTools:
 
         return None
 
+    @staticmethod
+    def _find_candidate_snapshot_entry(candidate_snapshot: list[Any], candidate_label: str) -> dict[str, Any] | None:
+        label = str(candidate_label or "").strip()
+        if not label:
+            return None
+        for item in list(candidate_snapshot or []):
+            if not isinstance(item, dict):
+                continue
+            item_label = str(item.get("name") or item.get("value") or item.get("entity_name") or "").strip()
+            if item_label == label:
+                return item
+        return None
+
     def _entity_matches_anchor(self, candidate: Any, anchor_entity: str) -> bool:
         anchor_norm = self._normalize_entity_token(anchor_entity)
         if not anchor_norm:
@@ -490,6 +531,1550 @@ class IDMSInteractionTools:
                 "Please specify which candidate or scope should be used."
             )
         return "I need one more detail to answer precisely. Please clarify your intended scope."
+
+    def _build_merge_clarification_question(self, slot_label: str, entity_text: str, reason_code: str) -> str:
+        which = str(slot_label or "entity").replace("_", " ").strip()
+        entity_hint = str(entity_text or "").strip()
+        if reason_code == "ambiguous_entity":
+            return (
+                f"I found multiple possible entities for {which} '{entity_hint}' in your merge request. "
+                "Please choose the exact entity candidate to use."
+            )
+        return (
+            f"I could not resolve {which} '{entity_hint}' in your merge request. "
+            "Please provide the exact entity name or object id."
+        )
+
+    def _build_document_clause_clarification_question(self, document_hint: str, reason_code: str) -> str:
+        hint = str(document_hint or "").strip()
+        if reason_code == "ambiguous_document":
+            return (
+                f"I found multiple documents matching '{hint}' for retrieve_document_file. "
+                "Please choose the exact document candidate to use."
+            )
+        return (
+            f"I could not resolve document '{hint}' for retrieve_document_file. "
+            "Please provide the exact doc id, doc key, or document name."
+        )
+
+    def _build_update_clause_clarification_question(self, entity_hint: str, reason_code: str) -> str:
+        hint = str(entity_hint or "").strip()
+        if reason_code == "ambiguous_entity":
+            return (
+                f"I found multiple entities matching '{hint}' for update. "
+                "Please choose the exact entity candidate to update."
+            )
+        return (
+            f"I could not resolve entity '{hint}' for update. "
+            "Please provide the exact entity name or object id."
+        )
+
+    def _resolve_merge_entity_reference(self, entity_value: Any) -> dict[str, Any]:
+        raw = str(entity_value or "").strip()
+        if not raw:
+            return {"status": "not_found", "input": raw, "candidates": []}
+
+        with self.get_connection() as conn:
+            if re.fullmatch(r"\d+", raw):
+                row = object_db.get_object_instance_by_id(conn, int(raw), include_inactive=False)
+                if row:
+                    return {
+                        "status": "resolved",
+                        "input": raw,
+                        "object_id": int(row.get("object_id") or 0),
+                        "object_name": str(row.get("object_name") or "").strip(),
+                        "class_name": str(row.get("class_name") or "").strip(),
+                    }
+                return {"status": "not_found", "input": raw, "candidates": []}
+
+            exact = object_db.get_object_instance(conn, raw, class_name=None, include_inactive=False)
+            if exact:
+                return {
+                    "status": "resolved",
+                    "input": raw,
+                    "object_id": int(exact.get("object_id") or 0),
+                    "object_name": str(exact.get("object_name") or "").strip(),
+                    "class_name": str(exact.get("class_name") or "").strip(),
+                }
+
+            candidates = object_db.search_objects(
+                connection=conn,
+                name_query=raw,
+                class_name=None,
+                limit=8,
+                include_inactive=False,
+            )
+
+        hint_tokens = set(self._normalize_entity_token(raw).split())
+        filtered: list[dict[str, Any]] = []
+        for candidate in list(candidates or []):
+            candidate_name = str(candidate.get("object_name") or candidate.get("canonical_full_name") or "").strip()
+            if not candidate_name:
+                continue
+            candidate_tokens = set(self._normalize_entity_token(candidate_name).split())
+            overlap_count = len(hint_tokens.intersection(candidate_tokens))
+            overlap_ratio = (overlap_count / max(1, len(hint_tokens))) if hint_tokens else 0.0
+            similarity = float(candidate.get("similarity") or 0.0)
+            if overlap_ratio <= 0.0 and similarity < 0.30:
+                continue
+            filtered.append(
+                {
+                    "object_id": int(candidate.get("object_id") or 0),
+                    "name": candidate_name,
+                    "class_name": candidate.get("class_name"),
+                    "similarity": similarity,
+                    "score": round((overlap_ratio * 100.0) + (similarity * 10.0), 4),
+                }
+            )
+
+        filtered = self._normalize_candidate_snapshot(filtered, limit=8)
+        if not filtered:
+            return {"status": "not_found", "input": raw, "candidates": []}
+        if len(filtered) == 1:
+            item = filtered[0] if isinstance(filtered[0], dict) else {}
+            if item.get("object_id"):
+                return {
+                    "status": "resolved",
+                    "input": raw,
+                    "object_id": int(item.get("object_id") or 0),
+                    "object_name": str(item.get("name") or "").strip(),
+                    "class_name": str(item.get("class_name") or "").strip(),
+                }
+
+        return {
+            "status": "ambiguous",
+            "input": raw,
+            "candidates": filtered,
+        }
+
+    def _extract_entity_update_payload(self, raw_arg: Any, base_payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        payload = dict(base_payload or {}) if isinstance(base_payload, dict) else {}
+        if payload.get("object_name") and isinstance(payload.get("attributes"), dict) and payload.get("attributes"):
+            return payload
+
+        text = str(raw_arg or "").strip()
+        if not text:
+            return None
+
+        match = re.match(
+            r"^(?:entity\s+)?(.+?)\s+(?:set\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:to|=)\s*(.+?)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        object_name = str(match.group(1) or "").strip(" ,.;")
+        field = str(match.group(2) or "").strip()
+        new_value_text = str(match.group(3) or "").strip(" ,.;")
+        if not object_name or not field or not new_value_text:
+            return None
+
+        lower_value = new_value_text.lower()
+        if lower_value in {"true", "false"}:
+            new_value: Any = lower_value == "true"
+        elif re.fullmatch(r"-?\d+", new_value_text):
+            new_value = int(new_value_text)
+        elif re.fullmatch(r"-?\d+\.\d+", new_value_text):
+            new_value = float(new_value_text)
+        else:
+            new_value = new_value_text.strip("\"'")
+
+        out = dict(payload)
+        out.setdefault("class_name", "entity")
+        out["object_name"] = object_name
+        attributes = out.get("attributes") if isinstance(out.get("attributes"), dict) else {}
+        attributes = dict(attributes)
+        attributes[field] = new_value
+        out["attributes"] = attributes
+        return out
+
+    def _resolve_document_reference(self, document_value: Any) -> dict[str, Any]:
+        raw = str(document_value or "").strip()
+        if not raw:
+            return {"status": "not_found", "input": raw, "candidates": []}
+
+        with self.get_connection() as conn:
+            if re.fullmatch(r"\d+", raw):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT doc_id, doc_key, doc_name, doc_path
+                        FROM document
+                        WHERE doc_id = %s
+                          AND COALESCE(status, 'active') = 'active'
+                        LIMIT 1
+                        """,
+                        (int(raw),),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    return {
+                        "status": "resolved",
+                        "input": raw,
+                        "doc_id": int(row[0]),
+                        "doc_key": str(row[1] or "").strip(),
+                        "doc_name": str(row[2] or "").strip(),
+                        "doc_path": str(row[3] or "").strip(),
+                    }
+                return {"status": "not_found", "input": raw, "candidates": []}
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT doc_id, doc_key, doc_name, doc_path
+                    FROM document
+                    WHERE COALESCE(status, 'active') = 'active'
+                      AND (
+                        LOWER(COALESCE(doc_key, '')) = LOWER(%s)
+                        OR LOWER(COALESCE(doc_name, '')) = LOWER(%s)
+                      )
+                    ORDER BY doc_date DESC NULLS LAST, doc_id DESC
+                    LIMIT 8
+                    """,
+                    (raw, raw),
+                )
+                exact_rows = cur.fetchall() or []
+
+            if len(exact_rows) == 1:
+                row = exact_rows[0]
+                return {
+                    "status": "resolved",
+                    "input": raw,
+                    "doc_id": int(row[0]),
+                    "doc_key": str(row[1] or "").strip(),
+                    "doc_name": str(row[2] or "").strip(),
+                    "doc_path": str(row[3] or "").strip(),
+                }
+
+            exact_candidates = self._normalize_candidate_snapshot(
+                [
+                    {
+                        "doc_id": int(row[0]),
+                        "doc_key": str(row[1] or "").strip(),
+                        "doc_name": str(row[2] or "").strip(),
+                        "doc_path": str(row[3] or "").strip(),
+                        "name": str(row[2] or row[1] or f"doc_{int(row[0])}").strip(),
+                    }
+                    for row in exact_rows
+                ],
+                limit=8,
+            )
+            if len(exact_candidates) > 1:
+                return {
+                    "status": "ambiguous",
+                    "input": raw,
+                    "candidates": exact_candidates,
+                }
+
+            fuzzy = object_db.search_documents_by_key(
+                connection=conn,
+                key_query=raw,
+                limit=8,
+                include_inactive=False,
+            )
+
+        candidates = self._normalize_candidate_snapshot(
+            [
+                {
+                    "doc_id": int(item.get("doc_id") or 0),
+                    "doc_key": str(item.get("doc_key") or "").strip(),
+                    "doc_name": str(item.get("doc_name") or item.get("doc_key") or "").strip(),
+                    "doc_path": str(item.get("doc_path") or "").strip(),
+                    "name": str(item.get("doc_name") or item.get("doc_key") or f"doc_{int(item.get('doc_id') or 0)}").strip(),
+                    "score": item.get("score"),
+                }
+                for item in list(fuzzy or [])
+                if int(item.get("doc_id") or 0) > 0
+            ],
+            limit=8,
+        )
+        if not candidates:
+            return {"status": "not_found", "input": raw, "candidates": []}
+        if len(candidates) == 1:
+            item = candidates[0] if isinstance(candidates[0], dict) else {}
+            return {
+                "status": "resolved",
+                "input": raw,
+                "doc_id": int(item.get("doc_id") or 0),
+                "doc_key": str(item.get("doc_key") or "").strip(),
+                "doc_name": str(item.get("doc_name") or item.get("name") or "").strip(),
+                "doc_path": str(item.get("doc_path") or "").strip(),
+            }
+
+        return {
+            "status": "ambiguous",
+            "input": raw,
+            "candidates": candidates,
+        }
+
+    def _resolve_task_reference(self, task_value: Any) -> dict[str, Any]:
+        raw = str(task_value or "").strip()
+        if not raw:
+            return {"status": "not_found", "input": raw, "candidates": []}
+
+        with self.get_connection() as conn:
+            if re.fullmatch(r"\d+", raw):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, name, project_id, status
+                        FROM project_tasks
+                        WHERE id = %s
+                        LIMIT 1
+                        """,
+                        (int(raw),),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    return {
+                        "status": "resolved",
+                        "input": raw,
+                        "task_id": int(row[0]),
+                        "task_name": str(row[1] or "").strip(),
+                        "project_id": row[2],
+                        "task_status": str(row[3] or "").strip(),
+                    }
+                return {"status": "not_found", "input": raw, "candidates": []}
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, project_id, status
+                    FROM project_tasks
+                    WHERE LOWER(COALESCE(name, '')) = LOWER(%s)
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """,
+                    (raw,),
+                )
+                exact_rows = cur.fetchall() or []
+
+            if len(exact_rows) == 1:
+                row = exact_rows[0]
+                return {
+                    "status": "resolved",
+                    "input": raw,
+                    "task_id": int(row[0]),
+                    "task_name": str(row[1] or "").strip(),
+                    "project_id": row[2],
+                    "task_status": str(row[3] or "").strip(),
+                }
+
+            candidates = self._normalize_candidate_snapshot(
+                [
+                    {
+                        "task_id": int(row[0]),
+                        "name": str(row[1] or f"task_{int(row[0])}").strip(),
+                        "project_id": row[2],
+                        "task_status": str(row[3] or "").strip(),
+                    }
+                    for row in exact_rows
+                ],
+                limit=8,
+            )
+            if len(candidates) > 1:
+                return {
+                    "status": "ambiguous",
+                    "input": raw,
+                    "candidates": candidates,
+                }
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, project_id, status,
+                           similarity(LOWER(COALESCE(name, '')), LOWER(%s)) AS sim
+                    FROM project_tasks
+                    WHERE LOWER(COALESCE(name, '')) LIKE '%%' || LOWER(%s) || '%%'
+                       OR LOWER(COALESCE(name, '')) %% LOWER(%s)
+                    ORDER BY sim DESC, id DESC
+                    LIMIT 8
+                    """,
+                    (raw, raw, raw),
+                )
+                fuzzy_rows = cur.fetchall() or []
+
+        fuzzy_candidates = self._normalize_candidate_snapshot(
+            [
+                {
+                    "task_id": int(row[0]),
+                    "name": str(row[1] or f"task_{int(row[0])}").strip(),
+                    "project_id": row[2],
+                    "task_status": str(row[3] or "").strip(),
+                    "score": float(row[4] or 0.0),
+                }
+                for row in fuzzy_rows
+            ],
+            limit=8,
+        )
+        if not fuzzy_candidates:
+            return {"status": "not_found", "input": raw, "candidates": []}
+        if len(fuzzy_candidates) == 1:
+            item = fuzzy_candidates[0] if isinstance(fuzzy_candidates[0], dict) else {}
+            return {
+                "status": "resolved",
+                "input": raw,
+                "task_id": int(item.get("task_id") or 0),
+                "task_name": str(item.get("name") or "").strip(),
+                "project_id": item.get("project_id"),
+                "task_status": str(item.get("task_status") or "").strip(),
+            }
+
+        return {
+            "status": "ambiguous",
+            "input": raw,
+            "candidates": fuzzy_candidates,
+        }
+
+    def _resolve_project_reference(self, project_value: Any) -> dict[str, Any]:
+        raw = str(project_value or "").strip()
+        if not raw:
+            return {"status": "not_found", "input": raw, "candidates": []}
+
+        with self.get_connection() as conn:
+            if re.fullmatch(r"\d+", raw):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, project_code, name, status
+                        FROM projects
+                        WHERE id = %s
+                        LIMIT 1
+                        """,
+                        (int(raw),),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    return {
+                        "status": "resolved",
+                        "input": raw,
+                        "project_id": int(row[0]),
+                        "project_code": str(row[1] or "").strip(),
+                        "name": str(row[2] or "").strip(),
+                        "project_status": str(row[3] or "").strip(),
+                    }
+                return {"status": "not_found", "input": raw, "candidates": []}
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, project_code, name, status
+                    FROM projects
+                    WHERE LOWER(COALESCE(project_code, '')) = LOWER(%s)
+                       OR LOWER(COALESCE(name, '')) = LOWER(%s)
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """,
+                    (raw, raw),
+                )
+                exact_rows = cur.fetchall() or []
+
+            if len(exact_rows) == 1:
+                row = exact_rows[0]
+                return {
+                    "status": "resolved",
+                    "input": raw,
+                    "project_id": int(row[0]),
+                    "project_code": str(row[1] or "").strip(),
+                    "name": str(row[2] or "").strip(),
+                    "project_status": str(row[3] or "").strip(),
+                }
+
+            candidates = self._normalize_candidate_snapshot(
+                [
+                    {
+                        "project_id": int(row[0]),
+                        "project_code": str(row[1] or "").strip(),
+                        "name": str(row[2] or f"project_{int(row[0])}").strip(),
+                        "project_status": str(row[3] or "").strip(),
+                    }
+                    for row in exact_rows
+                ],
+                limit=8,
+            )
+            if len(candidates) > 1:
+                return {
+                    "status": "ambiguous",
+                    "input": raw,
+                    "candidates": candidates,
+                }
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, project_code, name, status,
+                           GREATEST(
+                               similarity(LOWER(COALESCE(project_code, '')), LOWER(%s)),
+                               similarity(LOWER(COALESCE(name, '')), LOWER(%s))
+                           ) AS sim
+                    FROM projects
+                    WHERE LOWER(COALESCE(project_code, '')) LIKE '%%' || LOWER(%s) || '%%'
+                       OR LOWER(COALESCE(name, '')) LIKE '%%' || LOWER(%s) || '%%'
+                       OR LOWER(COALESCE(project_code, '')) %% LOWER(%s)
+                       OR LOWER(COALESCE(name, '')) %% LOWER(%s)
+                    ORDER BY sim DESC, id DESC
+                    LIMIT 8
+                    """,
+                    (raw, raw, raw, raw, raw, raw),
+                )
+                fuzzy_rows = cur.fetchall() or []
+
+        fuzzy_candidates = self._normalize_candidate_snapshot(
+            [
+                {
+                    "project_id": int(row[0]),
+                    "project_code": str(row[1] or "").strip(),
+                    "name": str(row[2] or f"project_{int(row[0])}").strip(),
+                    "project_status": str(row[3] or "").strip(),
+                    "score": float(row[4] or 0.0),
+                }
+                for row in fuzzy_rows
+            ],
+            limit=8,
+        )
+        if not fuzzy_candidates:
+            return {"status": "not_found", "input": raw, "candidates": []}
+        if len(fuzzy_candidates) == 1:
+            item = fuzzy_candidates[0] if isinstance(fuzzy_candidates[0], dict) else {}
+            return {
+                "status": "resolved",
+                "input": raw,
+                "project_id": int(item.get("project_id") or 0),
+                "project_code": str(item.get("project_code") or "").strip(),
+                "name": str(item.get("name") or "").strip(),
+                "project_status": str(item.get("project_status") or "").strip(),
+            }
+
+        return {
+            "status": "ambiguous",
+            "input": raw,
+            "candidates": fuzzy_candidates,
+        }
+
+    def _resolve_workflow_case_reference(self, case_value: Any) -> dict[str, Any]:
+        raw = str(case_value or "").strip()
+        if not raw:
+            return {"status": "not_found", "input": raw, "candidates": []}
+
+        with self.get_connection() as conn:
+            if re.fullmatch(r"\d+", raw):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, case_no, case_type, status
+                        FROM workflow_cases
+                        WHERE id = %s
+                        LIMIT 1
+                        """,
+                        (int(raw),),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    return {
+                        "status": "resolved",
+                        "input": raw,
+                        "case_ref": int(row[0]),
+                        "case_no": str(row[1] or "").strip(),
+                        "case_type": str(row[2] or "").strip(),
+                        "case_status": str(row[3] or "").strip(),
+                    }
+                return {"status": "not_found", "input": raw, "candidates": []}
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, case_no, case_type, status
+                    FROM workflow_cases
+                    WHERE LOWER(COALESCE(case_no, '')) = LOWER(%s)
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """,
+                    (raw,),
+                )
+                exact_rows = cur.fetchall() or []
+
+            if len(exact_rows) == 1:
+                row = exact_rows[0]
+                return {
+                    "status": "resolved",
+                    "input": raw,
+                    "case_ref": int(row[0]),
+                    "case_no": str(row[1] or "").strip(),
+                    "case_type": str(row[2] or "").strip(),
+                    "case_status": str(row[3] or "").strip(),
+                }
+
+            candidates = self._normalize_candidate_snapshot(
+                [
+                    {
+                        "case_ref": int(row[0]),
+                        "name": str(row[1] or f"case_{int(row[0])}").strip(),
+                        "case_no": str(row[1] or "").strip(),
+                        "case_type": str(row[2] or "").strip(),
+                        "case_status": str(row[3] or "").strip(),
+                    }
+                    for row in exact_rows
+                ],
+                limit=8,
+            )
+            if len(candidates) > 1:
+                return {"status": "ambiguous", "input": raw, "candidates": candidates}
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, case_no, case_type, status,
+                           similarity(LOWER(COALESCE(case_no, '')), LOWER(%s)) AS sim
+                    FROM workflow_cases
+                    WHERE LOWER(COALESCE(case_no, '')) LIKE '%%' || LOWER(%s) || '%%'
+                       OR LOWER(COALESCE(case_no, '')) %% LOWER(%s)
+                    ORDER BY sim DESC, id DESC
+                    LIMIT 8
+                    """,
+                    (raw, raw, raw),
+                )
+                fuzzy_rows = cur.fetchall() or []
+
+        fuzzy_candidates = self._normalize_candidate_snapshot(
+            [
+                {
+                    "case_ref": int(row[0]),
+                    "name": str(row[1] or f"case_{int(row[0])}").strip(),
+                    "case_no": str(row[1] or "").strip(),
+                    "case_type": str(row[2] or "").strip(),
+                    "case_status": str(row[3] or "").strip(),
+                    "score": float(row[4] or 0.0),
+                }
+                for row in fuzzy_rows
+            ],
+            limit=8,
+        )
+        if not fuzzy_candidates:
+            return {"status": "not_found", "input": raw, "candidates": []}
+        if len(fuzzy_candidates) == 1:
+            item = fuzzy_candidates[0] if isinstance(fuzzy_candidates[0], dict) else {}
+            return {
+                "status": "resolved",
+                "input": raw,
+                "case_ref": int(item.get("case_ref") or 0),
+                "case_no": str(item.get("case_no") or "").strip(),
+                "case_type": str(item.get("case_type") or "").strip(),
+                "case_status": str(item.get("case_status") or "").strip(),
+            }
+
+        return {"status": "ambiguous", "input": raw, "candidates": fuzzy_candidates}
+
+    def _create_merge_clause_clarification(
+        self,
+        *,
+        original_query: str,
+        clause_name: str,
+        raw_args: list[Any],
+        pending_slot: str,
+        resolution: dict[str, Any],
+        resolved_ids: dict[str, Any],
+    ) -> dict[str, Any]:
+        entity_text = str(resolution.get("input") or "").strip()
+        reason_code = "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found"
+        clarification_question = self._build_merge_clarification_question(pending_slot, entity_text, reason_code)
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=original_query,
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="entity_scope",
+            ambiguity_summary={
+                "clause_name": clause_name,
+                "pending_slot": pending_slot,
+                "entity_input": entity_text,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "solf_clause_merge_entities",
+                "solf_clause_name": clause_name,
+                "merge_resolution": {
+                    "raw_args": [str(arg or "").strip() for arg in list(raw_args or [])[:2]],
+                    "resolved_ids": dict(resolved_ids or {}),
+                    "pending_slot": pending_slot,
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="user",
+            message_text=original_query,
+            source_type="clause_dispatch_input",
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "clause_name": clause_name,
+                "pending_slot": pending_slot,
+                "entity_input": entity_text,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "intent": "solf_clause",
+            "source": "pending_clarification",
+            "question": original_query,
+            "answer": f"[source: pending_clarification] {clarification_question}",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "entity_scope",
+            "candidates": candidates,
+            "data": {
+                "clause_name": clause_name,
+                "thread_id": thread_id,
+                "pending_slot": pending_slot,
+                "resolution": resolution,
+            },
+            "clause_name": clause_name,
+        }
+
+    def _create_document_clause_clarification(
+        self,
+        *,
+        original_query: str,
+        clause_name: str,
+        raw_arg: Any,
+        resolution: dict[str, Any],
+    ) -> dict[str, Any]:
+        document_hint = str(resolution.get("input") or raw_arg or "").strip()
+        reason_code = "ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found"
+        clarification_question = self._build_document_clause_clarification_question(document_hint, reason_code)
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=original_query,
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="document_scope",
+            ambiguity_summary={
+                "clause_name": clause_name,
+                "document_input": document_hint,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "solf_clause_retrieve_document_file",
+                "solf_clause_name": clause_name,
+                "document_resolution": {
+                    "raw_arg": str(raw_arg or "").strip(),
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="user",
+            message_text=original_query,
+            source_type="clause_dispatch_input",
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "clause_name": clause_name,
+                "document_input": document_hint,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "intent": "solf_clause",
+            "source": "pending_clarification",
+            "question": original_query,
+            "answer": f"[source: pending_clarification] {clarification_question}",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "document_scope",
+            "candidates": candidates,
+            "data": {
+                "clause_name": clause_name,
+                "thread_id": thread_id,
+                "resolution": resolution,
+            },
+            "clause_name": clause_name,
+        }
+
+    def _create_update_clause_clarification(
+        self,
+        *,
+        original_query: str,
+        clause_name: str,
+        update_payload: dict[str, Any],
+        resolution: dict[str, Any],
+    ) -> dict[str, Any]:
+        entity_hint = str(resolution.get("input") or update_payload.get("object_name") or "").strip()
+        reason_code = "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found"
+        clarification_question = self._build_update_clause_clarification_question(entity_hint, reason_code)
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=original_query,
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="entity_scope",
+            ambiguity_summary={
+                "clause_name": clause_name,
+                "entity_input": entity_hint,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "solf_clause_entity_update",
+                "solf_clause_name": clause_name,
+                "update_resolution": {
+                    "update_payload": dict(update_payload or {}),
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="user",
+            message_text=original_query,
+            source_type="clause_dispatch_input",
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "clause_name": clause_name,
+                "entity_input": entity_hint,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "intent": "solf_clause",
+            "source": "pending_clarification",
+            "question": original_query,
+            "answer": f"[source: pending_clarification] {clarification_question}",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "entity_scope",
+            "candidates": candidates,
+            "data": {
+                "clause_name": clause_name,
+                "thread_id": thread_id,
+                "resolution": resolution,
+            },
+            "clause_name": clause_name,
+        }
+
+    def _create_update_action_clarification(
+        self,
+        *,
+        action_name: str,
+        payload: dict[str, Any],
+        resolution: dict[str, Any],
+    ) -> dict[str, Any]:
+        entity_hint = str(resolution.get("input") or payload.get("natural_key_value") or "").strip()
+        reason_code = "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found"
+        clarification_question = self._build_update_clause_clarification_question(entity_hint, reason_code)
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=f"workflow action {action_name}: {json.dumps(payload, ensure_ascii=False)}",
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="entity_scope",
+            ambiguity_summary={
+                "action": action_name,
+                "entity_input": entity_hint,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "workflow_action_update_entity",
+                "action_name": action_name,
+                "update_action_resolution": {
+                    "payload": dict(payload or {}),
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "action": action_name,
+                "entity_input": entity_hint,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "action": action_name,
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "entity_scope",
+            "candidates": candidates,
+            "message": clarification_question,
+            "data": {
+                "thread_id": thread_id,
+                "resolution": resolution,
+            },
+        }
+
+    def _create_create_workflow_case_action_clarification(
+        self,
+        *,
+        action_name: str,
+        payload: dict[str, Any],
+        resolution: dict[str, Any],
+        pending_field: str,
+    ) -> dict[str, Any]:
+        if pending_field == "subject":
+            entity_hint = str(
+                resolution.get("input")
+                or payload.get("subject_name")
+                or payload.get("subject_title")
+                or payload.get("subject_ref")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_subject" if str(resolution.get("status") or "") == "ambiguous" else "subject_not_found"
+            clarification_question = (
+                f"I found multiple subjects matching '{entity_hint}'. Please choose the exact subject candidate."
+                if reason_code == "ambiguous_subject"
+                else f"I could not resolve subject '{entity_hint}'. Please provide the exact subject id or name."
+            )
+        else:
+            entity_hint = str(
+                resolution.get("input")
+                or payload.get("initiated_by_name")
+                or payload.get("initiated_by_title")
+                or payload.get("initiated_by_ref")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_initiator" if str(resolution.get("status") or "") == "ambiguous" else "initiator_not_found"
+            clarification_question = (
+                f"I found multiple initiators matching '{entity_hint}'. Please choose the exact initiator candidate."
+                if reason_code == "ambiguous_initiator"
+                else f"I could not resolve initiator '{entity_hint}'. Please provide the exact initiator id or name."
+            )
+
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=f"workflow action {action_name}: {json.dumps(payload, ensure_ascii=False)}",
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="entity_scope",
+            ambiguity_summary={
+                "action": action_name,
+                "pending_field": pending_field,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "workflow_action_create_workflow_case_reference",
+                "action_name": action_name,
+                "create_workflow_case_action_resolution": {
+                    "payload": dict(payload or {}),
+                    "pending_field": pending_field,
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "action": action_name,
+                "pending_field": pending_field,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "action": action_name,
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "entity_scope",
+            "candidates": candidates,
+            "message": clarification_question,
+            "data": {
+                "thread_id": thread_id,
+                "resolution": resolution,
+                "pending_field": pending_field,
+            },
+        }
+
+    def _create_record_approval_action_clarification(
+        self,
+        *,
+        action_name: str,
+        payload: dict[str, Any],
+        resolution: dict[str, Any],
+        pending_field: str,
+    ) -> dict[str, Any]:
+        if pending_field == "case":
+            hint = str(
+                resolution.get("input")
+                or payload.get("case_no")
+                or payload.get("case_ref")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_case" if str(resolution.get("status") or "") == "ambiguous" else "case_not_found"
+            clarification_question = (
+                f"I found multiple workflow cases matching '{hint}'. Please choose the exact case candidate."
+                if reason_code == "ambiguous_case"
+                else f"I could not resolve workflow case '{hint}'. Please provide the exact case id or case no."
+            )
+        else:
+            hint = str(
+                resolution.get("input")
+                or payload.get("approver_name")
+                or payload.get("approver_title")
+                or payload.get("approver_ref")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_approver" if str(resolution.get("status") or "") == "ambiguous" else "approver_not_found"
+            clarification_question = (
+                f"I found multiple approvers matching '{hint}'. Please choose the exact approver candidate."
+                if reason_code == "ambiguous_approver"
+                else f"I could not resolve approver '{hint}'. Please provide the exact approver id or name."
+            )
+
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=f"workflow action {action_name}: {json.dumps(payload, ensure_ascii=False)}",
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="entity_scope",
+            ambiguity_summary={
+                "action": action_name,
+                "pending_field": pending_field,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "workflow_action_record_approval_reference",
+                "action_name": action_name,
+                "record_approval_action_resolution": {
+                    "payload": dict(payload or {}),
+                    "pending_field": pending_field,
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={"action": action_name, "pending_field": pending_field},
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "action": action_name,
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "entity_scope",
+            "candidates": candidates,
+            "message": clarification_question,
+            "data": {
+                "thread_id": thread_id,
+                "resolution": resolution,
+                "pending_field": pending_field,
+            },
+        }
+
+    def _create_retrieve_action_clarification(
+        self,
+        *,
+        action_name: str,
+        payload: dict[str, Any],
+        resolution: dict[str, Any],
+    ) -> dict[str, Any]:
+        document_hint = str(
+            resolution.get("input")
+            or payload.get("doc_name")
+            or payload.get("doc_key")
+            or payload.get("doc_id")
+            or ""
+        ).strip()
+        reason_code = "ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found"
+        clarification_question = self._build_document_clause_clarification_question(document_hint, reason_code)
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=f"workflow action {action_name}: {json.dumps(payload, ensure_ascii=False)}",
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="document_scope",
+            ambiguity_summary={
+                "action": action_name,
+                "document_input": document_hint,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "workflow_action_retrieve_document_file",
+                "action_name": action_name,
+                "retrieve_action_resolution": {
+                    "payload": dict(payload or {}),
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "action": action_name,
+                "document_input": document_hint,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "action": action_name,
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "document_scope",
+            "candidates": candidates,
+            "message": clarification_question,
+            "data": {
+                "thread_id": thread_id,
+                "resolution": resolution,
+            },
+        }
+
+    def _create_task_action_clarification(
+        self,
+        *,
+        action_name: str,
+        payload: dict[str, Any],
+        resolution: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_hint = str(
+            resolution.get("input")
+            or payload.get("task_name")
+            or payload.get("task_title")
+            or payload.get("task_id")
+            or ""
+        ).strip()
+        reason_code = "ambiguous_task" if str(resolution.get("status") or "") == "ambiguous" else "task_not_found"
+        clarification_question = (
+            f"I found multiple tasks matching '{task_hint}'. Please choose the exact task candidate."
+            if reason_code == "ambiguous_task"
+            else f"I could not resolve task '{task_hint}'. Please provide the exact task id or task name."
+        )
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=f"workflow action {action_name}: {json.dumps(payload, ensure_ascii=False)}",
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="task_scope",
+            ambiguity_summary={
+                "action": action_name,
+                "task_input": task_hint,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "workflow_action_task_reference",
+                "action_name": action_name,
+                "task_action_resolution": {
+                    "payload": dict(payload or {}),
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "action": action_name,
+                "task_input": task_hint,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "action": action_name,
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "task_scope",
+            "candidates": candidates,
+            "message": clarification_question,
+            "data": {
+                "thread_id": thread_id,
+                "resolution": resolution,
+            },
+        }
+
+    def _create_create_workflow_case_action_clarification(
+        self,
+        *,
+        action_name: str,
+        payload: dict[str, Any],
+        resolution: dict[str, Any],
+        pending_field: str,
+    ) -> dict[str, Any]:
+        if pending_field == "subject":
+            entity_hint = str(
+                resolution.get("input")
+                or payload.get("subject_name")
+                or payload.get("subject_title")
+                or payload.get("subject_ref")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_subject" if str(resolution.get("status") or "") == "ambiguous" else "subject_not_found"
+            clarification_question = (
+                f"I found multiple subjects matching '{entity_hint}'. Please choose the exact subject candidate."
+                if reason_code == "ambiguous_subject"
+                else f"I could not resolve subject '{entity_hint}'. Please provide the exact subject id or name."
+            )
+        else:
+            entity_hint = str(
+                resolution.get("input")
+                or payload.get("initiated_by_name")
+                or payload.get("initiated_by_title")
+                or payload.get("initiated_by_ref")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_initiator" if str(resolution.get("status") or "") == "ambiguous" else "initiator_not_found"
+            clarification_question = (
+                f"I found multiple initiators matching '{entity_hint}'. Please choose the exact initiator candidate."
+                if reason_code == "ambiguous_initiator"
+                else f"I could not resolve initiator '{entity_hint}'. Please provide the exact initiator id or name."
+            )
+
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=f"workflow action {action_name}: {json.dumps(payload, ensure_ascii=False)}",
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type="entity_scope",
+            ambiguity_summary={
+                "action": action_name,
+                "pending_field": pending_field,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "workflow_action_create_workflow_case_reference",
+                "action_name": action_name,
+                "create_workflow_case_action_resolution": {
+                    "payload": dict(payload or {}),
+                    "pending_field": pending_field,
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "action": action_name,
+                "pending_field": pending_field,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "action": action_name,
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": "entity_scope",
+            "candidates": candidates,
+            "message": clarification_question,
+            "data": {
+                "thread_id": thread_id,
+                "resolution": resolution,
+                "pending_field": pending_field,
+            },
+        }
+
+    def _create_create_task_action_clarification(
+        self,
+        *,
+        action_name: str,
+        payload: dict[str, Any],
+        resolution: dict[str, Any],
+        pending_field: str,
+    ) -> dict[str, Any]:
+        if pending_field == "project":
+            project_hint = str(
+                resolution.get("input")
+                or payload.get("project_name")
+                or payload.get("project_code")
+                or payload.get("project_id")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_project" if str(resolution.get("status") or "") == "ambiguous" else "project_not_found"
+            clarification_question = (
+                f"I found multiple projects matching '{project_hint}'. Please choose the exact project candidate."
+                if reason_code == "ambiguous_project"
+                else f"I could not resolve project '{project_hint}'. Please provide the exact project id, code, or name."
+            )
+            expected_input_type = "project_scope"
+        else:
+            assignee_hint = str(
+                resolution.get("input")
+                or payload.get("assigned_to")
+                or payload.get("assignee_name")
+                or ""
+            ).strip()
+            reason_code = "ambiguous_assignee" if str(resolution.get("status") or "") == "ambiguous" else "assignee_not_found"
+            clarification_question = (
+                f"I found multiple assignees matching '{assignee_hint}'. Please choose the exact assignee candidate."
+                if reason_code == "ambiguous_assignee"
+                else f"I could not resolve assignee '{assignee_hint}'. Please provide the exact assignee id or name."
+            )
+            expected_input_type = "entity_scope"
+
+        candidates = list(resolution.get("candidates") or [])
+        thread_id = self._create_clarification_thread(
+            original_query=f"workflow action {action_name}: {json.dumps(payload, ensure_ascii=False)}",
+            reason_code=reason_code,
+            clarification_question=clarification_question,
+            expected_input_type=expected_input_type,
+            ambiguity_summary={
+                "action": action_name,
+                "pending_field": pending_field,
+                "resolution_status": str(resolution.get("status") or "").strip(),
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+            metadata={
+                "trigger": "workflow_action_create_task_reference",
+                "action_name": action_name,
+                "create_task_action_resolution": {
+                    "payload": dict(payload or {}),
+                    "pending_field": pending_field,
+                },
+            },
+        )
+        self._append_clarification_turn(
+            thread_id=thread_id,
+            role="assistant",
+            message_text=clarification_question,
+            source_type="clarification_prompt",
+            answer_source="pending_clarification",
+            confidence=None,
+            ambiguity_flag=True,
+            ambiguity_payload={
+                "action": action_name,
+                "pending_field": pending_field,
+            },
+            candidate_snapshot=candidates,
+            provenance_snapshot=[],
+        )
+        return {
+            "action": action_name,
+            "source": "pending_clarification",
+            "success": False,
+            "status": "pending_clarification",
+            "thread_id": thread_id,
+            "clarification_question": clarification_question,
+            "reason_code": reason_code,
+            "expected_input_type": expected_input_type,
+            "candidates": candidates,
+            "message": clarification_question,
+            "data": {
+                "thread_id": thread_id,
+                "resolution": resolution,
+                "pending_field": pending_field,
+            },
+        }
+
+    def _dispatch_solf_clause_request(self, question: str, clause_request: dict[str, Any]) -> dict[str, Any]:
+        clause_name = str(clause_request.get("clause_name") or "").strip()
+        args = clause_request.get("args") if isinstance(clause_request.get("args"), list) else []
+
+        if clause_name == "merge_entities" and len(args) >= 2:
+            raw_args = [args[0], args[1]]
+            resolved_ids: dict[str, Any] = {}
+            for index, arg in enumerate(raw_args, start=1):
+                slot = f"entity_{index}"
+                resolution = self._resolve_merge_entity_reference(arg)
+                if str(resolution.get("status") or "") != "resolved":
+                    return self._create_merge_clause_clarification(
+                        original_query=question,
+                        clause_name=clause_name,
+                        raw_args=raw_args,
+                        pending_slot=slot,
+                        resolution=resolution,
+                        resolved_ids=resolved_ids,
+                    )
+                resolved_ids[slot] = int(resolution.get("object_id") or 0)
+
+            evaluated = self.evaluate_solf_clause(
+                clause_name=clause_name,
+                payload=clause_request.get("payload") if isinstance(clause_request.get("payload"), dict) else {},
+                args=[int(resolved_ids.get("entity_1") or 0), int(resolved_ids.get("entity_2") or 0)],
+            )
+            query_like = self._format_direct_solf_query_result(question, evaluated)
+            data = query_like.get("data") if isinstance(query_like.get("data"), dict) else {}
+            data["dispatch_mode"] = clause_request.get("dispatch_mode")
+            data["resolved_ids"] = dict(resolved_ids)
+            query_like["data"] = data
+            return query_like
+
+        if clause_name == "retrieve_document_file" and len(args) >= 1:
+            raw_arg = args[0]
+            resolution = self._resolve_document_reference(raw_arg)
+            if str(resolution.get("status") or "") != "resolved":
+                return self._create_document_clause_clarification(
+                    original_query=question,
+                    clause_name=clause_name,
+                    raw_arg=raw_arg,
+                    resolution=resolution,
+                )
+
+            resolved_doc_id = int(resolution.get("doc_id") or 0)
+            evaluated = self.evaluate_solf_clause(
+                clause_name=clause_name,
+                payload=clause_request.get("payload") if isinstance(clause_request.get("payload"), dict) else {},
+                args=[resolved_doc_id],
+            )
+            query_like = self._format_direct_solf_query_result(question, evaluated)
+            data = query_like.get("data") if isinstance(query_like.get("data"), dict) else {}
+            data["dispatch_mode"] = clause_request.get("dispatch_mode")
+            data["resolved_doc_id"] = resolved_doc_id
+            data["resolved_document"] = {
+                "doc_id": resolved_doc_id,
+                "doc_key": str(resolution.get("doc_key") or "").strip(),
+                "doc_name": str(resolution.get("doc_name") or "").strip(),
+                "doc_path": str(resolution.get("doc_path") or "").strip(),
+            }
+            query_like["data"] = data
+            return query_like
+
+        if clause_name in {"entity_update", "update"} and len(args) >= 1:
+            base_payload = clause_request.get("payload") if isinstance(clause_request.get("payload"), dict) else {}
+            update_payload = self._extract_entity_update_payload(args[0], base_payload=base_payload)
+            if not isinstance(update_payload, dict) or not update_payload.get("object_name"):
+                evaluated = {
+                    "success": False,
+                    "message": "Could not parse update target. Use format: <entity> <field> to <value>.",
+                    "clause_name": clause_name,
+                    "args": args,
+                    "result": None,
+                }
+                return self._format_direct_solf_query_result(question, evaluated)
+
+            resolution = self._resolve_merge_entity_reference(update_payload.get("object_name"))
+            if str(resolution.get("status") or "") != "resolved":
+                return self._create_update_clause_clarification(
+                    original_query=question,
+                    clause_name=clause_name,
+                    update_payload=update_payload,
+                    resolution=resolution,
+                )
+
+            resolved_payload = dict(update_payload)
+            resolved_payload["resolved_object_id"] = int(resolution.get("object_id") or 0)
+            resolved_payload["object_name"] = str(resolution.get("object_name") or resolved_payload.get("object_name") or "").strip()
+            if str(resolution.get("class_name") or "").strip() and not resolved_payload.get("class_name"):
+                resolved_payload["class_name"] = str(resolution.get("class_name") or "").strip()
+
+            evaluated = self.evaluate_solf_clause(
+                clause_name=clause_name,
+                payload={},
+                args=[resolved_payload],
+            )
+            query_like = self._format_direct_solf_query_result(question, evaluated)
+            data = query_like.get("data") if isinstance(query_like.get("data"), dict) else {}
+            data["dispatch_mode"] = clause_request.get("dispatch_mode")
+            data["resolved_object_id"] = int(resolution.get("object_id") or 0)
+            data["resolved_payload"] = resolved_payload
+            query_like["data"] = data
+            return query_like
+
+        evaluated = self.evaluate_solf_clause(
+            clause_name=clause_name,
+            payload=clause_request.get("payload") if isinstance(clause_request.get("payload"), dict) else {},
+            args=args,
+        )
+        query_like = self._format_direct_solf_query_result(question, evaluated)
+        data = query_like.get("data") if isinstance(query_like.get("data"), dict) else {}
+        data["dispatch_mode"] = clause_request.get("dispatch_mode")
+        query_like["data"] = data
+        return query_like
 
     def _extract_clarification_signal(self, user_message: str, query_result: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(query_result, dict):
@@ -812,6 +2397,908 @@ class IDMSInteractionTools:
             source_type="clarification_response",
         )
 
+        thread_metadata = thread.get("metadata") if isinstance(thread.get("metadata"), dict) else {}
+        if str(thread_metadata.get("trigger") or "") == "solf_clause_merge_entities":
+            merge_meta = thread_metadata.get("merge_resolution") if isinstance(thread_metadata.get("merge_resolution"), dict) else {}
+            raw_args = [str(arg or "").strip() for arg in list(merge_meta.get("raw_args") or [])[:2]]
+            resolved_ids = dict(merge_meta.get("resolved_ids") or {})
+            pending_slot = str(merge_meta.get("pending_slot") or "").strip() or "entity_1"
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+            selected_object_id = int(selected_entry.get("object_id") or 0) if isinstance(selected_entry, dict) else 0
+
+            if selected_object_id <= 0:
+                resolution = self._resolve_merge_entity_reference(response_text)
+                if str(resolution.get("status") or "") != "resolved":
+                    clarification_question = self._build_merge_clarification_question(
+                        pending_slot,
+                        str(resolution.get("input") or response_text).strip(),
+                        "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code="ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                        clarification_question=clarification_question,
+                        expected_input_type="entity_scope",
+                        ambiguity_summary={
+                            "clause_name": str(thread_metadata.get("solf_clause_name") or "merge_entities"),
+                            "pending_slot": pending_slot,
+                            "entity_input": str(resolution.get("input") or response_text).strip(),
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "solf_clause_merge_entities",
+                            "solf_clause_name": str(thread_metadata.get("solf_clause_name") or "merge_entities"),
+                            "merge_resolution": {
+                                "raw_args": raw_args,
+                                "resolved_ids": resolved_ids,
+                                "pending_slot": pending_slot,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"pending_slot": pending_slot},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                        "expected_input_type": "entity_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "solf_clause_merge_entities"},
+                    }
+                selected_object_id = int(resolution.get("object_id") or 0)
+
+            resolved_ids[pending_slot] = selected_object_id
+            for slot, idx in (("entity_1", 0), ("entity_2", 1)):
+                if resolved_ids.get(slot):
+                    continue
+                if idx >= len(raw_args):
+                    continue
+                next_resolution = self._resolve_merge_entity_reference(raw_args[idx])
+                if str(next_resolution.get("status") or "") == "resolved":
+                    resolved_ids[slot] = int(next_resolution.get("object_id") or 0)
+                    continue
+                clarification_question = self._build_merge_clarification_question(
+                    slot,
+                    str(next_resolution.get("input") or raw_args[idx]).strip(),
+                    "ambiguous_entity" if str(next_resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                )
+                self._update_clarification_prompt(
+                    int(thread_id),
+                    reason_code="ambiguous_entity" if str(next_resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                    clarification_question=clarification_question,
+                    expected_input_type="entity_scope",
+                    ambiguity_summary={
+                        "clause_name": str(thread_metadata.get("solf_clause_name") or "merge_entities"),
+                        "pending_slot": slot,
+                        "entity_input": str(next_resolution.get("input") or raw_args[idx]).strip(),
+                    },
+                    candidate_snapshot=list(next_resolution.get("candidates") or []),
+                    provenance_snapshot=[],
+                    metadata={
+                        "trigger": "solf_clause_merge_entities",
+                        "solf_clause_name": str(thread_metadata.get("solf_clause_name") or "merge_entities"),
+                        "merge_resolution": {
+                            "raw_args": raw_args,
+                            "resolved_ids": resolved_ids,
+                            "pending_slot": slot,
+                        },
+                    },
+                )
+                self._append_clarification_turn(
+                    thread_id=int(thread_id),
+                    role="assistant",
+                    message_text=clarification_question,
+                    source_type="clarification_prompt",
+                    answer_source="pending_clarification",
+                    ambiguity_flag=True,
+                    ambiguity_payload={"pending_slot": slot},
+                    candidate_snapshot=list(next_resolution.get("candidates") or []),
+                )
+                return {
+                    "status": "pending_clarification",
+                    "thread_id": int(thread_id),
+                    "clarification_question": clarification_question,
+                    "reason_code": "ambiguous_entity" if str(next_resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                    "expected_input_type": "entity_scope",
+                    "candidates": list(next_resolution.get("candidates") or []),
+                    "provenance_snapshot": [],
+                    "grounding": {"trigger": "solf_clause_merge_entities"},
+                }
+
+            clause_name = str(thread_metadata.get("solf_clause_name") or "merge_entities")
+            evaluated = self.evaluate_solf_clause(clause_name=clause_name, payload={}, args=[int(resolved_ids.get("entity_1") or 0), int(resolved_ids.get("entity_2") or 0)])
+            query_result = self._format_direct_solf_query_result(original_query := str(thread.get("original_query") or "").strip(), evaluated)
+            final_answer = str(query_result.get("answer") or "").strip()
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="solf_clause",
+                ambiguity_flag=False,
+                linked_object_ids=[int(resolved_ids.get("entity_1") or 0), int(resolved_ids.get("entity_2") or 0)],
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "solf_clause",
+                "grounding": query_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "solf_clause_retrieve_document_file":
+            doc_meta = thread_metadata.get("document_resolution") if isinstance(thread_metadata.get("document_resolution"), dict) else {}
+            raw_arg = str(doc_meta.get("raw_arg") or "").strip()
+            clause_name = str(thread_metadata.get("solf_clause_name") or "retrieve_document_file")
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+            selected_doc_id = int(selected_entry.get("doc_id") or 0) if isinstance(selected_entry, dict) else 0
+
+            if selected_doc_id <= 0:
+                resolution = self._resolve_document_reference(response_text)
+                if str(resolution.get("status") or "") != "resolved":
+                    clarification_question = self._build_document_clause_clarification_question(
+                        str(resolution.get("input") or response_text).strip(),
+                        "ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found",
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code="ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found",
+                        clarification_question=clarification_question,
+                        expected_input_type="document_scope",
+                        ambiguity_summary={
+                            "clause_name": clause_name,
+                            "document_input": str(resolution.get("input") or response_text).strip(),
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "solf_clause_retrieve_document_file",
+                            "solf_clause_name": clause_name,
+                            "document_resolution": {
+                                "raw_arg": raw_arg,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"clause_name": clause_name},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": "ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found",
+                        "expected_input_type": "document_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "solf_clause_retrieve_document_file"},
+                    }
+                selected_doc_id = int(resolution.get("doc_id") or 0)
+
+            evaluated = self.evaluate_solf_clause(clause_name=clause_name, payload={}, args=[selected_doc_id])
+            query_result = self._format_direct_solf_query_result(str(thread.get("original_query") or "").strip(), evaluated)
+            final_answer = str(query_result.get("answer") or "").strip()
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="solf_clause",
+                ambiguity_flag=False,
+                linked_doc_ids=[selected_doc_id],
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "solf_clause",
+                "grounding": query_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "solf_clause_entity_update":
+            update_meta = thread_metadata.get("update_resolution") if isinstance(thread_metadata.get("update_resolution"), dict) else {}
+            update_payload = dict(update_meta.get("update_payload") or {}) if isinstance(update_meta.get("update_payload"), dict) else {}
+            clause_name = str(thread_metadata.get("solf_clause_name") or "entity_update")
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+            selected_object_id = int(selected_entry.get("object_id") or 0) if isinstance(selected_entry, dict) else 0
+
+            if selected_object_id <= 0:
+                resolution = self._resolve_merge_entity_reference(response_text)
+                if str(resolution.get("status") or "") != "resolved":
+                    clarification_question = self._build_update_clause_clarification_question(
+                        str(resolution.get("input") or response_text).strip(),
+                        "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code="ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                        clarification_question=clarification_question,
+                        expected_input_type="entity_scope",
+                        ambiguity_summary={
+                            "clause_name": clause_name,
+                            "entity_input": str(resolution.get("input") or response_text).strip(),
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "solf_clause_entity_update",
+                            "solf_clause_name": clause_name,
+                            "update_resolution": {
+                                "update_payload": update_payload,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"clause_name": clause_name},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                        "expected_input_type": "entity_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "solf_clause_entity_update"},
+                    }
+                selected_object_id = int(resolution.get("object_id") or 0)
+                if str(resolution.get("object_name") or "").strip():
+                    update_payload["object_name"] = str(resolution.get("object_name") or "").strip()
+
+            resolved_payload = dict(update_payload)
+            resolved_payload["resolved_object_id"] = selected_object_id
+            evaluated = self.evaluate_solf_clause(clause_name=clause_name, payload={}, args=[resolved_payload])
+            query_result = self._format_direct_solf_query_result(str(thread.get("original_query") or "").strip(), evaluated)
+            final_answer = str(query_result.get("answer") or "").strip()
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="solf_clause",
+                ambiguity_flag=False,
+                linked_object_ids=[selected_object_id],
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "solf_clause",
+                "grounding": query_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "workflow_action_update_entity":
+            action_name = str(thread_metadata.get("action_name") or "update_entity")
+            action_meta = thread_metadata.get("update_action_resolution") if isinstance(thread_metadata.get("update_action_resolution"), dict) else {}
+            action_payload = dict(action_meta.get("payload") or {}) if isinstance(action_meta.get("payload"), dict) else {}
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+            selected_object_id = int(selected_entry.get("object_id") or 0) if isinstance(selected_entry, dict) else 0
+
+            if selected_object_id <= 0:
+                resolution = self._resolve_merge_entity_reference(response_text)
+                if str(resolution.get("status") or "") != "resolved":
+                    clarification_question = self._build_update_clause_clarification_question(
+                        str(resolution.get("input") or response_text).strip(),
+                        "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code="ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                        clarification_question=clarification_question,
+                        expected_input_type="entity_scope",
+                        ambiguity_summary={
+                            "action": action_name,
+                            "entity_input": str(resolution.get("input") or response_text).strip(),
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "workflow_action_update_entity",
+                            "action_name": action_name,
+                            "update_action_resolution": {
+                                "payload": action_payload,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"action": action_name},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": "ambiguous_entity" if str(resolution.get("status") or "") == "ambiguous" else "entity_not_found",
+                        "expected_input_type": "entity_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "workflow_action_update_entity"},
+                    }
+                selected_object_id = int(resolution.get("object_id") or 0)
+
+            resolved_payload = dict(action_payload)
+            resolved_payload["entity_id"] = selected_object_id
+            action_result = self.perform_action(action_name, resolved_payload)
+            if str(action_result.get("status") or "") == "pending_clarification":
+                return action_result
+
+            final_answer = str(action_result.get("message") or "").strip() or "Workflow action completed."
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="workflow_action",
+                ambiguity_flag=False,
+                linked_object_ids=[selected_object_id],
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "workflow_action",
+                "grounding": action_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "workflow_action_retrieve_document_file":
+            action_name = str(thread_metadata.get("action_name") or "retrieve_document_file")
+            action_meta = thread_metadata.get("retrieve_action_resolution") if isinstance(thread_metadata.get("retrieve_action_resolution"), dict) else {}
+            action_payload = dict(action_meta.get("payload") or {}) if isinstance(action_meta.get("payload"), dict) else {}
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+            selected_doc_id = int(selected_entry.get("doc_id") or 0) if isinstance(selected_entry, dict) else 0
+
+            if selected_doc_id <= 0:
+                resolution = self._resolve_document_reference(response_text)
+                if str(resolution.get("status") or "") != "resolved":
+                    clarification_question = self._build_document_clause_clarification_question(
+                        str(resolution.get("input") or response_text).strip(),
+                        "ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found",
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code="ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found",
+                        clarification_question=clarification_question,
+                        expected_input_type="document_scope",
+                        ambiguity_summary={
+                            "action": action_name,
+                            "document_input": str(resolution.get("input") or response_text).strip(),
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "workflow_action_retrieve_document_file",
+                            "action_name": action_name,
+                            "retrieve_action_resolution": {
+                                "payload": action_payload,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"action": action_name},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": "ambiguous_document" if str(resolution.get("status") or "") == "ambiguous" else "document_not_found",
+                        "expected_input_type": "document_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "workflow_action_retrieve_document_file"},
+                    }
+                selected_doc_id = int(resolution.get("doc_id") or 0)
+
+            resolved_payload = dict(action_payload)
+            resolved_payload["doc_id"] = selected_doc_id
+            action_result = self.perform_action(action_name, resolved_payload)
+            if str(action_result.get("status") or "") == "pending_clarification":
+                return action_result
+
+            final_answer = str(action_result.get("message") or "").strip() or "Workflow action completed."
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="workflow_action",
+                ambiguity_flag=False,
+                linked_doc_ids=[selected_doc_id],
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "workflow_action",
+                "grounding": action_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "workflow_action_task_reference":
+            action_name = str(thread_metadata.get("action_name") or "assign_task")
+            action_meta = thread_metadata.get("task_action_resolution") if isinstance(thread_metadata.get("task_action_resolution"), dict) else {}
+            action_payload = dict(action_meta.get("payload") or {}) if isinstance(action_meta.get("payload"), dict) else {}
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+            selected_task_id = int(selected_entry.get("task_id") or 0) if isinstance(selected_entry, dict) else 0
+
+            if selected_task_id <= 0:
+                resolution = self._resolve_task_reference(response_text)
+                if str(resolution.get("status") or "") != "resolved":
+                    clarification_question = (
+                        f"I found multiple tasks matching '{str(resolution.get('input') or response_text).strip()}'. Please choose the exact task candidate."
+                        if str(resolution.get("status") or "") == "ambiguous"
+                        else f"I could not resolve task '{str(resolution.get('input') or response_text).strip()}'. Please provide the exact task id or task name."
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code="ambiguous_task" if str(resolution.get("status") or "") == "ambiguous" else "task_not_found",
+                        clarification_question=clarification_question,
+                        expected_input_type="task_scope",
+                        ambiguity_summary={
+                            "action": action_name,
+                            "task_input": str(resolution.get("input") or response_text).strip(),
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "workflow_action_task_reference",
+                            "action_name": action_name,
+                            "task_action_resolution": {
+                                "payload": action_payload,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"action": action_name},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": "ambiguous_task" if str(resolution.get("status") or "") == "ambiguous" else "task_not_found",
+                        "expected_input_type": "task_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "workflow_action_task_reference"},
+                    }
+                selected_task_id = int(resolution.get("task_id") or 0)
+
+            resolved_payload = dict(action_payload)
+            resolved_payload["task_id"] = selected_task_id
+            action_result = self.perform_action(action_name, resolved_payload)
+            if str(action_result.get("status") or "") == "pending_clarification":
+                return action_result
+
+            final_answer = str(action_result.get("message") or "").strip() or "Workflow action completed."
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="workflow_action",
+                ambiguity_flag=False,
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "workflow_action",
+                "grounding": action_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "workflow_action_create_task_reference":
+            action_name = str(thread_metadata.get("action_name") or "create_task")
+            action_meta = thread_metadata.get("create_task_action_resolution") if isinstance(thread_metadata.get("create_task_action_resolution"), dict) else {}
+            action_payload = dict(action_meta.get("payload") or {}) if isinstance(action_meta.get("payload"), dict) else {}
+            pending_field = str(action_meta.get("pending_field") or "project").strip().lower()
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+
+            selected_id = 0
+            if isinstance(selected_entry, dict):
+                if pending_field == "project":
+                    selected_id = int(selected_entry.get("project_id") or 0)
+                else:
+                    selected_id = int(selected_entry.get("object_id") or 0)
+
+            if selected_id <= 0:
+                if pending_field == "project":
+                    resolution = self._resolve_project_reference(response_text)
+                    resolved_status = str(resolution.get("status") or "")
+                    if resolved_status != "resolved":
+                        clarification_question = (
+                            f"I found multiple projects matching '{str(resolution.get('input') or response_text).strip()}'. Please choose the exact project candidate."
+                            if resolved_status == "ambiguous"
+                            else f"I could not resolve project '{str(resolution.get('input') or response_text).strip()}'. Please provide the exact project id, code, or name."
+                        )
+                        self._update_clarification_prompt(
+                            int(thread_id),
+                            reason_code="ambiguous_project" if resolved_status == "ambiguous" else "project_not_found",
+                            clarification_question=clarification_question,
+                            expected_input_type="project_scope",
+                            ambiguity_summary={
+                                "action": action_name,
+                                "pending_field": pending_field,
+                            },
+                            candidate_snapshot=list(resolution.get("candidates") or []),
+                            provenance_snapshot=[],
+                            metadata={
+                                "trigger": "workflow_action_create_task_reference",
+                                "action_name": action_name,
+                                "create_task_action_resolution": {
+                                    "payload": action_payload,
+                                    "pending_field": pending_field,
+                                },
+                            },
+                        )
+                        self._append_clarification_turn(
+                            thread_id=int(thread_id),
+                            role="assistant",
+                            message_text=clarification_question,
+                            source_type="clarification_prompt",
+                            answer_source="pending_clarification",
+                            ambiguity_flag=True,
+                            ambiguity_payload={"action": action_name, "pending_field": pending_field},
+                            candidate_snapshot=list(resolution.get("candidates") or []),
+                        )
+                        return {
+                            "status": "pending_clarification",
+                            "thread_id": int(thread_id),
+                            "clarification_question": clarification_question,
+                            "reason_code": "ambiguous_project" if resolved_status == "ambiguous" else "project_not_found",
+                            "expected_input_type": "project_scope",
+                            "candidates": list(resolution.get("candidates") or []),
+                            "provenance_snapshot": [],
+                            "grounding": {"trigger": "workflow_action_create_task_reference"},
+                        }
+                    selected_id = int(resolution.get("project_id") or 0)
+                else:
+                    resolution = self._resolve_merge_entity_reference(response_text)
+                    resolved_status = str(resolution.get("status") or "")
+                    if resolved_status != "resolved":
+                        clarification_question = (
+                            f"I found multiple assignees matching '{str(resolution.get('input') or response_text).strip()}'. Please choose the exact assignee candidate."
+                            if resolved_status == "ambiguous"
+                            else f"I could not resolve assignee '{str(resolution.get('input') or response_text).strip()}'. Please provide the exact assignee id or name."
+                        )
+                        self._update_clarification_prompt(
+                            int(thread_id),
+                            reason_code="ambiguous_assignee" if resolved_status == "ambiguous" else "assignee_not_found",
+                            clarification_question=clarification_question,
+                            expected_input_type="entity_scope",
+                            ambiguity_summary={
+                                "action": action_name,
+                                "pending_field": pending_field,
+                            },
+                            candidate_snapshot=list(resolution.get("candidates") or []),
+                            provenance_snapshot=[],
+                            metadata={
+                                "trigger": "workflow_action_create_task_reference",
+                                "action_name": action_name,
+                                "create_task_action_resolution": {
+                                    "payload": action_payload,
+                                    "pending_field": pending_field,
+                                },
+                            },
+                        )
+                        self._append_clarification_turn(
+                            thread_id=int(thread_id),
+                            role="assistant",
+                            message_text=clarification_question,
+                            source_type="clarification_prompt",
+                            answer_source="pending_clarification",
+                            ambiguity_flag=True,
+                            ambiguity_payload={"action": action_name, "pending_field": pending_field},
+                            candidate_snapshot=list(resolution.get("candidates") or []),
+                        )
+                        return {
+                            "status": "pending_clarification",
+                            "thread_id": int(thread_id),
+                            "clarification_question": clarification_question,
+                            "reason_code": "ambiguous_assignee" if resolved_status == "ambiguous" else "assignee_not_found",
+                            "expected_input_type": "entity_scope",
+                            "candidates": list(resolution.get("candidates") or []),
+                            "provenance_snapshot": [],
+                            "grounding": {"trigger": "workflow_action_create_task_reference"},
+                        }
+                    selected_id = int(resolution.get("object_id") or 0)
+
+            resolved_payload = dict(action_payload)
+            if pending_field == "project":
+                resolved_payload["project_id"] = selected_id
+            else:
+                resolved_payload["assigned_to"] = selected_id
+
+            action_result = self.perform_action(action_name, resolved_payload)
+            if str(action_result.get("status") or "") == "pending_clarification":
+                return action_result
+
+            final_answer = str(action_result.get("message") or "").strip() or "Workflow action completed."
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="workflow_action",
+                ambiguity_flag=False,
+                linked_object_ids=[selected_id] if pending_field == "assignee" and selected_id > 0 else [],
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "workflow_action",
+                "grounding": action_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "workflow_action_create_workflow_case_reference":
+            action_name = str(thread_metadata.get("action_name") or "create_workflow_case")
+            action_meta = thread_metadata.get("create_workflow_case_action_resolution") if isinstance(thread_metadata.get("create_workflow_case_action_resolution"), dict) else {}
+            action_payload = dict(action_meta.get("payload") or {}) if isinstance(action_meta.get("payload"), dict) else {}
+            pending_field = str(action_meta.get("pending_field") or "subject").strip().lower()
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+
+            selected_id = 0
+            if isinstance(selected_entry, dict):
+                selected_id = int(selected_entry.get("object_id") or selected_entry.get("entity_id") or 0)
+
+            if selected_id <= 0:
+                resolution = self._resolve_merge_entity_reference(response_text)
+                resolved_status = str(resolution.get("status") or "")
+                if resolved_status != "resolved":
+                    clarification_question = (
+                        f"I found multiple {pending_field}s matching '{str(resolution.get('input') or response_text).strip()}'. Please choose the exact {pending_field} candidate."
+                        if resolved_status == "ambiguous"
+                        else f"I could not resolve {pending_field} '{str(resolution.get('input') or response_text).strip()}'. Please provide the exact id or name."
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code="ambiguous_subject" if pending_field == "subject" and resolved_status == "ambiguous" else (
+                            "subject_not_found" if pending_field == "subject" else (
+                                "ambiguous_initiator" if resolved_status == "ambiguous" else "initiator_not_found"
+                            )
+                        ),
+                        clarification_question=clarification_question,
+                        expected_input_type="entity_scope",
+                        ambiguity_summary={
+                            "action": action_name,
+                            "pending_field": pending_field,
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "workflow_action_create_workflow_case_reference",
+                            "action_name": action_name,
+                            "create_workflow_case_action_resolution": {
+                                "payload": action_payload,
+                                "pending_field": pending_field,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"action": action_name, "pending_field": pending_field},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": "ambiguous_subject" if pending_field == "subject" and resolved_status == "ambiguous" else (
+                            "subject_not_found" if pending_field == "subject" else (
+                                "ambiguous_initiator" if resolved_status == "ambiguous" else "initiator_not_found"
+                            )
+                        ),
+                        "expected_input_type": "entity_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "workflow_action_create_workflow_case_reference"},
+                    }
+                selected_id = int(resolution.get("object_id") or resolution.get("entity_id") or 0)
+
+            resolved_payload = dict(action_payload)
+            if pending_field == "subject":
+                resolved_payload["subject_ref"] = selected_id
+            else:
+                resolved_payload["initiated_by_ref"] = selected_id
+
+            action_result = self.perform_action(action_name, resolved_payload)
+            if str(action_result.get("status") or "") == "pending_clarification":
+                return action_result
+
+            final_answer = str(action_result.get("message") or "").strip() or "Workflow action completed."
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="workflow_action",
+                ambiguity_flag=False,
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "workflow_action",
+                "grounding": action_result,
+            }
+
+        if str(thread_metadata.get("trigger") or "") == "workflow_action_record_approval_reference":
+            action_name = str(thread_metadata.get("action_name") or "record_approval")
+            action_meta = thread_metadata.get("record_approval_action_resolution") if isinstance(thread_metadata.get("record_approval_action_resolution"), dict) else {}
+            action_payload = dict(action_meta.get("payload") or {}) if isinstance(action_meta.get("payload"), dict) else {}
+            pending_field = str(action_meta.get("pending_field") or "case").strip().lower()
+            candidate_snapshot = list(thread.get("candidate_snapshot") or [])
+            selected_label = self._match_user_response_to_candidate(candidate_snapshot, response_text)
+            selected_entry = self._find_candidate_snapshot_entry(candidate_snapshot, selected_label) if selected_label else None
+
+            selected_id = 0
+            if isinstance(selected_entry, dict):
+                selected_id = int(selected_entry.get("case_ref") or selected_entry.get("object_id") or selected_entry.get("entity_id") or 0)
+
+            if selected_id <= 0:
+                if pending_field == "case":
+                    resolution = self._resolve_workflow_case_reference(response_text)
+                else:
+                    resolution = self._resolve_merge_entity_reference(response_text)
+                resolved_status = str(resolution.get("status") or "")
+                if resolved_status != "resolved":
+                    clarification_question = (
+                        f"I found multiple workflow cases matching '{str(resolution.get('input') or response_text).strip()}'. Please choose the exact case candidate."
+                        if pending_field == "case" and resolved_status == "ambiguous"
+                        else (
+                            f"I found multiple approvers matching '{str(resolution.get('input') or response_text).strip()}'. Please choose the exact approver candidate."
+                            if pending_field == "approver" and resolved_status == "ambiguous"
+                            else (
+                                f"I could not resolve workflow case '{str(resolution.get('input') or response_text).strip()}'. Please provide the exact case id or case no."
+                                if pending_field == "case"
+                                else f"I could not resolve approver '{str(resolution.get('input') or response_text).strip()}'. Please provide the exact approver id or name."
+                            )
+                        )
+                    )
+                    self._update_clarification_prompt(
+                        int(thread_id),
+                        reason_code=("ambiguous_case" if pending_field == "case" and resolved_status == "ambiguous" else ("case_not_found" if pending_field == "case" else ("ambiguous_approver" if resolved_status == "ambiguous" else "approver_not_found"))),
+                        clarification_question=clarification_question,
+                        expected_input_type="entity_scope",
+                        ambiguity_summary={
+                            "action": action_name,
+                            "pending_field": pending_field,
+                        },
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                        provenance_snapshot=[],
+                        metadata={
+                            "trigger": "workflow_action_record_approval_reference",
+                            "action_name": action_name,
+                            "record_approval_action_resolution": {
+                                "payload": action_payload,
+                                "pending_field": pending_field,
+                            },
+                        },
+                    )
+                    self._append_clarification_turn(
+                        thread_id=int(thread_id),
+                        role="assistant",
+                        message_text=clarification_question,
+                        source_type="clarification_prompt",
+                        answer_source="pending_clarification",
+                        ambiguity_flag=True,
+                        ambiguity_payload={"action": action_name, "pending_field": pending_field},
+                        candidate_snapshot=list(resolution.get("candidates") or []),
+                    )
+                    return {
+                        "status": "pending_clarification",
+                        "thread_id": int(thread_id),
+                        "clarification_question": clarification_question,
+                        "reason_code": ("ambiguous_case" if pending_field == "case" and resolved_status == "ambiguous" else ("case_not_found" if pending_field == "case" else ("ambiguous_approver" if resolved_status == "ambiguous" else "approver_not_found"))),
+                        "expected_input_type": "entity_scope",
+                        "candidates": list(resolution.get("candidates") or []),
+                        "provenance_snapshot": [],
+                        "grounding": {"trigger": "workflow_action_record_approval_reference"},
+                    }
+                if pending_field == "case":
+                    selected_id = int(resolution.get("case_ref") or 0)
+                else:
+                    selected_id = int(resolution.get("object_id") or 0)
+
+            resolved_payload = dict(action_payload)
+            if pending_field == "case":
+                resolved_payload["case_ref"] = selected_id
+            else:
+                resolved_payload["approver_ref"] = selected_id
+
+            action_result = self.perform_action(action_name, resolved_payload)
+            if str(action_result.get("status") or "") == "pending_clarification":
+                return action_result
+
+            final_answer = str(action_result.get("message") or "").strip() or "Workflow action completed."
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=final_answer,
+                source_type="clarification_resolution",
+                answer_source="workflow_action",
+                ambiguity_flag=False,
+            )
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": final_answer,
+                "answer_source": "workflow_action",
+                "grounding": action_result,
+            }
+
         original_query = str(thread.get("original_query") or "").strip()
         candidate_snapshot = list(thread.get("candidate_snapshot") or [])
         selected_candidate = self._match_user_response_to_candidate(candidate_snapshot, response_text)
@@ -1028,15 +3515,12 @@ class IDMSInteractionTools:
             parser_adapter = type("Parser", (object,), {"parse": staticmethod(solf_parser.parse_script)})()
             interpreter.set_parser(parser_adapter)
             interpreter.set_debug(False)
-            # Suppress verbose SOLF load logs during normal runtime.
+            # Keep first policy load fast: load bundled script synchronously,
+            # then hydrate runtime business-rule scripts asynchronously.
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                runtime_pre_scripts, runtime_post_scripts = business_rules.load_active_business_rule_solf_script_chunks(limit=300)
-                first_script = "\n\n".join(chunk for chunk in [*runtime_pre_scripts, str(solf_script or "").strip()] if chunk)
-                if first_script:
-                    interpreter.load_program_script(first_script, clear_existing=True)
-                runtime_post_script = "\n\n".join(chunk for chunk in runtime_post_scripts if chunk)
-                if runtime_post_script:
-                    interpreter.load_program_script(runtime_post_script, clear_existing=False)
+                base_script = str(solf_script or "").strip()
+                if base_script:
+                    interpreter.load_program_script(base_script, clear_existing=True)
             self.logger.info("Loaded SOLF policy script from %s", script_path)
             return interpreter
         except Exception:
@@ -1050,8 +3534,121 @@ class IDMSInteractionTools:
             "policy_clause": None,
         }
 
+    def _attach_solf_interpreter(self, interpreter: Any) -> None:
+        self.solf_interpreter = interpreter
+        if hasattr(self, "event_bus") and self.event_bus is not None:
+            self.event_bus.solf_interpreter = interpreter
+        if hasattr(self, "action_tool") and self.action_tool is not None:
+            self.action_tool.solf_interpreter = interpreter
+        if hasattr(self, "transition_executor") and self.transition_executor is not None:
+            self.transition_executor.solf_interpreter = interpreter
+        self._start_solf_runtime_rule_hydration()
+
+    def _start_solf_runtime_rule_hydration(self) -> None:
+        if self.solf_interpreter is None or self._solf_runtime_rules_loaded:
+            return
+
+        with self._solf_runtime_lock:
+            if self.solf_interpreter is None or self._solf_runtime_rules_loaded or self._solf_runtime_rules_in_progress:
+                return
+            self._solf_runtime_rules_in_progress = True
+
+        def _hydrate() -> None:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    runtime_pre_scripts, runtime_post_scripts = business_rules.load_active_business_rule_solf_script_chunks(limit=300)
+                    runtime_script = "\n\n".join(
+                        chunk
+                        for chunk in [*list(runtime_pre_scripts or []), *list(runtime_post_scripts or [])]
+                        if str(chunk or "").strip()
+                    )
+                    if runtime_script and self.solf_interpreter is not None:
+                        self.solf_interpreter.load_program_script(runtime_script, clear_existing=False)
+                self._solf_runtime_rules_loaded = True
+                self.logger.info("Hydrated runtime SOLF business-rule scripts")
+            except Exception:
+                self.logger.exception("Failed to hydrate runtime SOLF business-rule scripts")
+            finally:
+                self._solf_runtime_rules_in_progress = False
+
+        threading.Thread(target=_hydrate, name="solf_runtime_hydrator", daemon=True).start()
+
+    def _solf_loader_worker(self) -> None:
+        interpreter: Any = None
+        build_error: str | None = None
+        try:
+            interpreter = self._build_solf_policy_interpreter()
+        except Exception as exc:
+            build_error = str(exc)
+
+        with self._solf_init_lock:
+            self._solf_load_in_progress = False
+            self._solf_loader_thread = None
+            if interpreter is None:
+                self._solf_last_error = build_error or "build_returned_none"
+            else:
+                self._solf_last_error = None
+                self._attach_solf_interpreter(interpreter)
+                self.logger.info("SOLF policy interpreter loaded lazily")
+            self._solf_load_done_event.set()
+
+    def _ensure_solf_interpreter_loaded(self, force_retry: bool = False, wait_for_load: bool = True) -> bool:
+        if self.solf_interpreter is not None:
+            return True
+
+        if self._solf_load_in_progress:
+            if wait_for_load:
+                self._solf_load_done_event.wait(timeout=float(self._solf_load_timeout_seconds))
+                return self.solf_interpreter is not None
+            return False
+
+        now_ts = time.time()
+        if (
+            not force_retry
+            and self._solf_load_attempted
+            and self._solf_retry_cooldown_seconds > 0
+            and (now_ts - self._solf_last_attempt_ts) < self._solf_retry_cooldown_seconds
+        ):
+            return False
+
+        with self._solf_init_lock:
+            if self.solf_interpreter is not None:
+                return True
+            now_ts = time.time()
+            if (
+                not force_retry
+                and self._solf_load_attempted
+                and self._solf_retry_cooldown_seconds > 0
+                and (now_ts - self._solf_last_attempt_ts) < self._solf_retry_cooldown_seconds
+            ):
+                return False
+
+            self._solf_load_attempted = True
+            self._solf_last_attempt_ts = now_ts
+            try:
+                self._solf_load_in_progress = True
+                self._solf_load_done_event.clear()
+                self._solf_loader_thread = threading.Thread(
+                    target=self._solf_loader_worker,
+                    name="solf_loader",
+                    daemon=True,
+                )
+                self._solf_loader_thread.start()
+            except Exception as exc:
+                self._solf_last_error = str(exc)
+                self._solf_load_in_progress = False
+                self._solf_loader_thread = None
+                return False
+
+        if not wait_for_load:
+            return False
+        self._solf_load_done_event.wait(timeout=float(self._solf_load_timeout_seconds))
+        return self.solf_interpreter is not None
+
     def _invoke_solf_policy(self, clause_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self.solf_interpreter is None:
+            self._ensure_solf_interpreter_loaded(wait_for_load=False)
+        if self.solf_interpreter is None and not self._ensure_solf_interpreter_loaded(wait_for_load=True):
             return self._default_policy("solf_unavailable")
 
         try:
@@ -1072,6 +3669,119 @@ class IDMSInteractionTools:
         normalized["mode"] = mode
         normalized["policy_clause"] = clause_name
         return normalized
+
+    def _merge_workflow_payload(self, base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base or {})
+        for key, value in (patch or {}).items():
+            existing = merged.get(key)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                merged[key] = self._merge_workflow_payload(existing, value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _looks_like_file_query(self, question: str, parsed_payload: dict[str, Any] | None = None) -> bool:
+        text = str(question or "")
+        lowered = text.lower()
+        if re.search(r"\b(?:file|filename|path|full\s+path|document\s+path|document\s+file)\b", lowered):
+            return True
+        parsed = parsed_payload if isinstance(parsed_payload, dict) else {}
+        attr = str(parsed.get("attribute_name") or "").strip().lower()
+        return attr in {"document_filename", "document_full_path", "document_file_info"}
+
+    def _apply_workflow_rule_directives(
+        self,
+        *,
+        stage: str,
+        policy: dict[str, Any] | None,
+        question: str | None = None,
+        parsed_payload: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        policy_dict = policy if isinstance(policy, dict) else {}
+        directives_raw = policy_dict.get("workflow_directives")
+        if not isinstance(directives_raw, dict):
+            directives_raw = policy_dict.get("directives") if isinstance(policy_dict.get("directives"), dict) else {}
+        directives = dict(directives_raw or {})
+
+        out: dict[str, Any] = {
+            "parsed_payload": dict(parsed_payload or {}) if isinstance(parsed_payload, dict) else None,
+            "payload": dict(payload or {}) if isinstance(payload, dict) else None,
+            "applied": False,
+            "applied_rules": [],
+        }
+
+        if not directives:
+            return out
+
+        if out["payload"] is not None:
+            payload_set = directives.get("set_payload") if isinstance(directives.get("set_payload"), dict) else {}
+            if payload_set:
+                out["payload"] = dict(payload_set)
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:set_payload")
+
+            payload_merge = directives.get("merge_payload") if isinstance(directives.get("merge_payload"), dict) else {}
+            if payload_merge:
+                out["payload"] = self._merge_workflow_payload(out["payload"], payload_merge)
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:merge_payload")
+
+        if out["parsed_payload"] is not None:
+            parsed_set = directives.get("set_parsed") if isinstance(directives.get("set_parsed"), dict) else {}
+            if parsed_set:
+                out["parsed_payload"] = self._merge_workflow_payload(out["parsed_payload"], parsed_set)
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:set_parsed")
+
+            if str(directives.get("set_intent") or "").strip():
+                out["parsed_payload"]["intent"] = str(directives.get("set_intent") or "").strip()
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:set_intent")
+
+            if str(directives.get("set_entity_name") or "").strip():
+                out["parsed_payload"]["entity_name"] = str(directives.get("set_entity_name") or "").strip()
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:set_entity_name")
+
+            if str(directives.get("set_attribute_name") or "").strip():
+                out["parsed_payload"]["attribute_name"] = str(directives.get("set_attribute_name") or "").strip()
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:set_attribute_name")
+
+            if str(directives.get("set_relation_name") or "").strip():
+                out["parsed_payload"]["relation_name"] = str(directives.get("set_relation_name") or "").strip()
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:set_relation_name")
+
+            if isinstance(directives.get("set_attribute_names"), list):
+                out["parsed_payload"]["attribute_names"] = [
+                    str(item).strip()
+                    for item in list(directives.get("set_attribute_names") or [])
+                    if str(item).strip()
+                ]
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:set_attribute_names")
+
+            merge_criteria = directives.get("merge_criteria") if isinstance(directives.get("merge_criteria"), dict) else {}
+            if merge_criteria:
+                existing_criteria = out["parsed_payload"].get("criteria") if isinstance(out["parsed_payload"].get("criteria"), dict) else {}
+                out["parsed_payload"]["criteria"] = self._merge_workflow_payload(existing_criteria, merge_criteria)
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:merge_criteria")
+
+            require_full_path = bool(directives.get("require_full_path_for_file_queries"))
+            if require_full_path and self._looks_like_file_query(str(question or ""), out["parsed_payload"]):
+                out["parsed_payload"]["attribute_name"] = "document_file_info"
+                criteria = out["parsed_payload"].get("criteria") if isinstance(out["parsed_payload"].get("criteria"), dict) else {}
+                criteria = dict(criteria)
+                criteria["require_full_path"] = True
+                criteria["parse_method"] = str(criteria.get("parse_method") or "workflow_rule_directive")
+                out["parsed_payload"]["criteria"] = criteria
+                out["applied"] = True
+                out["applied_rules"].append(f"{stage}:require_full_path_for_file_queries")
+
+        return out
 
     def _harden_transition_policy(self, payload: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
         entity_type = str(payload.get("entity_type") or "").strip().lower()
@@ -1121,6 +3831,8 @@ class IDMSInteractionTools:
 
     def _invoke_solf_clause_raw(self, clause_name: str, call_args: list[Any]) -> Any:
         if self.solf_interpreter is None:
+            self._ensure_solf_interpreter_loaded(wait_for_load=False)
+        if self.solf_interpreter is None and not self._ensure_solf_interpreter_loaded(wait_for_load=True):
             return None
         try:
             return self.solf_interpreter._invoke_clause(clause_name, call_args)
@@ -1159,7 +3871,7 @@ class IDMSInteractionTools:
                 "result": None,
             }
 
-        if self.solf_interpreter is None:
+        if not self._ensure_solf_interpreter_loaded():
             return {
                 "success": False,
                 "message": "SOLF interpreter unavailable",
@@ -1448,6 +4160,177 @@ class IDMSInteractionTools:
             "original_text": raw,
         }
 
+    def _is_dispatchable_solf_clause_name(self, clause_name: str) -> bool:
+        name = str(clause_name or "").strip().lower()
+        if not name:
+            return False
+        blocked_prefixes = (
+            "interaction_",
+            "query_style_",
+            "workflow_transition_",
+            "scheduler_command",
+            "event_",
+            "action_plan",
+            "sql_plan",
+            "compose_",
+            "can_",
+            "adk_",
+        )
+        blocked_suffixes = (
+            "_policy",
+            "_plan",
+            "_by_ref",
+        )
+        blocked_exact = {
+            "resolve_policy",
+            "entity_resolve_policy",
+            "person_resolve_policy",
+            "organization_resolve_policy",
+            "company_resolve_policy",
+            "run_regression_checks",
+            "reset_policy_maps",
+        }
+        if name in blocked_exact:
+            return False
+        if any(name.startswith(prefix) for prefix in blocked_prefixes):
+            return False
+        if any(name.endswith(suffix) for suffix in blocked_suffixes):
+            return False
+        return True
+
+    def _dispatchable_solf_clause_catalog(self) -> list[dict[str, Any]]:
+        if not self._ensure_solf_interpreter_loaded():
+            return []
+        clauses = getattr(self.solf_interpreter, "clauses", {}) if self.solf_interpreter is not None else {}
+        if not isinstance(clauses, dict):
+            return []
+
+        catalog: list[dict[str, Any]] = []
+        for raw_name, defs in clauses.items():
+            clause_name = str(raw_name or "").strip()
+            if not self._is_dispatchable_solf_clause_name(clause_name):
+                continue
+            clause_defs = defs if isinstance(defs, list) else [defs]
+            arities = sorted(
+                {
+                    len(item.get("args") or [])
+                    for item in clause_defs
+                    if isinstance(item, dict)
+                }
+            )
+            if not arities:
+                continue
+            tokens = [tok for tok in re.split(r"_+", clause_name.lower()) if tok]
+            catalog.append(
+                {
+                    "clause_name": clause_name,
+                    "tokens": tokens,
+                    "arities": arities,
+                }
+            )
+        return catalog
+
+    def _normalize_dispatch_text(self, text: str) -> str:
+        lowered = str(text or "").strip().lower()
+        lowered = re.sub(r"[^a-z0-9\s_\-]", " ", lowered)
+        lowered = lowered.replace("_", " ")
+        return re.sub(r"\s+", " ", lowered).strip()
+
+    def _extract_generic_clause_args(self, text: str, clause_name: str, arity: int) -> list[Any] | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        if arity == 0:
+            return []
+
+        quoted_matches = [a or b for a, b in re.findall(r'"([^"]+)"|\'([^\']+)\'', raw)]
+        if len(quoted_matches) >= arity:
+            return quoted_matches[:arity]
+
+        tokens = [tok for tok in re.split(r"_+", str(clause_name or "").strip().lower()) if tok]
+        if not tokens:
+            return None
+        verb = re.escape(tokens[0])
+        tail_tokens = [re.escape(tok) for tok in tokens[1:]]
+        optional_tail = rf"(?:\s+(?:{'|'.join(tail_tokens)}))?" if tail_tokens else ""
+
+        if arity == 1:
+            match = re.search(
+                rf"\b{verb}\b{optional_tail}\s+(.+?)(?:[?.!]|$)",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                candidate = str(match.group(1) or "").strip(" ,.;")
+                candidate = re.sub(r"\s+(?:together|please|now)$", "", candidate, flags=re.IGNORECASE).strip(" ,.;")
+                return [candidate] if candidate else None
+            return None
+
+        if arity == 2:
+            match = re.search(
+                rf"\b{verb}\b{optional_tail}\s+(.+?)\s+(?:and|with|into|to)\s+(.+?)(?:\s+(?:together|as\s+one))?(?:[?.!]|$)",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                left = str(match.group(1) or "").strip(" ,.;")
+                right = str(match.group(2) or "").strip(" ,.;")
+                if left and right:
+                    return [left, right]
+            return None
+
+        return None
+
+    def _score_generic_solf_clause_match(self, text: str, clause_entry: dict[str, Any]) -> tuple[float, list[Any] | None]:
+        normalized = self._normalize_dispatch_text(text)
+        words = set(re.findall(r"[a-z0-9]+", normalized))
+        tokens = [str(tok).strip().lower() for tok in list(clause_entry.get("tokens") or []) if str(tok).strip()]
+        if not tokens:
+            return 0.0, None
+
+        verb = tokens[0]
+        if verb not in words:
+            return 0.0, None
+
+        best_score = 0.0
+        best_args: list[Any] | None = None
+        overlap = len([tok for tok in tokens[1:] if tok in words])
+        for arity in list(clause_entry.get("arities") or []):
+            args = self._extract_generic_clause_args(text, str(clause_entry.get("clause_name") or ""), int(arity))
+            if args is None:
+                continue
+            score = 1.0 + (0.35 * overlap) + (0.25 * min(len(args), 3))
+            if best_args is None or score > best_score:
+                best_score = score
+                best_args = args
+
+        return best_score, best_args
+
+    def _resolve_solf_clause_request(self, text: str) -> dict[str, Any] | None:
+        explicit = self._extract_solf_clause_request(text)
+        if isinstance(explicit, dict):
+            explicit["dispatch_mode"] = "explicit"
+            return explicit
+
+        catalog = self._dispatchable_solf_clause_catalog()
+        best_request: dict[str, Any] | None = None
+        best_score = 0.0
+        for entry in catalog:
+            score, args = self._score_generic_solf_clause_match(text, entry)
+            if score < 1.2 or args is None:
+                continue
+            if score > best_score:
+                best_score = score
+                best_request = {
+                    "clause_name": str(entry.get("clause_name") or "").strip(),
+                    "payload": {},
+                    "args": args,
+                    "original_text": str(text or "").strip(),
+                    "dispatch_mode": "generic_nl",
+                    "dispatch_score": round(score, 4),
+                }
+        return best_request
+
     def _format_direct_solf_query_result(self, question: str, evaluated: dict[str, Any]) -> dict[str, Any]:
         success = bool(evaluated.get("success"))
         clause_name = str(evaluated.get("clause_name") or "").strip()
@@ -1480,14 +4363,9 @@ class IDMSInteractionTools:
                 cached["_cache_hit"] = True
                 return cached
 
-        clause_request = self._extract_solf_clause_request(question)
+        clause_request = self._resolve_solf_clause_request(question)
         if isinstance(clause_request, dict):
-            evaluated = self.evaluate_solf_clause(
-                clause_name=str(clause_request.get("clause_name") or ""),
-                payload=clause_request.get("payload") if isinstance(clause_request.get("payload"), dict) else {},
-                args=clause_request.get("args") if isinstance(clause_request.get("args"), list) else [],
-            )
-            result = self._format_direct_solf_query_result(question, evaluated)
+            result = self._dispatch_solf_clause_request(question, clause_request)
             if self.query_cache:
                 self.query_cache.put(question, result)
             return result
@@ -1610,23 +4488,22 @@ class IDMSInteractionTools:
         if not user_message:
             raise ValueError("user_message must not be empty")
 
-        clause_request = self._extract_solf_clause_request(user_message)
+        clause_request = self._resolve_solf_clause_request(user_message)
         if isinstance(clause_request, dict):
-            evaluated = self.evaluate_solf_clause(
-                clause_name=str(clause_request.get("clause_name") or ""),
-                payload=clause_request.get("payload") if isinstance(clause_request.get("payload"), dict) else {},
-                args=clause_request.get("args") if isinstance(clause_request.get("args"), list) else [],
-            )
-            query_like = self._format_direct_solf_query_result(user_message, evaluated)
+            query_like = self._dispatch_solf_clause_request(user_message, clause_request)
             assistant_text = str(query_like.get("answer") or "").strip()
             self.state.history.append({"role": "user", "content": user_message})
             self.state.history.append({"role": "assistant", "content": assistant_text})
             return {
                 "answer": assistant_text,
-                "answer_source": "solf_clause",
-                "answer_sources": ["solf_clause"],
+                "answer_source": str(query_like.get("source") or "solf_clause"),
+                "answer_sources": [str(query_like.get("source") or "solf_clause")],
                 "grounding": query_like,
-                "model": "deterministic_solf",
+                "model": "deterministic_solf" if str(query_like.get("source") or "") != "pending_clarification" else "deterministic_clarification",
+                "status": query_like.get("status"),
+                "thread_id": query_like.get("thread_id"),
+                "clarification_question": query_like.get("clarification_question"),
+                "candidates": query_like.get("candidates"),
             }
 
         query_result: dict[str, Any] | None = None
@@ -3700,6 +6577,174 @@ class IDMSInteractionTools:
             limit=20,
         )
 
+        # Criteria list questions can be under-filled when initial scope resolution is narrow.
+        # Retry once without scope constraints and prefer the richer grounded result.
+        parsed_intent = str(getattr(parsed, "intent", "") or "").strip().lower()
+        scoped_count = int((criteria_result or {}).get("count", 0) or 0) if isinstance(criteria_result, dict) else 0
+        if parsed_intent == "criteria_lookup" and scoped_count <= 1:
+            expanded_result = self.query_engine.search_by_criteria(
+                question=question,
+                parsed=parsed,
+                scope=None,
+                limit=20,
+            )
+            expanded_count = int((expanded_result or {}).get("count", 0) or 0) if isinstance(expanded_result, dict) else 0
+            if isinstance(expanded_result, dict) and expanded_count > scoped_count:
+                criteria_result = dict(expanded_result)
+                criteria_result["scope_retry"] = "unscoped"
+
+        # If lexical criteria remain too sparse, fall back to scoped document candidates
+        # already resolved for this query so list-style asks can surface the evidence bundle.
+        scoped_count = int((criteria_result or {}).get("count", 0) or 0) if isinstance(criteria_result, dict) else 0
+        scope_docs = list((scope or {}).get("documents") or []) if isinstance(scope, dict) else []
+        if parsed_intent == "criteria_lookup" and scoped_count <= 1 and len(scope_docs) > scoped_count:
+            parsed_criteria = parsed.criteria if isinstance(parsed.criteria, dict) else {}
+            must_contain = [
+                str(item).strip()
+                for item in list(parsed_criteria.get("must_contain") or [])
+                if str(item).strip()
+            ]
+            require_all_terms = bool(parsed_criteria.get("require_all_terms"))
+
+            # Build tolerant criteria terms (for example travelling -> travel)
+            # so scope fallback does not inject unrelated documents.
+            phrase_terms: list[str] = []
+            token_terms: list[str] = []
+            if must_contain:
+                try:
+                    phrase_terms, token_terms = self.query_engine._criteria_terms(must_contain)
+                except Exception:
+                    phrase_terms = [str(item).strip().lower() for item in must_contain if str(item).strip()]
+                    token_terms = list(phrase_terms)
+
+            def _term_candidates(term: str) -> list[str]:
+                base = str(term or "").strip().lower()
+                if not base:
+                    return []
+                normalized = self.query_engine._normalize_semantic_text(base)
+                candidates: set[str] = set(
+                    self.query_engine._semantic_token_variants(normalized) if hasattr(self.query_engine, "_semantic_token_variants") else [normalized]
+                )
+                if normalized.endswith("ing") and len(normalized) > 6:
+                    stem = normalized[:-3]
+                    candidates.add(stem)
+                    if stem.endswith("ll"):
+                        candidates.add(stem[:-1])
+                    if not stem.endswith("e"):
+                        candidates.add(stem + "e")
+                return [c for c in candidates if c]
+
+            def _scope_doc_match_terms(item: dict[str, Any]) -> list[str]:
+                if not must_contain:
+                    return []
+                blob_parts = [
+                    item.get("doc_name"),
+                    item.get("title"),
+                    item.get("doc_path"),
+                    item.get("file_path"),
+                    item.get("doc_key"),
+                    item.get("doc_desc"),
+                    item.get("summary"),
+                    item.get("keyword_text"),
+                ]
+                metadata = item.get("metadata")
+                if isinstance(metadata, dict):
+                    blob_parts.append(json.dumps(metadata, ensure_ascii=False))
+                haystack = self.query_engine._normalize_semantic_text(
+                    " ".join(str(part or "") for part in blob_parts)
+                )
+                matched: list[str] = []
+                for term in list(phrase_terms) + list(token_terms):
+                    candidates = _term_candidates(term)
+                    if any(candidate in haystack for candidate in candidates):
+                        matched.append(str(term))
+                # Dedupe while preserving order
+                deduped: list[str] = []
+                seen: set[str] = set()
+                for token in matched:
+                    lowered = token.lower()
+                    if lowered in seen:
+                        continue
+                    seen.add(lowered)
+                    deduped.append(token)
+                return deduped
+
+            scope_matches: list[dict[str, Any]] = []
+            seen_doc_ids: set[int] = set()
+            for item in scope_docs:
+                if not isinstance(item, dict):
+                    continue
+                doc_id = item.get("doc_id")
+                if not isinstance(doc_id, int) or doc_id in seen_doc_ids:
+                    continue
+                matched_terms = _scope_doc_match_terms(item)
+                if must_contain and not matched_terms:
+                    continue
+                if require_all_terms and must_contain:
+                    required = {
+                        self.query_engine._normalize_semantic_text(term)
+                        for term in must_contain
+                        if self.query_engine._normalize_semantic_text(term)
+                    }
+                    matched_norm = {
+                        self.query_engine._normalize_semantic_text(term)
+                        for term in matched_terms
+                        if self.query_engine._normalize_semantic_text(term)
+                    }
+                    if not required.issubset(matched_norm):
+                        continue
+                seen_doc_ids.add(doc_id)
+                label = str(item.get("doc_name") or item.get("title") or item.get("doc_path") or f"document_{doc_id}").strip()
+                scope_matches.append(
+                    {
+                        "object_id": None,
+                        "entity_name": label,
+                        "entity_type": "document",
+                        "doc_id": doc_id,
+                        "doc_name": item.get("doc_name") or label,
+                        "doc_path": item.get("doc_path") or item.get("file_path") or "",
+                        "doc_date": item.get("doc_date"),
+                        "matched_terms": (matched_terms[:4] if matched_terms else must_contain[:4]),
+                        "score": 0.5,
+                    }
+                )
+
+            # If lexical matching is too sparse but scope documents are already
+            # resolved for this query, preserve that evidence bundle instead of
+            # collapsing to a single sparse match.
+            if not scope_matches and scope_docs:
+                for item in scope_docs:
+                    if not isinstance(item, dict):
+                        continue
+                    doc_id = item.get("doc_id")
+                    if not isinstance(doc_id, int) or doc_id in seen_doc_ids:
+                        continue
+                    seen_doc_ids.add(doc_id)
+                    label = str(item.get("doc_name") or item.get("title") or item.get("doc_path") or f"document_{doc_id}").strip()
+                    scope_matches.append(
+                        {
+                            "object_id": None,
+                            "entity_name": label,
+                            "entity_type": "document",
+                            "doc_id": doc_id,
+                            "doc_name": item.get("doc_name") or label,
+                            "doc_path": item.get("doc_path") or item.get("file_path") or "",
+                            "doc_date": item.get("doc_date"),
+                            "matched_terms": must_contain[:4],
+                            "score": 0.4,
+                        }
+                    )
+
+            if scope_matches:
+                criteria_result = {
+                    "criteria": parsed_criteria,
+                    "time_window": parsed_criteria.get("time_window") if isinstance(parsed_criteria.get("time_window"), dict) else None,
+                    "count": len(scope_matches),
+                    "matches": scope_matches[:20],
+                    "source": "criteria_scope_docs",
+                    "scope_retry": "scope_documents",
+                }
+
         if (
             not criteria_result
             and str(getattr(parsed, "intent", "") or "").strip().lower() == "attribute_lookup"
@@ -3886,6 +6931,13 @@ class IDMSInteractionTools:
             guard_clause = str(semantic_plan.get("guard") or "").strip()
             if guard_clause:
                 guard_result = self._invoke_solf_policy(guard_clause, payload)
+                directive_out = self._apply_workflow_rule_directives(
+                    stage=guard_clause,
+                    policy=guard_result,
+                    payload=payload,
+                )
+                if isinstance(directive_out.get("payload"), dict):
+                    payload = dict(directive_out.get("payload") or {})
                 if str(guard_result.get("mode") or "allow").lower() == "deny":
                     return _respond({
                         "action": action,
@@ -3911,21 +6963,409 @@ class IDMSInteractionTools:
                         where_payload: dict[str, Any] = {}
                         if payload.get("doc_id") is not None:
                             where_payload["doc_id"] = int(payload.get("doc_id"))
-                        elif payload.get("doc_key"):
-                            where_payload["doc_key"] = str(payload.get("doc_key")).strip()
-                        elif payload.get("doc_name"):
-                            where_payload["doc_name"] = str(payload.get("doc_name")).strip()
                         else:
-                            return _respond({
-                                "action": action,
-                                "success": False,
-                                "message": "One of doc_id, doc_key, or doc_name is required.",
-                                "semantic_plan": semantic_plan,
-                                "sql_plan": sql_plan,
-                            })
+                            doc_hint = payload.get("doc_key") if payload.get("doc_key") else payload.get("doc_name")
+                            if doc_hint in (None, ""):
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "One of doc_id, doc_key, or doc_name is required.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            resolution = self._resolve_document_reference(doc_hint)
+                            if str(resolution.get("status") or "") != "resolved":
+                                return _respond(
+                                    self._create_retrieve_action_clarification(
+                                        action_name=action,
+                                        payload=payload,
+                                        resolution=resolution,
+                                    )
+                                )
+
+                            resolved_doc_id = int(resolution.get("doc_id") or 0)
+                            if resolved_doc_id <= 0:
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "Unable to resolve document reference for retrieve_document_file.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            payload = dict(payload)
+                            payload["doc_id"] = resolved_doc_id
+                            where_payload["doc_id"] = resolved_doc_id
                         sql_plan["operation"] = "select"
                         sql_plan["table"] = "document"
                         sql_plan["where"] = where_payload
+
+                    if action == "update_entity":
+                        entity_id_raw = payload.get("entity_id")
+                        natural_key_field = str(payload.get("natural_key_field") or "").strip().lower()
+                        natural_key_value = payload.get("natural_key_value")
+                        if (entity_id_raw in (None, "")) and natural_key_field in {"name", "object_name", "canonical_full_name"} and (natural_key_value not in (None, "")):
+                            resolution = self._resolve_merge_entity_reference(natural_key_value)
+                            if str(resolution.get("status") or "") != "resolved":
+                                return _respond(
+                                    self._create_update_action_clarification(
+                                        action_name=action,
+                                        payload=payload,
+                                        resolution=resolution,
+                                    )
+                                )
+
+                            resolved_object_id = int(resolution.get("object_id") or 0)
+                            field_name = str(payload.get("field") or "").strip()
+                            entity_type = str(payload.get("entity_type") or "").strip()
+                            if resolved_object_id <= 0 or not field_name or not entity_type:
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "Unable to resolve update_entity payload after entity disambiguation.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+
+                            payload = dict(payload)
+                            payload["entity_id"] = resolved_object_id
+                            sql_plan = {
+                                "operation": "update",
+                                "table": entity_type,
+                                "where": {"id": resolved_object_id},
+                                "values": {field_name: payload.get("new_value")},
+                                "returning": ["id"],
+                            }
+
+                    if action in {"assign_task", "close_task"}:
+                        task_id_raw = payload.get("task_id")
+                        if task_id_raw in (None, ""):
+                            task_hint = payload.get("task_name") if payload.get("task_name") else payload.get("task_title")
+                            if task_hint not in (None, ""):
+                                resolution = self._resolve_task_reference(task_hint)
+                                if str(resolution.get("status") or "") != "resolved":
+                                    return _respond(
+                                        self._create_task_action_clarification(
+                                            action_name=action,
+                                            payload=payload,
+                                            resolution=resolution,
+                                        )
+                                    )
+                                resolved_task_id = int(resolution.get("task_id") or 0)
+                                if resolved_task_id <= 0:
+                                    return _respond({
+                                        "action": action,
+                                        "success": False,
+                                        "message": f"Unable to resolve task reference for {action}.",
+                                        "semantic_plan": semantic_plan,
+                                        "sql_plan": sql_plan,
+                                    })
+                                payload = dict(payload)
+                                payload["task_id"] = resolved_task_id
+                                if action == "assign_task":
+                                    assigned_to = payload.get("assigned_to")
+                                    if assigned_to in (None, ""):
+                                        return _respond({
+                                            "action": action,
+                                            "success": False,
+                                            "message": "assigned_to is required for assign_task.",
+                                            "semantic_plan": semantic_plan,
+                                            "sql_plan": sql_plan,
+                                        })
+                                    sql_plan = {
+                                        "operation": "update",
+                                        "table": "project_tasks",
+                                        "where": {"id": resolved_task_id},
+                                        "values": {
+                                            "assigned_to": int(assigned_to),
+                                            "status": "in_progress",
+                                        },
+                                        "returning": ["id"],
+                                    }
+
+                    if action == "create_task":
+                        project_id_raw = payload.get("project_id")
+                        if project_id_raw in (None, ""):
+                            project_hint = payload.get("project_name") if payload.get("project_name") else payload.get("project_code")
+                            if project_hint in (None, ""):
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "project_id is required (or provide project_name/project_code).",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            project_resolution = self._resolve_project_reference(project_hint)
+                            if str(project_resolution.get("status") or "") != "resolved":
+                                return _respond(
+                                    self._create_create_task_action_clarification(
+                                        action_name=action,
+                                        payload=payload,
+                                        resolution=project_resolution,
+                                        pending_field="project",
+                                    )
+                                )
+                            resolved_project_id = int(project_resolution.get("project_id") or 0)
+                            if resolved_project_id <= 0:
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "Unable to resolve create_task project reference.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            payload = dict(payload)
+                            payload["project_id"] = resolved_project_id
+                        else:
+                            payload = dict(payload)
+                            payload["project_id"] = int(project_id_raw)
+
+                        assigned_to_raw = payload.get("assigned_to")
+                        if assigned_to_raw not in (None, ""):
+                            assigned_to_text = str(assigned_to_raw).strip()
+                            if re.fullmatch(r"\d+", assigned_to_text):
+                                payload["assigned_to"] = int(assigned_to_text)
+                            else:
+                                assignee_resolution = self._resolve_merge_entity_reference(assigned_to_text)
+                                if str(assignee_resolution.get("status") or "") != "resolved":
+                                    return _respond(
+                                        self._create_create_task_action_clarification(
+                                            action_name=action,
+                                            payload=payload,
+                                            resolution=assignee_resolution,
+                                            pending_field="assignee",
+                                        )
+                                    )
+                                resolved_assignee_id = int(assignee_resolution.get("object_id") or 0)
+                                if resolved_assignee_id <= 0:
+                                    return _respond({
+                                        "action": action,
+                                        "success": False,
+                                        "message": "Unable to resolve create_task assignee reference.",
+                                        "semantic_plan": semantic_plan,
+                                        "sql_plan": sql_plan,
+                                    })
+                                payload["assigned_to"] = resolved_assignee_id
+
+                        title = str(payload.get("title") or "").strip()
+                        if not title:
+                            return _respond({
+                                "action": action,
+                                "success": False,
+                                "message": "title is required for create_task.",
+                                "semantic_plan": semantic_plan,
+                                "sql_plan": sql_plan,
+                            })
+
+                        try:
+                            estimated_hours = float(payload.get("hours_estimate") or 0.0)
+                        except Exception:
+                            estimated_hours = 0.0
+
+                        sql_plan = {
+                            "operation": "insert",
+                            "table": "project_tasks",
+                            "values": {
+                                "project_id": int(payload.get("project_id")),
+                                "name": title,
+                                "estimated_hours": estimated_hours,
+                                "assigned_to": payload.get("assigned_to"),
+                                "status": "open",
+                            },
+                            "returning": ["id"],
+                        }
+
+                    if action == "create_workflow_case":
+                        subject_ref_raw = payload.get("subject_ref")
+                        if subject_ref_raw in (None, ""):
+                            subject_hint = payload.get("subject_name") if payload.get("subject_name") else payload.get("subject_title")
+                            if subject_hint in (None, ""):
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "subject_ref is required (or provide subject_name/subject_title).",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            subject_resolution = self._resolve_merge_entity_reference(subject_hint)
+                            if str(subject_resolution.get("status") or "") != "resolved":
+                                return _respond(
+                                    self._create_create_workflow_case_action_clarification(
+                                        action_name=action,
+                                        payload=payload,
+                                        resolution=subject_resolution,
+                                        pending_field="subject",
+                                    )
+                                )
+                            resolved_subject_ref = int(subject_resolution.get("object_id") or 0)
+                            if resolved_subject_ref <= 0:
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "Unable to resolve create_workflow_case subject reference.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            payload = dict(payload)
+                            payload["subject_ref"] = resolved_subject_ref
+                        else:
+                            payload = dict(payload)
+                            payload["subject_ref"] = int(subject_ref_raw)
+
+                        initiated_by_raw = payload.get("initiated_by_ref")
+                        if initiated_by_raw in (None, ""):
+                            initiator_hint = payload.get("initiated_by_name") if payload.get("initiated_by_name") else payload.get("initiated_by_title")
+                            if initiator_hint in (None, ""):
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "initiated_by_ref is required (or provide initiated_by_name/initiated_by_title).",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            initiator_resolution = self._resolve_merge_entity_reference(initiator_hint)
+                            if str(initiator_resolution.get("status") or "") != "resolved":
+                                return _respond(
+                                    self._create_create_workflow_case_action_clarification(
+                                        action_name=action,
+                                        payload=payload,
+                                        resolution=initiator_resolution,
+                                        pending_field="initiator",
+                                    )
+                                )
+                            resolved_initiator_ref = int(initiator_resolution.get("object_id") or 0)
+                            if resolved_initiator_ref <= 0:
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "Unable to resolve create_workflow_case initiator reference.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            payload["initiated_by_ref"] = resolved_initiator_ref
+                        else:
+                            payload["initiated_by_ref"] = int(initiated_by_raw)
+
+                        case_no = str(payload.get("case_no") or "").strip()
+                        case_type = str(payload.get("case_type") or "").strip()
+                        current_step = str(payload.get("current_step") or "").strip()
+                        status_value = str(payload.get("status") or "").strip()
+                        if not case_no or not case_type or not current_step or not status_value:
+                            return _respond({
+                                "action": action,
+                                "success": False,
+                                "message": "case_no, case_type, current_step, and status are required for create_workflow_case.",
+                                "semantic_plan": semantic_plan,
+                                "sql_plan": sql_plan,
+                            })
+
+                        sql_plan = {
+                            "operation": "insert",
+                            "table": "workflow_cases",
+                            "values": {
+                                "case_no": case_no,
+                                "case_type": case_type,
+                                "subject_ref": int(payload.get("subject_ref")),
+                                "initiated_by_ref": int(payload.get("initiated_by_ref")),
+                                "current_step": current_step,
+                                "sla_due_at": payload.get("sla_due_at"),
+                                "status": status_value,
+                            },
+                            "returning": ["id"],
+                        }
+
+                    if action == "record_approval":
+                        case_ref_raw = payload.get("case_ref")
+                        if case_ref_raw in (None, ""):
+                            case_hint = payload.get("case_no")
+                            if case_hint in (None, ""):
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "case_ref is required (or provide case_no).",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            case_resolution = self._resolve_workflow_case_reference(case_hint)
+                            if str(case_resolution.get("status") or "") != "resolved":
+                                return _respond(
+                                    self._create_record_approval_action_clarification(
+                                        action_name=action,
+                                        payload=payload,
+                                        resolution=case_resolution,
+                                        pending_field="case",
+                                    )
+                                )
+                            resolved_case_ref = int(case_resolution.get("case_ref") or 0)
+                            if resolved_case_ref <= 0:
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "Unable to resolve record_approval case reference.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            payload = dict(payload)
+                            payload["case_ref"] = resolved_case_ref
+                        else:
+                            payload = dict(payload)
+                            payload["case_ref"] = int(case_ref_raw)
+
+                        approver_raw = payload.get("approver_ref")
+                        if approver_raw in (None, ""):
+                            approver_hint = payload.get("approver_name") if payload.get("approver_name") else payload.get("approver_title")
+                            if approver_hint in (None, ""):
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "approver_ref is required (or provide approver_name/approver_title).",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            approver_resolution = self._resolve_merge_entity_reference(approver_hint)
+                            if str(approver_resolution.get("status") or "") != "resolved":
+                                return _respond(
+                                    self._create_record_approval_action_clarification(
+                                        action_name=action,
+                                        payload=payload,
+                                        resolution=approver_resolution,
+                                        pending_field="approver",
+                                    )
+                                )
+                            resolved_approver_ref = int(approver_resolution.get("object_id") or 0)
+                            if resolved_approver_ref <= 0:
+                                return _respond({
+                                    "action": action,
+                                    "success": False,
+                                    "message": "Unable to resolve record_approval approver reference.",
+                                    "semantic_plan": semantic_plan,
+                                    "sql_plan": sql_plan,
+                                })
+                            payload["approver_ref"] = resolved_approver_ref
+                        else:
+                            payload["approver_ref"] = int(approver_raw)
+
+                        decision = str(payload.get("decision") or "").strip()
+                        if not decision:
+                            return _respond({
+                                "action": action,
+                                "success": False,
+                                "message": "decision is required for record_approval.",
+                                "semantic_plan": semantic_plan,
+                                "sql_plan": sql_plan,
+                            })
+                        sql_plan = {
+                            "operation": "insert",
+                            "table": "approvals",
+                            "values": {
+                                "case_ref": int(payload.get("case_ref")),
+                                "approver_ref": int(payload.get("approver_ref")),
+                                "decision": decision,
+                                "decision_at": payload.get("decision_at"),
+                                "comment": payload.get("comment"),
+                                "escalation_level": int(payload.get("escalation_level") or 0),
+                            },
+                            "returning": ["id"],
+                        }
 
                     # validate_plan has multi-check semantics already implemented in ActionTool.
                     if action == "validate_plan":
@@ -4419,6 +7859,13 @@ class IDMSInteractionTools:
         plan = self._compose_scheduler_command(cmd, payload)
         if plan:
             policy = self._invoke_solf_policy("scheduler_command_policy", payload)
+            directive_out = self._apply_workflow_rule_directives(
+                stage="scheduler_command_policy",
+                policy=policy,
+                payload=payload,
+            )
+            if isinstance(directive_out.get("payload"), dict):
+                payload = dict(directive_out.get("payload") or {})
             if str(policy.get("mode") or "allow").lower() == "deny":
                 return {
                     "command": cmd,
@@ -4581,6 +8028,19 @@ class IDMSInteractionTools:
                 "metadata": metadata,
             }
             policy = self._invoke_solf_policy("workflow_transition_policy", policy_payload)
+            directive_out = self._apply_workflow_rule_directives(
+                stage="workflow_transition_policy",
+                policy=policy,
+                payload=policy_payload,
+            )
+            if isinstance(directive_out.get("payload"), dict):
+                policy_payload = dict(directive_out.get("payload") or {})
+                entity_type = str(policy_payload.get("entity_type") or entity_type).strip().lower()
+                entity_id = int(policy_payload.get("entity_id") or entity_id or 0)
+                to_state = str(policy_payload.get("to_state") or to_state).strip().lower()
+                event = str(policy_payload.get("event") or event).strip().lower()
+                actor_ref = str(policy_payload.get("actor_ref") or actor_ref).strip().lower()
+                metadata = policy_payload.get("metadata") if isinstance(policy_payload.get("metadata"), dict) else metadata
             policy = self._harden_transition_policy(policy_payload, policy)
             if str(policy.get("mode") or "allow").lower() == "deny":
                 return {
@@ -5100,22 +8560,17 @@ class IDMSInteractionTools:
         if not question:
             raise ValueError("question must not be empty")
 
-        clause_request = self._extract_solf_clause_request(question)
+        clause_request = self._resolve_solf_clause_request(question)
         if isinstance(clause_request, dict):
-            evaluated = self.evaluate_solf_clause(
-                clause_name=str(clause_request.get("clause_name") or ""),
-                payload=clause_request.get("payload") if isinstance(clause_request.get("payload"), dict) else {},
-                args=clause_request.get("args") if isinstance(clause_request.get("args"), list) else [],
-            )
-            query_like = self._format_direct_solf_query_result(question, evaluated)
+            query_like = self._dispatch_solf_clause_request(question, clause_request)
             answer_text = str(query_like.get("answer") or "").strip()
             if record_history:
                 self.state.history.append({"role": "user", "content": question})
                 self.state.history.append({"role": "assistant", "content": answer_text})
             return {
                 "answer": answer_text,
-                "answer_source": "solf_clause",
-                "answer_sources": ["solf_clause"],
+                "answer_source": str(query_like.get("source") or "solf_clause"),
+                "answer_sources": [str(query_like.get("source") or "solf_clause")],
                 "grounding": {
                     "parsed": {
                         "intent": "solf_clause",
@@ -5136,7 +8591,7 @@ class IDMSInteractionTools:
                     "attribute_result": None,
                     "criteria_result": None,
                     "direct_query_result": query_like,
-                    "solf_clause_result": evaluated,
+                    "solf_clause_result": query_like.get("data") if isinstance(query_like.get("data"), dict) else {},
                 },
                 "policy": {
                     "query": {"mode": "allow", "reason": "explicit_solf_predicate_request"},
@@ -5146,12 +8601,15 @@ class IDMSInteractionTools:
                 "trace": [
                     {
                         "step": -1,
-                        "tool": "evaluate_solf_clause",
-                        "clause_name": evaluated.get("clause_name"),
-                        "success": bool(evaluated.get("success")),
+                        "tool": "dispatch_solf_clause",
+                        "clause_name": query_like.get("clause_name"),
+                        "success": bool(query_like.get("success")),
+                        "source": str(query_like.get("source") or "solf_clause"),
                     }
                 ],
-                "model": "deterministic_solf",
+                "model": "deterministic_solf" if str(query_like.get("source") or "") != "pending_clarification" else "deterministic_clarification",
+                "status": query_like.get("status"),
+                "thread_id": query_like.get("thread_id"),
             }
 
         self.logger.info("Autonomous query started: max_steps=%s question=%s", max_steps, question)
@@ -5199,6 +8657,22 @@ class IDMSInteractionTools:
             "parsed": state["parsed"],
         }
         query_policy = self._invoke_solf_policy("interaction_query_policy", query_policy_payload)
+        directive_out = self._apply_workflow_rule_directives(
+            stage="interaction_query_policy",
+            policy=query_policy,
+            question=question,
+            parsed_payload=parsed_payload,
+        )
+        if isinstance(directive_out.get("parsed_payload"), dict):
+            parsed_payload = dict(directive_out.get("parsed_payload") or {})
+            parsed.intent = str(parsed_payload.get("intent") or parsed.intent or "").strip() or parsed.intent
+            parsed.entity_name = str(parsed_payload.get("entity_name") or parsed.entity_name or "").strip() or parsed.entity_name
+            parsed.attribute_name = str(parsed_payload.get("attribute_name") or parsed.attribute_name or "").strip() or parsed.attribute_name
+            parsed.relation_name = str(parsed_payload.get("relation_name") or parsed.relation_name or "").strip() or parsed.relation_name
+            if isinstance(parsed_payload.get("criteria"), dict):
+                parsed.criteria = dict(parsed_payload.get("criteria") or {})
+            if isinstance(parsed_payload.get("attribute_names"), list):
+                parsed.attribute_names = [str(item).strip() for item in list(parsed_payload.get("attribute_names") or []) if str(item).strip()]
         state["trace"].append(
             {
                 "step": -1,
@@ -5206,6 +8680,17 @@ class IDMSInteractionTools:
                 "result": query_policy,
             }
         )
+        if directive_out.get("applied"):
+            state["trace"].append(
+                {
+                    "step": -1,
+                    "policy": "workflow_rule_directives",
+                    "result": {
+                        "stage": "interaction_query_policy",
+                        "applied_rules": list(directive_out.get("applied_rules") or []),
+                    },
+                }
+            )
         state["trace"].append(
             {
                 "step": -1,
@@ -5471,12 +8956,20 @@ class IDMSInteractionTools:
 
             # Criteria-intent guardrail: run SQL criteria retrieval before semantic-only
             # discovery loops when the parser has already identified a list/filter ask.
-            if parsed_intent == "criteria_lookup" and not has_criteria_result and action in {"search_discovery", "resolve_scope"}:
+            if parsed_intent == "criteria_lookup" and not has_criteria_result and action in {"search_discovery"}:
                 action = "search_criteria"
                 decision["action"] = action
                 decision["rationale"] = (
                     "Parsed intent is criteria_lookup; prioritize criteria retrieval first "
                     "to avoid discovery-only drift on document/note list queries."
+                )
+
+            if parsed_intent == "criteria_lookup" and not has_criteria_result and action == "finalize":
+                action = "search_criteria"
+                decision["action"] = action
+                decision["rationale"] = (
+                    "Parsed intent is criteria_lookup and no criteria_result exists yet; "
+                    "run criteria retrieval before finalizing."
                 )
 
             if action == "resolve_scope" and self._scope_is_empty(state.get("scope")):
@@ -5497,7 +8990,8 @@ class IDMSInteractionTools:
             state["trace"].append({"step": step, "planner": decision})
 
             if action == "resolve_scope":
-                scope = self.query_engine.resolve_search_scope(question, limit=12)
+                scope_limit = 36 if parsed_intent == "criteria_lookup" else 12
+                scope = self.query_engine.resolve_search_scope(question, limit=scope_limit)
                 state["scope"] = {
                     "candidate_count": scope.get("candidate_count", 0),
                     "discovery_candidate_count": scope.get("discovery_candidate_count", 0),
@@ -5510,7 +9004,7 @@ class IDMSInteractionTools:
                     "discovery_results": (scope.get("discovery_results") or [])[:5],
                     "nodes": (scope.get("nodes") or scope.get("objects") or [])[:5],
                     "edges": (scope.get("edges") or scope.get("relationships") or [])[:5],
-                    "documents": (scope.get("documents") or [])[:5],
+                    "documents": (scope.get("documents") or [])[:36],
                 }
                 continue
 
@@ -5682,7 +9176,7 @@ class IDMSInteractionTools:
                                 "discovery_results": (scope.get("discovery_results") or [])[:5],
                                 "nodes": (scope.get("nodes") or scope.get("objects") or [])[:5],
                                 "edges": (scope.get("edges") or scope.get("relationships") or [])[:5],
-                                "documents": (scope.get("documents") or [])[:5],
+                                "documents": (scope.get("documents") or [])[:36],
                             }
                             state["trace"].append(
                                 {
@@ -6003,6 +9497,129 @@ def _parse_json_array(raw: str) -> list[Any]:
 
 def _parse_csv_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _extract_json_object_from_text(raw_text: str) -> dict[str, Any]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return {}
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # Fallback: extract first JSON object-looking segment from free text.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        segment = text[start : end + 1]
+        try:
+            parsed = json.loads(segment)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    return {}
+
+
+def _extract_domain_definition_json(payload: dict[str, Any]) -> dict[str, Any] | None:
+    data = payload if isinstance(payload, dict) else {}
+    text = str(data.get("text") or "")
+    candidates = [
+        data.get("definition"),
+        data.get("data"),
+        data.get("definition_json"),
+        data.get("json"),
+        data.get("payload"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return dict(candidate)
+        if isinstance(candidate, str):
+            parsed = _extract_json_object_from_text(candidate)
+            if parsed:
+                return parsed
+
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    if fenced:
+        parsed = _extract_json_object_from_text(fenced.group(1))
+        if parsed:
+            return parsed
+
+    parsed = _extract_json_object_from_text(text)
+    return parsed if parsed else None
+
+
+def _resolve_domain_definition_operation(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return ""
+
+    op_aliases = {
+        "create": ["create", "add", "insert", "new", "register"],
+        "update": ["update", "modify", "edit", "change", "replace", "set"],
+        "delete": ["delete", "remove", "drop", "deactivate"],
+        "list": ["list", "all", "browse", "overview"],
+        "read": ["get", "show", "read", "view", "find"],
+    }
+    for op_name, aliases in op_aliases.items():
+        if any(re.search(rf"\b{re.escape(alias)}\b", lowered) for alias in aliases):
+            return op_name
+    return ""
+
+
+def _resolve_domain_definition_type(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return ""
+
+    type_aliases = {
+        "account_definition": [
+            "account definition",
+            "account",
+            "coa",
+            "chart of accounts",
+            "chart_of_accounts",
+            "ledger account",
+            "gl account",
+            "konto",
+            "konten",
+        ],
+        "hr_department_definition": [
+            "department definition",
+            "department",
+            "hr department",
+            "dept",
+            "abteilung",
+        ],
+        "hr_role_definition": [
+            "role definition",
+            "role",
+            "job role",
+            "position",
+            "funktion",
+            "stelle",
+        ],
+    }
+    for definition_type, aliases in type_aliases.items():
+        if any(alias in lowered for alias in aliases):
+            return definition_type
+    return ""
+
+
+def _llm_extract_domain_definition_request(text: str, operation_hint: str = "", definition_type_hint: str = "") -> dict[str, Any]:
+    # Lightweight compatibility shim used by tests that assert helper availability.
+    return {
+        "operation": str(operation_hint or "").strip().lower(),
+        "definition_type": str(definition_type_hint or "").strip().lower(),
+        "definition": _extract_domain_definition_json({"text": text}) or {},
+        "confidence": 0.0,
+        "errors": [],
+    }
 
 
 def run_cli() -> int:

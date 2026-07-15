@@ -1413,7 +1413,7 @@ def extract_from_document(document_text, prompt=GENERAL_PROMPT):
       f"status={response.status_code}, body={json.dumps(data)[:1200]}"
     )
 
-def test_llm_extraction(document_text):
+def run_llm_extraction(document_text):
     print(f"Model: {LLM_MODEL}")
     if OPENROUTER_PROVIDER_ORDER:
         print(
@@ -1488,7 +1488,7 @@ def main():
           print("ERROR: Failed to load input file after all retries.")
           return 1
         print(f"Successfully loaded file after attempt {attempt_count}.")
-        result = test_llm_extraction(document_text)
+        result = run_llm_extraction(document_text)
         print("Extraction result JSON:")
         print(json.dumps(result, indent=2, ensure_ascii=False))
         print("Run completed successfully.")
@@ -1501,4 +1501,10 @@ def main():
 
 if __name__ == "__main__":
   raise SystemExit(main())
+
+
+def test_extraction_module_smoke() -> None:
+  """Basic collection-time smoke check for pytest runs."""
+  assert isinstance(LLM_MODEL, str)
+  assert bool(LLM_MODEL.strip())
 

@@ -480,7 +480,7 @@ def extract_from_document(document_text, prompt=GENERAL_PROMPT):
     # Parse JSON output
     return json.loads(content)
 
-def test_llm_extraction(document_text):
+def run_llm_extraction(document_text):
     print(f"Model: {LLM_MODEL}")
     startts = time.time()
     doc_type, score, results = classify_document_type(document_text)
@@ -902,5 +902,11 @@ if __name__ == "__main__":
     Invoice INV-2024-001 was issued by SIM International to ABC Consulting for USD 12,500.
     """
     doc = aphotonix_reg
-    result = test_llm_extraction(doc)
+    result = run_llm_extraction(doc)
     print(json.dumps(result, indent=2))
+
+
+def test_llm_module_smoke() -> None:
+    """Basic collection-time smoke check for pytest runs."""
+    assert isinstance(LLM_MODEL, str)
+    assert bool(LLM_MODEL.strip())

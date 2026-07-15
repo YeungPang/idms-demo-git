@@ -111,8 +111,95 @@ class TemplateReferenceGenerateRequest(BaseModel):
     output_format: str = Field(default="pdf", description="Requested output format")
     document_kind: str = Field(default="invoice", description="Document kind context (invoice, quotation, etc.)")
     payload: dict[str, Any] = Field(default_factory=dict, description="Context overrides for the generated document")
+    override_fields: list[str] = Field(
+        default_factory=list,
+        description="Optional allow-list of payload fields to overwrite (supports dot paths, e.g. recipient.address.city)",
+    )
     output_path: str = Field(default="", description="Optional full output file path")
     output_dir: str = Field(default="", description="Optional output directory; defaults to generated/docs")
+
+
+class InvoiceFromReferenceGenerateRequest(BaseModel):
+    reference_name: str = Field(..., description="Registered template reference name")
+    specification: str = Field(default="", description="Natural-language generation instruction")
+    output_format: str = Field(default="pdf", description="Requested output format")
+    document_kind: str = Field(default="invoice", description="Document kind context; defaults to invoice")
+    payload: dict[str, Any] = Field(default_factory=dict, description="Invoice payload overrides")
+    override_fields: list[str] = Field(
+        default_factory=list,
+        description="Optional allow-list of payload fields to overwrite (supports dot paths, e.g. recipient.address.city)",
+    )
+    qr_data: dict[str, Any] = Field(default_factory=dict, description="Optional QR payload overrides")
+    output_path: str = Field(default="", description="Optional full output file path")
+    output_dir: str = Field(default="", description="Optional output directory; defaults to generated/docs")
+    reference_mode: str = Field(
+        default="next_from_reference",
+        description=(
+            "Reference generation mode: next_from_reference, next_from_sequence, "
+            "prefix_and_sequence, explicit"
+        ),
+    )
+    current_reference: str = Field(
+        default="",
+        description="Current 27-digit reference used for next_from_reference mode",
+    )
+    current_sequence: int | None = Field(
+        default=None,
+        ge=0,
+        description="Current sequence used for next_from_sequence mode",
+    )
+    sequence_step: int = Field(
+        default=1,
+        ge=1,
+        description="Increment step for next_from_reference or next_from_sequence",
+    )
+    reference_prefix: str = Field(
+        default="",
+        description="Prefix digits used for prefix_and_sequence mode",
+    )
+    sequence_value: int | None = Field(
+        default=None,
+        ge=0,
+        description="Sequence value used for prefix_and_sequence mode",
+    )
+    persist_reference_state: bool = Field(
+        default=True,
+        description="When true, reserve next reference atomically in DB-backed state.",
+    )
+
+
+class SwissReferenceValidateRequest(BaseModel):
+    reference: str = Field(..., description="Swiss QRR reference string (27 digits, spaces allowed)")
+
+
+class InvoiceFromInstructionGenerateRequest(BaseModel):
+    instruction_text: str = Field(
+        ...,
+        description="Natural-language instruction used to generate runtime SOLF artifacts.",
+    )
+    invoice_request: InvoiceFromReferenceGenerateRequest = Field(
+        ...,
+        description="Invoice generation request executed after SOLF generation.",
+    )
+    persist_generated_solf: bool = Field(
+        default=True,
+        description="Persist generated SOLF artifacts for reuse.",
+    )
+    reuse_existing_solf_rule: bool = Field(
+        default=True,
+        description="When true, reuse an active existing SOLF business rule if matched instead of regenerating.",
+    )
+    existing_rule_name: str = Field(
+        default="",
+        description="Optional explicit active business rule name to reuse.",
+    )
+    solf_created_by: str = Field(default="api:user", description="Creator label for persisted SOLF artifacts")
+    solf_is_active: bool = Field(default=True, description="Whether generated SOLF artifacts are active")
+    solf_default_clause_type: str = Field(
+        default="resolve_policy",
+        description="Default clause type used when persisting generated SOLF clauses",
+    )
+    temperature: float = Field(default=0.0, ge=0.0, le=1.0, description="Generation temperature for runtime SOLF creation")
 
 
 class SalesPipelineGenerateRequest(BaseModel):

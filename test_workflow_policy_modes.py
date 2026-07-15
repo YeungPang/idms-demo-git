@@ -63,3 +63,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_workflow_policy_modes_module_smoke() -> None:
+    assert callable(run_test)

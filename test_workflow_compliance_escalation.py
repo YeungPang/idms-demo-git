@@ -119,3 +119,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_workflow_compliance_escalation_module_smoke() -> None:
+    assert callable(run_test)
+    assert callable(_query_assertions)

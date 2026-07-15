@@ -1801,6 +1801,91 @@ def _parse_note_injections(description: str) -> dict[str, Any]:
     return injections
 
 
+_INGEST_DIRECTIVE_PATTERNS: tuple[str, ...] = (
+    r"\brules?\s*:\s*[^\n\r]+",
+    r"\brule_names?\s*:\s*[^\n\r]+",
+    r"\binject\s*:\s*[^\n\r]+",
+    r"\binject\s+[^\n\r]+",
+    r"\baction\s*:\s*[^\n\r]+",
+    r"\bworkflow\s+process(?:es)?\s*:\s*[^\n\r]+",
+    r"\bprocess(?:es)?\s*:\s*[^\n\r]+",
+)
+
+
+def _strip_ingestion_directive_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+
+    stripped = cleaned
+    for pattern in _INGEST_DIRECTIVE_PATTERNS:
+        stripped = re.sub(pattern, " ", stripped, flags=re.IGNORECASE)
+
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ;,.-")
+    return stripped
+
+
+def _is_directive_only_text(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    return not bool(_strip_ingestion_directive_text(raw))
+
+
+def _load_semantic_markdown_excerpt(metadata: dict[str, Any], max_chars: int = 700) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+
+    user_metadata = metadata.get("user_metadata") if isinstance(metadata.get("user_metadata"), dict) else {}
+    source_reference = user_metadata.get("source_reference") if isinstance(user_metadata.get("source_reference"), dict) else {}
+
+    candidate_paths = [
+        str(source_reference.get("markdown_cache_path") or "").strip(),
+        str(user_metadata.get("markdown_path") or "").strip(),
+        str(metadata.get("markdown_path") or "").strip(),
+    ]
+
+    seen_paths: set[str] = set()
+    for raw_path in candidate_paths:
+        if not raw_path:
+            continue
+        norm_path = os.path.normpath(raw_path)
+        if norm_path in seen_paths:
+            continue
+        seen_paths.add(norm_path)
+        if not os.path.exists(norm_path):
+            continue
+
+        try:
+            text = Path(norm_path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        lines: list[str] = []
+        for line in text.splitlines():
+            piece = str(line or "").strip()
+            if not piece:
+                continue
+            if piece.startswith("#"):
+                continue
+            if re.fullmatch(r"[|\-: ]+", piece):
+                continue
+            if any(re.search(pattern, piece, flags=re.IGNORECASE) for pattern in _INGEST_DIRECTIVE_PATTERNS):
+                continue
+            if len(piece) < 12:
+                continue
+            lines.append(piece)
+            if sum(len(item) for item in lines) >= max_chars:
+                break
+
+        excerpt = " ".join(lines)
+        excerpt = re.sub(r"\s+", " ", excerpt).strip()
+        if excerpt:
+            return excerpt[:max_chars]
+
+    return ""
+
+
 def _parse_note_action_requests(description: str) -> list[dict[str, Any]]:
     """Parse generic action declarations from note text.
 
@@ -3797,6 +3882,118 @@ def build_model_contents(source_path_or_uri: str, gcs_uri: str, prompt: str) -> 
     ]
 
 
+def _strip_json_fence(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    if not text.startswith("```"):
+        return text
+    if text.lower().startswith("```json"):
+        text = text[7:]
+    else:
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def _iter_json_candidates(raw_text: str) -> list[str]:
+    text = str(raw_text or "").strip()
+    candidates: list[str] = []
+    if text:
+        candidates.append(text)
+
+    stripped = _strip_json_fence(text)
+    if stripped and stripped not in candidates:
+        candidates.append(stripped)
+
+    for candidate in (text, stripped):
+        open_idx = candidate.find("{")
+        close_idx = candidate.rfind("}")
+        if open_idx != -1 and close_idx != -1 and close_idx > open_idx:
+            sliced = candidate[open_idx:close_idx + 1].strip()
+            if sliced and sliced not in candidates:
+                candidates.append(sliced)
+
+    return candidates
+
+
+def _autoclose_truncated_json_object(candidate: str) -> str | None:
+    text = str(candidate or "").strip()
+    if not text:
+        return None
+    first_brace = text.find("{")
+    if first_brace == -1:
+        return None
+    text = text[first_brace:]
+    if "```" in text:
+        text = text.split("```", 1)[0].strip()
+
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            stack.append("}")
+            continue
+        if ch == "[":
+            stack.append("]")
+            continue
+        if ch in {"}", "]"}:
+            if not stack or stack[-1] != ch:
+                return None
+            stack.pop()
+
+    repaired = text
+    if in_string:
+        last_quote = repaired.rfind('"')
+        if last_quote <= 0:
+            return None
+        repaired = repaired[:last_quote]
+
+    repaired = repaired.rstrip()
+    while repaired and repaired[-1] in {",", ":"}:
+        repaired = repaired[:-1].rstrip()
+
+    if not repaired or not repaired.startswith("{"):
+        return None
+    return repaired + "".join(reversed(stack))
+
+
+def _parse_json_object_best_effort(raw_text: str) -> dict[str, Any] | None:
+    for candidate in _iter_json_candidates(raw_text):
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            value = None
+        if isinstance(value, dict):
+            return value
+
+        repaired = _autoclose_truncated_json_object(candidate)
+        if not repaired:
+            continue
+        try:
+            repaired_value = json.loads(repaired)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(repaired_value, dict):
+            return repaired_value
+    return None
+
+
 def generate_json(
     client: Any,
     model: str,
@@ -3872,34 +4069,7 @@ def generate_json(
         raise RuntimeError("Model request failed before receiving a response")
 
     text = str(response.text or "{}").strip()
-    parsed: dict[str, Any] | None = None
-
-    parse_candidates = [text]
-    if text.startswith("```"):
-        fenced = text
-        if fenced.lower().startswith("```json"):
-            fenced = fenced[7:]
-        elif fenced.startswith("```"):
-            fenced = fenced[3:]
-        if fenced.endswith("```"):
-            fenced = fenced[:-3]
-        parse_candidates.append(fenced.strip())
-
-    open_idx = text.find("{")
-    close_idx = text.rfind("}")
-    if open_idx != -1 and close_idx != -1 and close_idx > open_idx:
-        parse_candidates.append(text[open_idx:close_idx + 1].strip())
-
-    for candidate in parse_candidates:
-        if not candidate:
-            continue
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            parsed = value
-            break
+    parsed = _parse_json_object_best_effort(text)
 
     if not isinstance(parsed, dict):
         # One best-effort JSON repair pass: ask the model to only fix formatting
@@ -3925,32 +4095,7 @@ def generate_json(
             )
             repaired_text = str(repair_response.text or "").strip()
 
-            repaired_candidates = [repaired_text]
-            if repaired_text.startswith("```"):
-                repaired_fenced = repaired_text
-                if repaired_fenced.lower().startswith("```json"):
-                    repaired_fenced = repaired_fenced[7:]
-                elif repaired_fenced.startswith("```"):
-                    repaired_fenced = repaired_fenced[3:]
-                if repaired_fenced.endswith("```"):
-                    repaired_fenced = repaired_fenced[:-3]
-                repaired_candidates.append(repaired_fenced.strip())
-
-            repaired_open = repaired_text.find("{")
-            repaired_close = repaired_text.rfind("}")
-            if repaired_open != -1 and repaired_close != -1 and repaired_close > repaired_open:
-                repaired_candidates.append(repaired_text[repaired_open:repaired_close + 1].strip())
-
-            for candidate in repaired_candidates:
-                if not candidate:
-                    continue
-                try:
-                    value = json.loads(candidate)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(value, dict):
-                    parsed = value
-                    break
+            parsed = _parse_json_object_best_effort(repaired_text)
         except Exception as repair_exc:
             LOGGER.warning(
                 "genai_json_repair_failed run_id=%s call=%s model=%s error=%s",
@@ -4759,7 +4904,8 @@ def insert_document_record(
     """
 
     keywords = document.get("keywords") if isinstance(document.get("keywords"), list) else []
-    user_description = str(metadata.get("user_description") or "").strip()
+    user_description_raw = str(metadata.get("user_description") or "").strip()
+    user_description = _strip_ingestion_directive_text(user_description_raw)
     user_tags = metadata.get("user_tags") if isinstance(metadata.get("user_tags"), list) else []
     client_file_name = str(user_metadata.get("client_file_name") or "").strip()
     client_file_path = str(user_metadata.get("client_file_path") or "").strip()
@@ -4773,9 +4919,16 @@ def insert_document_record(
         keyword_parts.append(str(document.get("doc_theme")))
     if str(document.get("doc_type") or "").strip():
         keyword_parts.append(str(document.get("doc_type")))
-    metadata_description = str(metadata.get("description") or "").strip()
+    metadata_description_raw = str(metadata.get("description") or "").strip()
+    metadata_description = _strip_ingestion_directive_text(metadata_description_raw)
+    semantic_markdown_excerpt = ""
+    if not user_description and not metadata_description:
+        semantic_markdown_excerpt = _load_semantic_markdown_excerpt(metadata)
+
     if metadata_description:
         keyword_parts.append(metadata_description)
+    if semantic_markdown_excerpt:
+        keyword_parts.append(semantic_markdown_excerpt)
     identifiers = document.get("identifiers") if isinstance(document.get("identifiers"), dict) else {}
     for key, value in identifiers.items():
         if str(key or "").strip():
@@ -4804,29 +4957,31 @@ def insert_document_record(
     if not fallback_name:
         fallback_name = Path(gcs_uri).name
     doc_name_value = client_file_name or fallback_name
-    doc_desc_value = user_description or str(metadata.get("description") or "").strip() or None
+    if user_description_raw and _is_directive_only_text(user_description_raw):
+        metadata["ingestion_directive_text"] = user_description_raw
+    if metadata_description_raw and _is_directive_only_text(metadata_description_raw):
+        metadata["ingestion_directive_description"] = metadata_description_raw
+
+    fallback_user_desc = user_description_raw if user_description_raw and not _is_directive_only_text(user_description_raw) else ""
+    fallback_metadata_desc = (
+        metadata_description_raw
+        if metadata_description_raw and not _is_directive_only_text(metadata_description_raw)
+        else ""
+    )
+
+    doc_desc_value = (
+        user_description
+        or metadata_description
+        or semantic_markdown_excerpt
+        or fallback_user_desc
+        or fallback_metadata_desc
+        or None
+    )
     doc_status = str(document.get("status") or "active").strip().lower() or "active"
     doc_valid_from = normalize_effective_date(
         document.get("valid_from") or document_effective_date or document.get("doc_date") or document_recorded_date
     )
     doc_valid_until = normalize_effective_date(document.get("valid_until"))
-
-    persistence_mode = detect_document_persistence_mode(
-        connection,
-        gcs_uri,
-        document,
-        document_effective_date=document_effective_date,
-        document_recorded_date=document_recorded_date,
-    )
-    if persistence_mode.get("persistence_action") == "update_existing":
-        LOGGER.warning(
-            "Document persistence collision detected; existing row will be updated doc_id=%s matched_by=%s match_value=%s new_doc_key=%s new_doc_name=%s",
-            persistence_mode.get("doc_id"),
-            persistence_mode.get("matched_by"),
-            persistence_mode.get("match_value"),
-            document.get("doc_key") or Path(gcs_uri).name,
-            client_file_name or Path(gcs_uri).name,
-        )
 
     with connection.cursor() as cursor:
         params = (
@@ -4851,6 +5006,14 @@ def insert_document_record(
             row = cursor.fetchone()
             if row is not None:
                 doc_id = int(row[0])
+                LOGGER.warning(
+                    "Document persistence collision detected; existing row will be updated doc_id=%s matched_by=%s match_value=%s new_doc_key=%s new_doc_name=%s",
+                    doc_id,
+                    "doc_path",
+                    document_path,
+                    document.get("doc_key") or Path(gcs_uri).name,
+                    client_file_name or Path(gcs_uri).name,
+                )
                 connection.commit()
                 return doc_id
 
@@ -4859,6 +5022,14 @@ def insert_document_record(
             row = cursor.fetchone()
             if row is not None:
                 doc_id = int(row[0])
+                LOGGER.warning(
+                    "Document persistence collision detected; existing row will be updated doc_id=%s matched_by=%s match_value=%s new_doc_key=%s new_doc_name=%s",
+                    doc_id,
+                    "source_identity",
+                    source_identity,
+                    document.get("doc_key") or Path(gcs_uri).name,
+                    client_file_name or Path(gcs_uri).name,
+                )
                 connection.commit()
                 return doc_id
 
@@ -6807,6 +6978,7 @@ def run_ingest(
     # Markdown tables have explicit header/row structure which gives the model better
     # column-to-attribute alignment than reading the raw PDF via GCS Part.
     extraction_source = source_path_or_uri
+    extraction_source_generated_markdown = False
     if prefer_markdown_input:
         existing_markdown_file = Path(existing_markdown_path) if existing_markdown_path else None
         if existing_markdown_file and existing_markdown_file.exists():
@@ -6849,6 +7021,7 @@ def run_ingest(
                     if generated_md:
                         generated_md_path.write_text(generated_md, encoding="utf-8")
                         extraction_source = str(generated_md_path)
+                        extraction_source_generated_markdown = True
                         LOGGER.info(
                             "prefer_markdown_input: generated markdown for extraction run_id=%s path=%s",
                             run_id,
@@ -7073,6 +7246,30 @@ def run_ingest(
             defaults.setdefault(key, value)
         return defaults
 
+    def _collect_selected_rule_reference_defaults(selected_rules: list[dict[str, Any]]) -> dict[str, Any]:
+        defaults: dict[str, Any] = {}
+        for rule in selected_rules:
+            if not isinstance(rule, dict):
+                continue
+            structured = rule.get("structured_rule") if isinstance(rule.get("structured_rule"), dict) else {}
+            directives = structured.get("post_extraction_directives") if isinstance(structured.get("post_extraction_directives"), list) else []
+            for directive in directives:
+                if not isinstance(directive, dict):
+                    continue
+                conditions = directive.get("conditions") if isinstance(directive.get("conditions"), list) else []
+                if conditions:
+                    continue
+                set_attrs = directive.get("set_attributes") if isinstance(directive.get("set_attributes"), dict) else {}
+                for key, value in set_attrs.items():
+                    attr_key = str(key or "").strip()
+                    if not attr_key.endswith("_ref"):
+                        continue
+                    text = str(value or "").strip()
+                    if not text or re.fullmatch(r"e\d+", text.lower()):
+                        continue
+                    defaults.setdefault(attr_key, value)
+        return defaults
+
     def _propagate_rule_reference_defaults(payload_after: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
         if not defaults:
             return payload_after
@@ -7114,20 +7311,68 @@ def run_ingest(
     )
 
     if selected_processing_rules and integrity_violations:
-        violation_preview = "; ".join(
-            str(item.get("type") or "unknown")
-            + ":"
-            + str(item.get("rule_name") or item.get("rule_id") or "")
-            for item in integrity_violations[:5]
+        blocking_violation_types = {"unresolved_reference_token", "selected_rule_not_applied"}
+        blocking_integrity_violations = [
+            item
+            for item in integrity_violations
             if isinstance(item, dict)
+            and str(item.get("type") or "").strip().lower() in blocking_violation_types
+        ]
+
+        if blocking_integrity_violations:
+            violation_preview = "; ".join(
+                str(item.get("type") or "unknown")
+                + ":"
+                + str(item.get("rule_name") or item.get("rule_id") or "")
+                for item in blocking_integrity_violations[:5]
+                if isinstance(item, dict)
+            )
+            raise RuntimeError(
+                "Selected processing rules failed integrity checks: "
+                + (violation_preview or "unknown violation")
+            )
+
+        _record_step(
+            "selected_rule_integrity_non_blocking",
+            violation_count=len(integrity_violations),
+            violation_types=sorted(
+                {
+                    str(item.get("type") or "unknown").strip().lower()
+                    for item in integrity_violations
+                    if isinstance(item, dict)
+                }
+            ),
         )
-        raise RuntimeError(
-            "Selected processing rules failed integrity checks: "
-            + (violation_preview or "unknown violation")
-        )
+
+    extracted_document = extracted.get("document") if isinstance(extracted.get("document"), dict) else {}
+    extracted_metadata = extracted_document.get("metadata") if isinstance(extracted_document.get("metadata"), dict) else {}
+    extracted_metadata = dict(extracted_metadata)
+    if normalized_user_context["metadata"]:
+        existing_user_metadata = extracted_metadata.get("user_metadata") if isinstance(extracted_metadata.get("user_metadata"), dict) else {}
+        merged_user_metadata = dict(existing_user_metadata)
+        merged_user_metadata.update(normalized_user_context["metadata"])
+        if existing_markdown_path:
+            merged_source_reference = merged_user_metadata.get("source_reference") if isinstance(merged_user_metadata.get("source_reference"), dict) else {}
+            merged_source_reference = dict(merged_source_reference)
+            merged_source_reference.setdefault("markdown_cache_path", str(existing_markdown_path))
+            merged_user_metadata["source_reference"] = merged_source_reference
+        extracted_metadata["user_metadata"] = merged_user_metadata
+        extracted_document["metadata"] = extracted_metadata
+        extracted["document"] = extracted_document
 
     extracted = apply_domain_action_policy(routed, extracted, class_defs)
     rule_reference_defaults = _collect_rule_reference_defaults(rule_effect_snapshot)
+    selected_rule_reference_defaults = _collect_selected_rule_reference_defaults(selected_processing_rules or [])
+    for key, value in selected_rule_reference_defaults.items():
+        rule_reference_defaults.setdefault(key, value)
+
+    if selected_rule_reference_defaults:
+        _record_step(
+            "selected_rule_reference_defaults",
+            keys=sorted(selected_rule_reference_defaults.keys()),
+            count=len(selected_rule_reference_defaults),
+        )
+
     extracted = _propagate_rule_reference_defaults(extracted, rule_reference_defaults)
     persistence_violations = _validate_rule_effect_snapshot(rule_effect_snapshot, extracted)
     if persistence_violations:
@@ -7227,7 +7472,7 @@ def run_ingest(
             _record_step("markdown_cache_reuse", cache_path=str(markdown_cache_path), skipped_generation=True)
         else:
             _record_step("markdown_generation", status="skipped", reason="skip_markdown_generation_enabled")
-    elif str(extraction_source).lower().endswith(".md"):
+    elif str(extraction_source).lower().endswith(".md") and not extraction_source_generated_markdown:
         extraction_md_path = Path(str(extraction_source))
         if extraction_md_path.exists():
             extraction_md_text = extraction_md_path.read_text(encoding="utf-8")
@@ -7294,7 +7539,7 @@ def run_ingest(
             parser_rule_override=markdown_rule_override,
         )
 
-    if not markdown_text.strip() and str(extraction_source).lower().endswith(".md"):
+    if not markdown_text.strip() and str(extraction_source).lower().endswith(".md") and not extraction_source_generated_markdown:
         extraction_md_path = Path(str(extraction_source))
         if extraction_md_path.exists():
             fallback_text = extraction_md_path.read_text(encoding="utf-8")

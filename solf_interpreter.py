@@ -1327,14 +1327,17 @@ class SOLFInterpreter:
                             tuple_elements.append(self._evaluate_child(element, clause, [1, 0, 1, element_idx]))
                         return SOLFReturnValue(tuple(tuple_elements))
                     else:
-                        # Single value return - evaluate it
-                        evaluated = self._evaluate_child(operand, clause, [1, 0])
+                        # Single value return - reuse the already-evaluated operand
+                        # when available so side-effecting function calls are not
+                        # executed twice under ↲(...).
+                        evaluated = evaluated_operands[0] if evaluated_operands else self._evaluate_child(operand, clause, [1, 0])
                         return SOLFReturnValue(evaluated)
                 else:
                     # Multiple operands - return as tuple
-                    tuple_elements = []
-                    for operand_idx, operand in enumerate(operands):
-                        tuple_elements.append(self._evaluate_child(operand, clause, [1, operand_idx]))
+                    tuple_elements = list(evaluated_operands) if evaluated_operands else []
+                    if not tuple_elements:
+                        for operand_idx, operand in enumerate(operands):
+                            tuple_elements.append(self._evaluate_child(operand, clause, [1, operand_idx]))
                     return SOLFReturnValue(tuple(tuple_elements))
             
             # Handle assignment operator

@@ -15,3 +15,7 @@ for i, pattern in enumerate(payment_term_patterns):
     if match:
         print(f"  Matched text: '{match.group()}'")
     print()
+
+
+def test_regex_module_smoke() -> None:
+    assert any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in payment_term_patterns)

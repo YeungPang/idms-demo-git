@@ -16,6 +16,12 @@ entity_ingest(_entity_payload) ⦃ingest(_entity_payload)⦄
 entity_update(_entity_payload) ⦃update(_entity_payload)⦄
 entity_delete(_entity_payload) ⦃delete(_entity_payload)⦄
 
+merge_entities(_entity_1, _entity_2) ⦃
+    (_id_1 ≔ get_entity_id(_entity_1)) ⋀
+    (_id_2 ≔ get_entity_id(_entity_2)) ⋀
+    ↲(merge(_id_1, _id_2))
+⦄
+
 resolve_policy(_entity_payload) ⦃
     ↲({
         threshold: 0.72,

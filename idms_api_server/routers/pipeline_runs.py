@@ -18,6 +18,8 @@ import json
 import logging
 import re
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -30,6 +32,7 @@ from workflow_pipeline_executor import WorkflowPipelineExecutor
 
 router = APIRouter(prefix="/api/pipeline-runs", tags=["pipeline-runs"])
 LOGGER = logging.getLogger("idms.api")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 _GENERATED_SCRIPT_TABLE_DDL = """
@@ -83,6 +86,37 @@ CREATE INDEX IF NOT EXISTS idx_wgps_audit_metadata_gin ON workflow_generated_pyt
 
 
 _SCRIPT_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{2,127}$")
+
+
+def _resolve_output_file_path(
+    *,
+    filename: str,
+    output_path: str = "",
+    output_dir: str = "",
+) -> Path:
+    requested_path = str(output_path or "").strip()
+    requested_dir = str(output_dir or "").strip()
+
+    if requested_path:
+        candidate = Path(requested_path)
+        if not candidate.is_absolute():
+            candidate = (PROJECT_ROOT / candidate).resolve()
+        return candidate
+
+    if requested_dir:
+        base_dir = Path(requested_dir)
+        if not base_dir.is_absolute():
+            base_dir = (PROJECT_ROOT / base_dir).resolve()
+    else:
+        base_dir = (PROJECT_ROOT / "generated" / "workflow-runs").resolve()
+
+    return base_dir / filename
+
+
+def _sanitize_output_filename(value: str) -> str:
+    base = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value or "").strip())
+    base = base.strip("._-")
+    return base or "workflow_run_output"
 
 
 def _ensure_generated_script_table(connection: Any) -> None:
@@ -238,6 +272,19 @@ class PipelineRunRerunExecuteRequest(BaseModel):
     dry_run: bool = Field(default=False, description="When true, return planned execution only")
 
 
+class PipelineRunOutputSaveRequest(BaseModel):
+    output_path: str = Field(default="", description="Optional explicit output file path")
+    output_dir: str = Field(default="", description="Optional output directory when output_path is omitted")
+    file_name: str | None = Field(default=None, description="Optional base file name (without extension)")
+    format: str = Field(default="json", description="Output format: json or txt")
+    payload_source: str = Field(
+        default="auto",
+        description="Payload source: auto, output_context, current_context, run",
+    )
+    include_steps: bool = Field(default=False, description="Include run steps in saved artifact")
+    pretty: bool = Field(default=True, description="Pretty-print JSON output")
+
+
 class GeneratedScriptUpsertRequest(BaseModel):
     script_key: str = Field(..., description="Stable script key used by workflow step config")
     script_name: str = Field(..., description="Human-readable script name")
@@ -295,6 +342,12 @@ def _get_executor() -> WorkflowPipelineExecutor:
     solf_interpreter = None
     try:
         tools = deps.get_tools()
+        ensure_loaded = getattr(tools, "_ensure_solf_interpreter_loaded", None)
+        if callable(ensure_loaded):
+            try:
+                ensure_loaded(wait_for_load=True)
+            except Exception:
+                LOGGER.exception("Failed to force-load SOLF interpreter for pipeline executor")
         solf_interpreter = getattr(tools, "solf_interpreter", None)
     except Exception:
         LOGGER.exception("Failed to obtain SOLF interpreter for pipeline executor")
@@ -433,6 +486,114 @@ def get_pipeline_run(run_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Pipeline run {run_id} not found")
 
     return {"success": True, "run": state}
+
+
+@router.post("/{run_id}/output/save", summary="Persist workflow run output to a file")
+def save_pipeline_run_output(run_id: int, request: PipelineRunOutputSaveRequest) -> dict[str, Any]:
+    executor = _get_executor()
+    try:
+        state = executor.get_run_state(run_id)
+    except Exception as exc:
+        LOGGER.exception("pipeline get_state failed run_id=%s", run_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"Pipeline run {run_id} not found")
+
+    source = str(request.payload_source or "auto").strip().lower()
+    if source not in {"auto", "output_context", "current_context", "run"}:
+        raise HTTPException(status_code=400, detail="payload_source must be one of auto, output_context, current_context, run")
+
+    output_context = state.get("output_context") if isinstance(state.get("output_context"), dict) else {}
+    current_context = state.get("current_context") if isinstance(state.get("current_context"), dict) else {}
+
+    resolved_source = source
+    if source == "auto":
+        if output_context:
+            payload = output_context
+            resolved_source = "output_context"
+        elif current_context:
+            payload = current_context
+            resolved_source = "current_context"
+        else:
+            payload = state
+            resolved_source = "run"
+    elif source == "output_context":
+        payload = output_context
+    elif source == "current_context":
+        payload = current_context
+    else:
+        payload = state
+
+    fmt = str(request.format or "json").strip().lower()
+    if fmt not in {"json", "txt"}:
+        raise HTTPException(status_code=400, detail="format must be json or txt")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_status = str(state.get("run_status") or "unknown").strip().lower() or "unknown"
+    file_base = request.file_name or f"workflow_run_{run_id}_{run_status}_{timestamp}"
+    safe_base = _sanitize_output_filename(file_base)
+    extension = ".json" if fmt == "json" else ".txt"
+    filename = f"{safe_base}{extension}"
+
+    envelope: dict[str, Any] = {
+        "saved_at_utc": timestamp,
+        "run_id": int(run_id),
+        "workflow_key": state.get("workflow_key"),
+        "workflow_version_id": state.get("workflow_version_id"),
+        "run_status": state.get("run_status"),
+        "payload_source": resolved_source,
+        "payload": payload,
+    }
+    if bool(request.include_steps):
+        envelope["steps"] = state.get("steps") if isinstance(state.get("steps"), list) else []
+
+    if fmt == "json":
+        content_text = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            indent=2 if bool(request.pretty) else None,
+            default=str,
+        )
+        media_type = "application/json"
+    else:
+        if isinstance(payload, str):
+            payload_text = payload
+        else:
+            payload_text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        lines = [
+            f"run_id: {run_id}",
+            f"workflow_key: {state.get('workflow_key')}",
+            f"workflow_version_id: {state.get('workflow_version_id')}",
+            f"run_status: {state.get('run_status')}",
+            f"payload_source: {resolved_source}",
+            "",
+            payload_text,
+        ]
+        content_text = "\n".join(lines)
+        media_type = "text/plain"
+
+    target = _resolve_output_file_path(
+        filename=filename,
+        output_path=request.output_path,
+        output_dir=request.output_dir,
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content_text, encoding="utf-8")
+
+    return {
+        "success": True,
+        "run_id": int(run_id),
+        "run_status": state.get("run_status"),
+        "workflow_key": state.get("workflow_key"),
+        "workflow_version_id": state.get("workflow_version_id"),
+        "format": fmt,
+        "media_type": media_type,
+        "payload_source": resolved_source,
+        "saved_path": str(target),
+        "size_bytes": len(content_text.encode("utf-8")),
+        "project_root": str(PROJECT_ROOT),
+    }
 
 
 @router.get("/{run_id}/documents", summary="List documents linked to a pipeline run")

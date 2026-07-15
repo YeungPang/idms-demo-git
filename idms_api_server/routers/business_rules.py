@@ -79,6 +79,16 @@ class WorkflowVersionPublishRequest(BaseModel):
     published_by: str | None = Field(default="api:user")
 
 
+class WorkflowVersionCreateRequest(BaseModel):
+    steps: list[dict[str, Any]] = Field(default_factory=list, description="Workflow steps for the new version")
+    graph_spec: dict[str, Any] = Field(default_factory=dict, description="Optional workflow graph specification")
+    input_contract: dict[str, Any] = Field(default_factory=dict, description="Optional input contract")
+    output_contract: dict[str, Any] = Field(default_factory=dict, description="Optional output contract")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Optional version metadata")
+    status: str = Field(default="draft", description="Version status: draft|review|published|deprecated|archived")
+    created_by: str | None = Field(default="api:user", description="Creator label")
+
+
 class WorkflowVersionRollbackRequest(BaseModel):
     target_version_id: int = Field(..., description="Version to roll back to")
     reason: str | None = Field(default=None, description="Reason for rollback")
@@ -265,7 +275,7 @@ def create_solf_script_rule(payload: SolfScriptRuleCreateRequest) -> dict[str, A
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.put("/{rule_id}/solf-script")
+@router.put("/{rule_id:int}/solf-script")
 def update_solf_script_rule(rule_id: int, payload: SolfScriptRuleUpdateRequest) -> dict[str, Any]:
     try:
         result = business_rules.update_business_rule_from_solf_script(
@@ -298,7 +308,7 @@ def list_business_rules(is_active: bool | None = None, limit: int = 200) -> dict
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/{rule_id}")
+@router.get("/{rule_id:int}")
 def get_business_rule(rule_id: int) -> dict[str, Any]:
     try:
         rule = business_rules.get_business_rule(rule_id=rule_id)
@@ -312,7 +322,7 @@ def get_business_rule(rule_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/{rule_id}/nl")
+@router.get("/{rule_id:int}/nl")
 def get_business_rule_nl_input(rule_id: int) -> dict[str, Any]:
     try:
         rule = business_rules.get_business_rule(rule_id=rule_id)
@@ -340,7 +350,7 @@ def get_business_rule_nl_input(rule_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.put("/{rule_id}")
+@router.put("/{rule_id:int}")
 def update_business_rule(rule_id: int, payload: BusinessRuleUpdateRequest) -> dict[str, Any]:
     try:
         result = business_rules.update_business_rule(
@@ -370,7 +380,7 @@ def update_business_rule(rule_id: int, payload: BusinessRuleUpdateRequest) -> di
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.delete("/{rule_id}")
+@router.delete("/{rule_id:int}")
 def deactivate_business_rule(rule_id: int, updated_by: str = "api:user") -> dict[str, Any]:
     try:
         updated = business_rules.deactivate_business_rule(rule_id=rule_id, updated_by=updated_by)
@@ -390,7 +400,7 @@ def deactivate_business_rule(rule_id: int, updated_by: str = "api:user") -> dict
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/{rule_id}/artifacts")
+@router.get("/{rule_id:int}/artifacts")
 def get_business_rule_artifacts(rule_id: int) -> dict[str, Any]:
     try:
         result = business_rules.get_business_rule_artifacts(rule_id=rule_id)
@@ -404,7 +414,7 @@ def get_business_rule_artifacts(rule_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/{rule_id}/activation")
+@router.post("/{rule_id:int}/activation")
 def set_business_rule_activation(rule_id: int, payload: BusinessRuleActivationRequest) -> dict[str, Any]:
     try:
         updated = business_rules.activate_business_rule(rule_id=rule_id, is_active=payload.is_active)
@@ -602,6 +612,22 @@ def list_workflow_registry_entries(
     except Exception as exc:
         LOGGER.exception("Failed to list workflow registry entries")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/workflow-registry/list")
+def list_workflow_registry_entries_explicit(
+    is_active: bool | None = None,
+    domain: str | None = None,
+    status: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Explicit list route that avoids collision with /{rule_id} legacy route ordering."""
+    return list_workflow_registry_entries(
+        is_active=is_active,
+        domain=domain,
+        status=status,
+        limit=limit,
+    )
 
 
 @router.get("/workflow-registry/{workflow_id}")
@@ -1146,7 +1172,57 @@ def set_workflow_registry_entry_activation(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/{rule_id}/workflow-registry/sync")
+@router.get("/workflow-registry/{workflow_id}/versions")
+def list_workflow_versions(
+    workflow_id: int,
+    is_active: bool | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    try:
+        result = business_rules.list_workflow_versions(
+            workflow_id=workflow_id,
+            is_active=is_active,
+            limit=limit,
+        )
+        if result == []:
+            workflow = business_rules.get_solf_workflow_registry_entry(workflow_id=workflow_id)
+            if workflow is None:
+                raise HTTPException(status_code=404, detail=f"workflow {workflow_id} not found")
+        return {"success": True, "count": len(result), "result": result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception("Failed to list workflow versions")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/workflow-registry/{workflow_id}/versions")
+def create_workflow_version(
+    workflow_id: int,
+    payload: WorkflowVersionCreateRequest,
+) -> dict[str, Any]:
+    try:
+        result = business_rules.create_workflow_version(
+            workflow_id=workflow_id,
+            steps=payload.steps,
+            graph_spec=payload.graph_spec,
+            input_contract=payload.input_contract,
+            output_contract=payload.output_contract,
+            metadata=payload.metadata,
+            status=payload.status,
+            created_by=payload.created_by,
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"workflow {workflow_id} not found")
+        return {"success": True, "result": result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception("Failed to create workflow version")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/{rule_id:int}/workflow-registry/sync")
 def sync_rule_workflow_registry(rule_id: int, payload: WorkflowRegistrySyncRequest) -> dict[str, Any]:
     try:
         result = business_rules.sync_business_rule_workflow_registry(
@@ -1207,7 +1283,7 @@ def export_workflow_descriptions_inline(payload: WorkflowDescriptionExportReques
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/{rule_id}/workflow-registry")
+@router.get("/{rule_id:int}/workflow-registry")
 def get_rule_workflow_registry(rule_id: int) -> dict[str, Any]:
     try:
         result = business_rules.get_business_rule_workflow_registry(rule_id=rule_id)

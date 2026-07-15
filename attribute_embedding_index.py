@@ -535,7 +535,7 @@ class AttributeEmbeddingIndex:
             return None
         try:
             from idms_config import QDRANT_URL, QDRANT_QUERY_API_KEY
-            return QdrantClient(url=QDRANT_URL, api_key=QDRANT_QUERY_API_KEY)
+            return QdrantClient(url=QDRANT_URL, api_key=QDRANT_QUERY_API_KEY, timeout=5.0)
         except Exception as e:
             self.logger.warning(f"Failed to create qdrant client: {e}")
             return None
@@ -998,6 +998,39 @@ class AttributeEmbeddingIndex:
         if not self.qdrant or not embedding:
             return []
 
+        base_url = str(os.getenv("QDRANT_URL") or "http://localhost:6333").rstrip("/")
+        api_key = str(os.getenv("QDRANT_QUERY_API_KEY") or os.getenv("QDRANT_API_KEY") or "").strip()
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["api-key"] = api_key
+
+        payload = {
+            "vector": embedding,
+            "limit": int(limit),
+            "with_payload": True,
+        }
+
+        # Prefer REST search first because it has an explicit timeout and avoids
+        # client-level hangs observed in query_points() under some local setups.
+        if requests is not None:
+            try:
+                response = requests.post(
+                    f"{base_url}/collections/{self.COLLECTION_NAME}/points/search",
+                    headers=headers,
+                    json=payload,
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    body = response.json() if response.content else {}
+                    result = body.get("result") if isinstance(body, dict) else None
+                    return list(result or [])
+            except Exception as exc:
+                self.logger.warning(
+                    "Qdrant REST search failed for collection '%s': %s; falling back to query_points",
+                    self.COLLECTION_NAME,
+                    exc,
+                )
+
         # qdrant_client >= 1.10 removed .search(); use query_points() with no "using"
         # parameter so it works with both named and unnamed (simple) vector collections.
         if hasattr(self.qdrant, "query_points"):
@@ -1017,24 +1050,12 @@ class AttributeEmbeddingIndex:
         if requests is None:
             return []
 
-        base_url = str(os.getenv("QDRANT_URL") or "http://localhost:6333").rstrip("/")
-        api_key = str(os.getenv("QDRANT_QUERY_API_KEY") or os.getenv("QDRANT_API_KEY") or "").strip()
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["api-key"] = api_key
-
-        payload = {
-            "vector": embedding,
-            "limit": int(limit),
-            "with_payload": True,
-        }
-
         try:
             response = requests.post(
                 f"{base_url}/collections/{self.COLLECTION_NAME}/points/search",
                 headers=headers,
                 json=payload,
-                timeout=12,
+                timeout=5,
             )
             if response.status_code != 200:
                 return []

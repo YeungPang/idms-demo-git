@@ -43,6 +43,11 @@ def run_monitoring_regression_suite() -> dict:
     }
 
 
+def test_workflow_monitoring_module_smoke() -> None:
+    assert callable(run_test)
+    assert callable(run_monitoring_regression_suite)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Regression test for workflow monitoring")
     parser.parse_args()

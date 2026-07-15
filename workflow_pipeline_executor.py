@@ -756,6 +756,51 @@ class WorkflowPipelineExecutor:
             LOGGER.exception("pipeline step error step_key=%s", step.get("step_key"))
             return _StepOutcome(success=False, error_message=str(exc))
 
+    def _load_clause_body_from_db(self, clause_name: str) -> str:
+        normalized = str(clause_name or "").strip()
+        if not normalized:
+            return ""
+
+        with self.db_connection_fn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT clause_body
+                    FROM solf_clauses
+                    WHERE clause_name = %s
+                      AND is_active = TRUE
+                    ORDER BY modified_at DESC, clause_id DESC
+                    LIMIT 1
+                    """,
+                    (normalized,),
+                )
+                row = cursor.fetchone()
+
+        return str(row[0] or "").strip() if row else ""
+
+    def _hydrate_clause_from_db(self, clause_name: str) -> bool:
+        clause_text = self._load_clause_body_from_db(clause_name)
+        if not clause_text:
+            return False
+
+        loader = getattr(self.solf_interpreter, "load_program_script", None)
+        if not callable(loader):
+            return False
+
+        try:
+            loader(clause_text, clear_existing=False)
+        except Exception:
+            LOGGER.exception("Failed to hydrate SOLF clause from DB clause_name=%s", clause_name)
+            return False
+
+        clause_lookup = getattr(self.solf_interpreter, "get_clause_definitions", None)
+        if callable(clause_lookup):
+            try:
+                return bool(clause_lookup(clause_name))
+            except Exception:
+                return False
+        return True
+
     def _execute_clause_step(
         self, step: dict[str, Any], context: dict[str, Any], config: dict[str, Any]
     ) -> _StepOutcome:
@@ -768,6 +813,35 @@ class WorkflowPipelineExecutor:
         clause_name = str(step.get("clause_name") or "").strip()
         if not clause_name:
             return _StepOutcome(success=False, error_message="clause step has no clause_name")
+
+        clause_lookup = getattr(self.solf_interpreter, "get_clause_definitions", None)
+        if callable(clause_lookup):
+            try:
+                loaded_defs = clause_lookup(clause_name)
+            except Exception:
+                loaded_defs = []
+            if not loaded_defs:
+                loaded_from_db = self._hydrate_clause_from_db(clause_name)
+                if loaded_from_db:
+                    try:
+                        loaded_defs = clause_lookup(clause_name)
+                    except Exception:
+                        loaded_defs = []
+
+            if not loaded_defs:
+                source = str(config.get("source") or "").strip().lower()
+                if source == "workflow_narrative":
+                    # Narrative fallback steps can exist before a concrete SOLF clause is authored.
+                    # Treat this as a successful no-op so the run can still persist output artifacts.
+                    return _StepOutcome(
+                        success=True,
+                        output={
+                            "workflow_execution_mode": "narrative_fallback",
+                            "workflow_step_status": "skipped_missing_clause",
+                            "missing_clause_name": clause_name,
+                            "workflow_narrative": str(config.get("narrative") or "").strip(),
+                        },
+                    )
 
         try:
             result = self.solf_interpreter._invoke_clause(clause_name, [context])
@@ -782,6 +856,11 @@ class WorkflowPipelineExecutor:
                     prompt=str(result.get("prompt") or result.get("interaction_prompt") or ""),
                     missing_data_desc=str(result.get("missing_data_desc") or ""),
                     required_doc_types=list(result.get("required_doc_types") or []),
+                )
+            if result.get("ok") is False:
+                return _StepOutcome(
+                    success=False,
+                    error_message=str(result.get("error") or f"SOLF clause '{clause_name}' returned ok=false"),
                 )
             return _StepOutcome(success=True, output=result)
 
