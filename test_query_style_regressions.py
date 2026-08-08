@@ -72,6 +72,37 @@ class _StructuredTableConnection:
         return self.cursor_stub
 
 
+class _BroadScopeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, _sql, _params):
+        return None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _BroadScopeConnection:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def cursor(self):
+        return _BroadScopeCursor(self._rows)
+
+
 class TestQueryEngineStyleRegression(unittest.TestCase):
     def _new_engine(self) -> QueryEngine:
         engine = QueryEngine.__new__(QueryEngine)
@@ -194,6 +225,383 @@ class TestQueryEngineStyleRegression(unittest.TestCase):
         self.assertIsInstance(parsed.criteria, dict)
         self.assertEqual(parsed.criteria.get("entity_type"), "employee")
         self.assertIn("backend", parsed.criteria.get("must_contain", []))
+
+    def test_contact_person_details_query_parsing(self):
+        engine = self._new_engine()
+        parsed = engine.parse_query("Show me the details of the contact persons of Carjan bv")
+
+        self.assertEqual(parsed.intent, "attribute_lookup")
+        self.assertEqual(parsed.entity_name, "Carjan bv")
+        self.assertEqual(parsed.attribute_name, "contact_person")
+        self.assertTrue((parsed.criteria or {}).get("broad_scope"))
+        self.assertEqual((parsed.criteria or {}).get("parse_method"), "contact_person_details_gate")
+
+    def test_contact_person_contact_detail_attributes_are_extracted(self):
+        engine = self._new_engine()
+        parsed = engine.parse_query("Show me the email and telephone number of the contact persons of Carjan bv")
+
+        self.assertEqual(parsed.intent, "attribute_lookup")
+        self.assertEqual(parsed.entity_name, "Carjan bv")
+        self.assertEqual(parsed.attribute_name, "contact_person")
+        self.assertEqual(parsed.relation_name, "contact_person")
+        self.assertEqual(parsed.attribute_names, ["email", "telephone"])
+        self.assertEqual((parsed.criteria or {}).get("parse_method"), "contact_person_details_gate")
+
+    def test_broad_relation_details_query_expands_related_attribute_hints(self):
+        engine = self._new_engine()
+        hints = engine._related_attribute_hints_from_text(
+            "Show me the details of the contact persons of Carjan bv",
+            "contact_person",
+        )
+
+        self.assertIn("email", hints)
+        self.assertTrue(any(item in hints for item in ["phone", "telephone"]))
+
+    def test_broad_scope_relationship_lookup_keeps_related_object_attributes(self):
+        engine = self._new_engine()
+        connection = _BroadScopeConnection([
+            ("Carjan bv", 42, "Mr. Jan Carjan", "Person", "contact_person_of", "", "", "", "", "", "", 0, "", ""),
+        ])
+        engine._related_object_attribute_map = lambda _conn, _ids, max_attrs_per_object=12: {
+            42: {"email": "jan@carjan.example", "phone": "+41 44 123 45 67", "city": "Zurich"}
+        }
+
+        result = engine._sql_generic_relationship_lookup(connection, "Carjan bv", "contact_person", broad_scope=True)
+
+        self.assertIsNotNone(result)
+        value = result.get("attribute_value")
+        self.assertIsInstance(value, list)
+        self.assertEqual(value[0].get("email"), "jan@carjan.example")
+        self.assertEqual(value[0].get("phone"), "+41 44 123 45 67")
+        self.assertEqual(value[0].get("city"), "Zurich")
+
+    def test_lookup_attribute_uses_relationship_context_for_related_contact_details(self):
+        engine = self._new_engine()
+        connection = _BroadScopeConnection([])
+        engine._get_connection = lambda: connection
+        engine._resolve_entity_name_for_lookup_details = lambda *_args, **_kwargs: None
+        engine.sql_exact_attribute_lookup = lambda *_args, **_kwargs: None
+        engine._lookup_related_attribute_via_relationship = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_in_structured_tables = lambda *_args, **_kwargs: None
+        engine._match_entity_relationship_name = lambda *_args, **_kwargs: None
+        engine.sql_fallback_from_ids = lambda *_args, **_kwargs: None
+        engine._sql_generic_relationship_lookup = lambda _conn, _entity_name, relationship_concept, broad_scope=False: {
+            "entity_name": "Carjan bv",
+            "attribute_name": relationship_concept,
+            "attribute_value": [{"name": "Mr. Jan Carjan", "email": "jan@carjan.example", "phone": "+41 44 123 45 67"}],
+            "relationship_concept": relationship_concept,
+        }
+
+        result = engine.lookup_attribute(
+            attribute_name="email",
+            entity_name="Carjan bv",
+            relation_name="contact_person",
+            criteria={"broad_scope": True},
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("attribute_name"), "email")
+        self.assertEqual(result.get("attribute_value"), "jan@carjan.example")
+
+    def test_answer_for_contact_person_multi_attribute_request_uses_explicit_attributes_only(self):
+        engine = self._new_engine()
+        parsed = ParsedQuery(
+            intent="attribute_lookup",
+            entity_name="Carjan bv",
+            attribute_name="contact_person",
+            relation_name="contact_person",
+            confidence=0.9,
+            language="en",
+            criteria={"parse_method": "contact_person_details_gate", "relationship_concept": "contact_person", "broad_scope": True},
+            attribute_names=["email", "telephone"],
+        )
+        engine.parse_query = lambda _question: parsed
+        engine._normalize_parsed_for_execution = lambda parsed_query, _question: parsed_query
+        engine._decompose_multi_question = lambda _question: []
+        engine._try_federated_sql_read = lambda _question: None
+        engine._try_fuel_station_invoice_answer = lambda _question: None
+        engine._try_accounting_travel_expense_total_answer = lambda _question, _parsed: None
+        engine._looks_like_travel_expense_total_question = lambda _question: False
+        engine._extract_table_cell_query = lambda *_args, **_kwargs: None
+        engine._build_match_telemetry = lambda *_args, **_kwargs: {}
+        engine._attribute_filters_from_criteria = lambda _criteria: []
+        engine._has_broad_attribute_scope_cue = lambda _question: True
+        engine._has_file_info_cue = lambda _question: False
+        engine.qdrant_candidates = lambda _question: []
+        engine.discovery_candidates = lambda _question: []
+        engine._unique_ints = lambda values: [item for item in values if item is not None]
+        engine._resolve_entity_name_for_lookup_details = lambda *_args, **_kwargs: None
+        engine._resolve_entity_name_for_lookup = lambda *_args, **_kwargs: "Carjan bv"
+        engine._is_full_profile_request = lambda _question: False
+        engine._is_value_document_context_question = lambda _question: False
+        engine._expand_query_attribute_candidates = lambda **_kwargs: ["phone", "contact_email"]
+        engine._related_attribute_hints_from_text = lambda _question, _relation_name: ["phone", "contact_email"]
+        engine._get_attribute_display_name = lambda attr_name, _language: attr_name
+        engine._repair_mojibake_value = lambda value: value
+        engine._format_attribute_value_for_answer = lambda value: str(value)
+        engine._try_learn_pattern = lambda *_args, **_kwargs: None
+        engine._derived_answer_from_pattern_matches = lambda *_args, **_kwargs: None
+        engine._derived_clause_diagnostics = lambda *_args, **_kwargs: None
+        engine._requires_contextual_value_resolution = lambda **_kwargs: False
+        engine._result_satisfies_attribute_filters = lambda *_args, **_kwargs: True
+        engine._get_connection = lambda: _BroadScopeConnection([])
+        engine.sql_exact_attribute_lookup = lambda *_args, **_kwargs: None
+        engine._lookup_related_attribute_via_relationship = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_in_structured_tables = lambda *_args, **_kwargs: None
+        engine._match_entity_relationship_name = lambda *_args, **_kwargs: None
+        engine.sql_fallback_from_ids = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_from_synchronized_source = lambda *_args, **_kwargs: None
+
+        def _lookup(attr_name, _entity_name, relation_name=None, criteria=None):
+            if attr_name == "email":
+                return {"entity_name": "Carjan bv", "attribute_name": "email", "attribute_value": "factuur@carjan.nl"}
+            if attr_name == "telephone":
+                return {"entity_name": "Carjan bv", "attribute_name": "telephone", "attribute_value": "+31 6 19675414"}
+            if attr_name == "phone":
+                return {"entity_name": "Carjan bv", "attribute_name": "phone", "attribute_value": "+31 6 19675414"}
+            if attr_name == "contact_email":
+                return {"entity_name": "Carjan bv", "attribute_name": "contact_email", "attribute_value": None}
+            return None
+
+        engine.lookup_attribute = _lookup
+
+        result = engine.answer("Show me the email and telephone number of the contact persons of Carjan bv")
+        answer_text = str(result.get("answer") or "")
+
+        self.assertIn("email", answer_text)
+        self.assertIn("telephone", answer_text)
+        self.assertNotIn("None found", answer_text)
+
+    def test_lookup_attribute_backtracks_across_alternative_relation_routes(self):
+        engine = self._new_engine()
+        connection = _BroadScopeConnection([])
+        engine._get_connection = lambda: connection
+        engine._resolve_entity_name_for_lookup_details = lambda *_args, **_kwargs: None
+        engine.sql_exact_attribute_lookup = lambda *_args, **_kwargs: None
+        engine._lookup_related_attribute_via_relationship = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_in_structured_tables = lambda *_args, **_kwargs: None
+        engine._match_entity_relationship_name = lambda *_args, **_kwargs: None
+        engine.sql_fallback_from_ids = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_from_synchronized_source = lambda *_args, **_kwargs: None
+
+        attempts = []
+
+        def _generic_lookup(_conn, _entity_name, relationship_concept, broad_scope=False):
+            attempts.append(relationship_concept)
+            if relationship_concept == "contact_person":
+                return None
+            if relationship_concept == "contact":
+                return {
+                    "entity_name": "Carjan bv",
+                    "attribute_name": "contact",
+                    "attribute_value": [{"name": "Mr. Jan Carjan", "email": "jan@carjan.example"}],
+                    "relationship_concept": relationship_concept,
+                }
+            return None
+
+        engine._sql_generic_relationship_lookup = _generic_lookup
+
+        result = engine.lookup_attribute(
+            attribute_name="email",
+            entity_name="Carjan bv",
+            relation_name="contact_person",
+            criteria={"broad_scope": True, "strict_relation_lookup": True},
+        )
+
+        self.assertEqual(attempts[:2], ["contact_person", "contact"])
+        self.assertEqual(result.get("attribute_value"), "jan@carjan.example")
+
+    def test_lookup_attribute_uses_synchronized_source_for_generic_relation_attribute(self):
+        engine = self._new_engine()
+        connection = _BroadScopeConnection([])
+        engine._get_connection = lambda: connection
+        engine._resolve_entity_name_for_lookup_details = lambda *_args, **_kwargs: None
+        engine.sql_exact_attribute_lookup = lambda *_args, **_kwargs: None
+        engine._lookup_related_attribute_via_relationship = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_in_structured_tables = lambda *_args, **_kwargs: None
+        engine._match_entity_relationship_name = lambda *_args, **_kwargs: None
+        engine.sql_fallback_from_ids = lambda *_args, **_kwargs: None
+
+        def _synchronized_lookup(_conn, _entity_name, attribute_name, relation_name=None):
+            if attribute_name == "city" and relation_name == "contact_person":
+                return {
+                    "entity_name": "Carjan bv",
+                    "attribute_name": "city",
+                    "attribute_value": "Zurich",
+                    "source": "synchronized_source",
+                }
+            return None
+
+        engine._lookup_attribute_from_synchronized_source = _synchronized_lookup
+        engine._sql_generic_relationship_lookup = lambda *_args, **_kwargs: None
+
+        result = engine.lookup_attribute(
+            attribute_name="city",
+            entity_name="Carjan bv",
+            relation_name="contact_person",
+            criteria={"broad_scope": True, "strict_relation_lookup": True},
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("attribute_value"), "Zurich")
+        self.assertEqual(result.get("source"), "synchronized_source")
+
+    def test_lookup_attribute_prefers_relationship_payload_for_contact_person_name(self):
+        engine = self._new_engine()
+        connection = _BroadScopeConnection([])
+        engine._get_connection = lambda: connection
+        engine._resolve_entity_name_for_lookup_details = lambda *_args, **_kwargs: None
+        engine.sql_exact_attribute_lookup = lambda *_args, **_kwargs: None
+        engine._lookup_related_attribute_via_relationship = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_in_structured_tables = lambda *_args, **_kwargs: None
+        engine._match_entity_relationship_name = lambda *_args, **_kwargs: None
+        engine.sql_fallback_from_ids = lambda *_args, **_kwargs: None
+
+        def _generic_lookup(_conn, _entity_name, relationship_concept, broad_scope=False):
+            if relationship_concept != "contact_person":
+                return None
+            return {
+                "entity_name": "Carjan bv",
+                "attribute_name": relationship_concept,
+                "attribute_value": [{"name": "Mr. Jan Carjan", "email": "jan@carjan.example", "phone": "+41 44 123 45 67"}],
+                "relationship_concept": relationship_concept,
+            }
+
+        def _synchronized_lookup(_conn, _entity_name, attribute_name, relation_name=None):
+            return {
+                "entity_name": "Carjan bv",
+                "attribute_name": attribute_name,
+                "attribute_value": "Carjan bv",
+                "source": "synchronized_source",
+            }
+
+        engine._sql_generic_relationship_lookup = _generic_lookup
+        engine._lookup_attribute_from_synchronized_source = _synchronized_lookup
+
+        result = engine.lookup_attribute(
+            attribute_name="contact_person",
+            entity_name="Carjan bv",
+            relation_name="contact_person",
+            criteria={"broad_scope": True, "strict_relation_lookup": True},
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("attribute_value"), "Mr. Jan Carjan")
+        self.assertNotEqual(result.get("attribute_value"), "Carjan bv")
+
+    def test_lookup_attribute_uses_relation_name_for_contact_person_email_and_telephone(self):
+        engine = self._new_engine()
+        connection = _BroadScopeConnection([])
+        engine._get_connection = lambda: connection
+        engine._resolve_entity_name_for_lookup_details = lambda *_args, **_kwargs: None
+        engine.sql_exact_attribute_lookup = lambda *_args, **_kwargs: None
+        engine._lookup_related_attribute_via_relationship = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_in_structured_tables = lambda *_args, **_kwargs: None
+        engine._match_entity_relationship_name = lambda *_args, **_kwargs: None
+        engine.sql_fallback_from_ids = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_from_synchronized_source = lambda *_args, **_kwargs: None
+
+        def _generic_lookup(_conn, _entity_name, relationship_concept, broad_scope=False):
+            if relationship_concept != "contact_person":
+                return None
+            return {
+                "entity_name": "Carjan bv",
+                "attribute_name": relationship_concept,
+                "attribute_value": [{"name": "Mr. Jan Carjan", "email": "jan@carjan.example", "phone": "+41 44 123 45 67"}],
+                "relationship_concept": relationship_concept,
+            }
+
+        engine._sql_generic_relationship_lookup = _generic_lookup
+
+        email_result = engine.lookup_attribute(
+            attribute_name="email",
+            entity_name="Carjan bv",
+            relation_name="contact_person",
+            criteria={"broad_scope": True},
+        )
+        telephone_result = engine.lookup_attribute(
+            attribute_name="telephone",
+            entity_name="Carjan bv",
+            relation_name="contact_person",
+            criteria={"broad_scope": True},
+        )
+
+        self.assertEqual(email_result.get("attribute_value"), "jan@carjan.example")
+        self.assertEqual(telephone_result.get("attribute_value"), "+41 44 123 45 67")
+
+    def test_lookup_attribute_falls_back_to_synchronized_source_mapping(self):
+        engine = self._new_engine()
+
+        class _FederatedSourceCursor:
+            def __init__(self):
+                self._rows = []
+                self._executed = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, sql, params):
+                self._executed.append((sql, params))
+                lowered = " ".join(str(sql or "").split()).lower()
+                if "from object_instance" in lowered and (
+                    "where lower(coalesce(object_name, ''))" in lowered
+                    or "where lower(object_name)" in lowered
+                ):
+                    self._rows = [(7, "Carjan bv", "company")]
+                elif "from source_entity_mapping" in lowered:
+                    self._rows = [
+                        (
+                            1,
+                            "public",
+                            "customer",
+                            "1001",
+                            "company",
+                            {"source_row": {"contact_name": "Mr. Jan Carjan", "telephone_no": "079 123 45 67"}},
+                            "row-hash",
+                            "source-name",
+                        )
+                    ]
+                else:
+                    self._rows = []
+
+            def fetchone(self):
+                return self._rows[0] if self._rows else None
+
+            def fetchall(self):
+                return list(self._rows)
+
+        class _FederatedSourceConnection:
+            def __init__(self):
+                self.cursor_stub = _FederatedSourceCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def cursor(self):
+                return self.cursor_stub
+
+        connection = _FederatedSourceConnection()
+        engine._get_connection = lambda: connection
+        engine._resolve_entity_name_for_lookup_details = lambda *_args, **_kwargs: None
+        engine.sql_exact_attribute_lookup = lambda *_args, **_kwargs: None
+        engine._sql_generic_relationship_lookup = lambda *_args, **_kwargs: None
+        engine._lookup_related_attribute_via_relationship = lambda *_args, **_kwargs: None
+        engine._lookup_attribute_in_structured_tables = lambda *_args, **_kwargs: None
+        engine._match_entity_relationship_name = lambda *_args, **_kwargs: None
+        engine.sql_fallback_from_ids = lambda *_args, **_kwargs: None
+
+        result = engine.lookup_attribute(attribute_name="telephone", entity_name="Carjan bv")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("attribute_name"), "telephone")
+        self.assertEqual(result.get("attribute_value"), "079 123 45 67")
+        self.assertEqual(result.get("source"), "synchronized_source")
 
     def test_generic_process_contact_query_parsing(self):
         engine = self._new_engine()

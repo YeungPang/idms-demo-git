@@ -64,8 +64,9 @@ organization_resolve_policy(_entity_payload) ⦃
         name_similarity_weight: 0.40,
         strong_match_score: 0.50,
         medium_match_score: 0.20,
-        strong_keys: [registration_no, vat_no, uid_che, mwst_no, tax_no],
-        medium_keys: [legal_name, address, country]
+        strong_keys: [registration_no, vat_no, uid_che, mwst_no, tax_no, customer_code],
+        medium_keys: [legal_name, address, country],
+        mandatory_existing_keys: [customer_code]
     })
 ⦄
 
@@ -79,8 +80,9 @@ company_resolve_policy(_entity_payload) ⦃
         name_similarity_weight: 0.42,
         strong_match_score: 0.55,
         medium_match_score: 0.20,
-        strong_keys: [registration_no, vat_no, uid_che, mwst_no, tax_no, eori_no],
-        medium_keys: [legal_name, address, country]
+        strong_keys: [registration_no, vat_no, uid_che, mwst_no, tax_no, eori_no, customer_code],
+        medium_keys: [legal_name, address, country],
+        mandatory_existing_keys: [customer_code]
     })
 ⦄
 

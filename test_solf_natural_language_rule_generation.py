@@ -130,6 +130,41 @@ class TestSolfNaturalLanguageRuleGeneration(unittest.TestCase):
         self.assertEqual(ingest_sim.get("class_definitions_preview_count"), 1)
         self.assertEqual((ingest_sim.get("class_definitions_preview") or [])[0].get("class_name"), "customs_declaration")
 
+    def test_generate_and_process_solf_from_inspection_persists_generated_rule(self):
+        payload = {
+            "rule_name": "inspection_policy",
+            "solf_script": "inspection_policy(_ctx) ⦃ ↲({ok: true}) ⦄",
+        }
+        fake_response = SimpleNamespace(text=json.dumps(payload, ensure_ascii=False))
+
+        with patch.object(business_rules, "_make_genai_client", return_value=MagicMock()):
+            with patch.object(
+                business_rules,
+                "generate_content_with_openrouter_fallback",
+                return_value=fake_response,
+            ):
+                with patch.object(
+                    business_rules,
+                    "process_solf_llm_generation_output",
+                    return_value={"persisted": True, "accepted": True},
+                ) as process_mock:
+                    result = business_rules.generate_and_process_solf_from_inspection(
+                        goal="derive a workflow rule from a web and db inspection",
+                        inspection_context={
+                            "web": [{"source": "https://example.com", "summary": "customer contact data"}],
+                            "internal_db": [{"table": "company", "observation": "contact person available"}],
+                            "external_db": [{"table": "vendor", "observation": "email is required"}],
+                        },
+                        persist=True,
+                        created_by="test",
+                    )
+
+        self.assertTrue(result["processed"]["persisted"])
+        self.assertEqual(result["goal"], "derive a workflow rule from a web and db inspection")
+        self.assertEqual(process_mock.call_args.kwargs["persist"], True)
+        self.assertEqual(process_mock.call_args.kwargs["created_by"], "test")
+        self.assertIn("inspection_context", result)
+
     def test_persisted_runtime_rule_is_loaded_by_ingest_interpreter(self):
         rule_text = (
             "For Swiss invoices, VAT number means registration number during ingest and query. "

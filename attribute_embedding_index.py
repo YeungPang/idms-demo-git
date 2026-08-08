@@ -188,16 +188,22 @@ class AttributeEmbeddingIndex:
         }
         return [variant for variant in variants if variant]
 
-    def __init__(self, embedding_model: str = "text-embedding-004", cluster_name: str = "default"):
+    def __init__(self, embedding_model: str | None = None, cluster_name: str = "default"):
         """
         Initialize embedding index.
 
         Args:
-            embedding_model: Google embedding model ID
+            embedding_model: OpenRouter embedding model ID
             cluster_name: Qdrant cluster identifier
         """
         self.logger = logging.getLogger("attribute_embedding_index")
-        self.embedding_model = embedding_model
+        resolved_embedding_model = str(
+            embedding_model
+            or os.getenv("IDMS_OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-large")
+        ).strip()
+        if not resolved_embedding_model:
+            resolved_embedding_model = "openai/text-embedding-3-large"
+        self.embedding_model = resolved_embedding_model
         self.genai_client = self._make_genai_client()
         self.generation_client = self._make_generation_client()
         self.qdrant = self._make_qdrant_client(cluster_name)
@@ -206,10 +212,26 @@ class AttributeEmbeddingIndex:
         # Guard: when True, blocks upsert/rebuild operations so a live query path
         # never triggers a bulk embedding job.
         self._query_context: bool = False
+        # Circuit breaker for repeated Qdrant 400 dimension mismatch failures.
+        self._vector_search_disabled: bool = False
+        self._vector_search_disable_reason: str = ""
+        self._vector_search_disable_logged: bool = False
+        self._embedding_dimension: int | None = None
         if self._seed_aliases_enabled():
             self._register_terms_for_lexical_match(self.KIND_ATTRIBUTE, self.CANONICAL_ATTRIBUTES)
         self._index_built = False
         self.refresh_ready_state()
+
+    def _disable_vector_search(self, reason: str) -> None:
+        self._vector_search_disabled = True
+        self._vector_search_disable_reason = str(reason or "vector_search_disabled").strip()
+        if not self._vector_search_disable_logged:
+            self.logger.warning(
+                "Disabling attribute embedding vector search for this process: %s. "
+                "Lexical/schema fallback remains active.",
+                self._vector_search_disable_reason,
+            )
+            self._vector_search_disable_logged = True
 
     @staticmethod
     def _seed_aliases_enabled() -> bool:
@@ -360,6 +382,85 @@ class AttributeEmbeddingIndex:
     def _make_generation_client(self):
         """Create OpenRouter-backed client for text generation."""
         return get_openrouter_client()
+
+    @staticmethod
+    def _extract_vector_size(vectors_cfg: Any, preferred_name: str = "dense") -> int | None:
+        """Best-effort extraction of vector size from Qdrant vectors config."""
+        if vectors_cfg is None:
+            return None
+
+        direct_size = getattr(vectors_cfg, "size", None)
+        if direct_size is not None:
+            try:
+                return int(direct_size)
+            except Exception:
+                return None
+
+        cfg_dict: dict[str, Any] | None = None
+        if isinstance(vectors_cfg, dict):
+            cfg_dict = vectors_cfg
+        else:
+            model_dump = getattr(vectors_cfg, "model_dump", None)
+            if callable(model_dump):
+                try:
+                    dumped = model_dump()
+                    if isinstance(dumped, dict):
+                        cfg_dict = dumped
+                except Exception:
+                    cfg_dict = None
+
+        if not cfg_dict:
+            return None
+
+        preferred = cfg_dict.get(preferred_name)
+        if isinstance(preferred, dict) and preferred.get("size") is not None:
+            try:
+                return int(preferred.get("size"))
+            except Exception:
+                return None
+        if hasattr(preferred, "size"):
+            try:
+                return int(getattr(preferred, "size"))
+            except Exception:
+                return None
+
+        for value in cfg_dict.values():
+            if isinstance(value, dict) and value.get("size") is not None:
+                try:
+                    return int(value.get("size"))
+                except Exception:
+                    continue
+            if hasattr(value, "size"):
+                try:
+                    return int(getattr(value, "size"))
+                except Exception:
+                    continue
+        return None
+
+    def _get_embedding_dimension(self) -> int | None:
+        """Return current embedding model output dimension, cached per process."""
+        if self._embedding_dimension is not None:
+            return int(self._embedding_dimension)
+
+        if not self.genai_client:
+            return None
+
+        try:
+            sample_response = self.genai_client.models.embed_content(
+                model=self.embedding_model,
+                contents=["dimension_probe"],
+            )
+            embeddings = list(getattr(sample_response, "embeddings", []) or [])
+            if not embeddings:
+                return None
+            values = list(getattr(embeddings[0], "values", []) or [])
+            if not values:
+                return None
+            self._embedding_dimension = len(values)
+            return int(self._embedding_dimension)
+        except Exception as exc:
+            self.logger.warning("Failed to determine embedding dimension for model '%s': %s", self.embedding_model, exc)
+            return None
 
     @staticmethod
     def _fetch_distinct_attribute_types(limit: int = 5000) -> list[str]:
@@ -577,6 +678,15 @@ class AttributeEmbeddingIndex:
             self.logger.error("VectorParams/Distance not available")
             return False
 
+        expected_dim = self._get_embedding_dimension()
+        if not expected_dim:
+            self.logger.error("Failed to determine embedding dimension for model '%s'", self.embedding_model)
+            return False
+
+        recreate_on_mismatch = str(
+            os.getenv("IDMS_RECREATE_ATTRIBUTE_EMBEDDING_COLLECTION_ON_DIM_MISMATCH", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
         try:
             collections = self.qdrant.get_collections()
             existing = {c.name for c in collections.collections}
@@ -587,28 +697,41 @@ class AttributeEmbeddingIndex:
                 try:
                     info = self.qdrant.get_collection(self.COLLECTION_NAME)
                     vectors_cfg = getattr(info.config.params, "vectors", None)
-                    if vectors_cfg:
-                        return True
-                    # Invalid collection: drop and recreate below.
-                    self.qdrant.delete_collection(self.COLLECTION_NAME)
+                    current_dim = self._extract_vector_size(vectors_cfg)
+                    if vectors_cfg and current_dim is not None:
+                        if int(current_dim) == int(expected_dim):
+                            return True
+                        message = (
+                            f"Collection '{self.COLLECTION_NAME}' dimension mismatch: "
+                            f"collection={current_dim}, model={expected_dim} ({self.embedding_model})"
+                        )
+                        if recreate_on_mismatch:
+                            self.logger.warning(
+                                "%s. Recreating collection because "
+                                "IDMS_RECREATE_ATTRIBUTE_EMBEDDING_COLLECTION_ON_DIM_MISMATCH=true",
+                                message,
+                            )
+                            self.qdrant.delete_collection(self.COLLECTION_NAME)
+                        else:
+                            self.logger.error(
+                                "%s. Set IDMS_RECREATE_ATTRIBUTE_EMBEDDING_COLLECTION_ON_DIM_MISMATCH=true "
+                                "or align model/dimension configuration.",
+                                message,
+                            )
+                            self._disable_vector_search(message)
+                            return False
+                    else:
+                        # Invalid collection: drop and recreate below.
+                        self.qdrant.delete_collection(self.COLLECTION_NAME)
                 except Exception:
                     try:
                         self.qdrant.delete_collection(self.COLLECTION_NAME)
                     except Exception:
                         pass
 
-            sample_response = self.genai_client.models.embed_content(
-                model=self.embedding_model,
-                contents=["test"],
-            )
-            if not sample_response.embeddings:
-                self.logger.error("Failed to create sample embedding")
-                return False
-            vector_size = len(sample_response.embeddings[0].values)
-
             self.qdrant.create_collection(
                 collection_name=self.COLLECTION_NAME,
-                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                vectors_config=VectorParams(size=expected_dim, distance=Distance.COSINE),
             )
             return True
         except Exception as e:
@@ -785,7 +908,7 @@ class AttributeEmbeddingIndex:
         # Tier 1: lexical aliases (fast and robust for close variants like "filename" vs "document name")
         lexical = self._lexical_schema_match(user_input, allowed_kinds)
         if lexical:
-            self.logger.info("schema_term_lexical_hit text_len=%s kind=%s canonical=%s", len(str(user_input or "")), lexical.get("kind"), lexical.get("canonical_name"))
+            self.logger.debug("schema_term_lexical_hit text_len=%s kind=%s canonical=%s", len(str(user_input or "")), lexical.get("kind"), lexical.get("canonical_name"))
             return lexical
 
         if not self._index_built or not self.genai_client or not self.qdrant:
@@ -796,10 +919,10 @@ class AttributeEmbeddingIndex:
         if cache_key in self.cache:
             result, timestamp = self.cache[cache_key]
             if time.time() - timestamp < self.CACHE_TTL:
-                self.logger.info("schema_term_cache_hit text_len=%s", len(str(user_input or "")))
+                self.logger.debug("schema_term_cache_hit text_len=%s", len(str(user_input or "")))
                 return result
 
-        self.logger.info("schema_term_cache_miss text_len=%s", len(str(user_input or "")))
+        self.logger.debug("schema_term_cache_miss text_len=%s", len(str(user_input or "")))
 
         try:
             # Embed user input
@@ -900,20 +1023,37 @@ class AttributeEmbeddingIndex:
         instance-level cache so subsequent per-phrase calls are free.
         """
         self._query_context = True
+        if not inputs:
+            return []
+
         allowed_kinds = set(kinds or {self.KIND_ATTRIBUTE, self.KIND_RELATIONSHIP})
         results: list[dict[str, Any] | None] = [None] * len(inputs)
         now = time.time()
         lexical_hits = 0
         cache_hits = 0
 
+        canonical_inputs = [re.sub(r"\s+", " ", str(text or "").strip()) for text in inputs]
+        if not any(canonical_inputs):
+            return results
+
+        normalized_result_cache: dict[str, dict[str, Any] | None] = {}
+
         # --- Pass 1: lexical + cache hits (free) ---
         pending_indexes: list[int] = []
         pending_texts: list[str] = []
-        for idx, text in enumerate(inputs):
+        for idx, text in enumerate(canonical_inputs):
+            if not text:
+                continue
+            if text in normalized_result_cache:
+                results[idx] = normalized_result_cache[text]
+                if results[idx] is not None:
+                    cache_hits += 1
+                continue
             # Lexical first
             lexical = self._lexical_schema_match(text, allowed_kinds)
             if lexical:
                 results[idx] = lexical
+                normalized_result_cache[text] = lexical
                 lexical_hits += 1
                 continue
             # Instance cache
@@ -922,38 +1062,49 @@ class AttributeEmbeddingIndex:
                 cached_result, ts = self.cache[ck]
                 if now - ts < self.CACHE_TTL:
                     results[idx] = cached_result
+                    normalized_result_cache[text] = cached_result
                     cache_hits += 1
                     continue
             pending_indexes.append(idx)
             pending_texts.append(text)
 
         if not pending_texts or not self._index_built or not self.genai_client or not self.qdrant:
-            self.logger.info(
-                "schema_term_batch_summary inputs=%s lexical_hits=%s cache_hits=%s embedded=%s resolved=%s",
-                len(inputs), lexical_hits, cache_hits, 0, sum(1 for item in results if item is not None),
-            )
+            if lexical_hits or cache_hits:
+                self.logger.info(
+                    "schema_term_batch_summary inputs=%s lexical_hits=%s cache_hits=%s embedded=%s resolved=%s",
+                    len(inputs), lexical_hits, cache_hits, 0, sum(1 for item in results if item is not None),
+                )
             return results
+
+        unique_pending_texts: list[str] = []
+        unique_pending_map: dict[str, list[int]] = {}
+        for orig_idx, text in zip(pending_indexes, pending_texts):
+            slots = unique_pending_map.setdefault(text, [])
+            slots.append(orig_idx)
+            if len(slots) == 1:
+                unique_pending_texts.append(text)
 
         # --- Pass 2: one batched embed call for all uncached texts ---
         try:
             embed_response = self.genai_client.models.embed_content(
                 model=self.embedding_model,
-                contents=pending_texts,
+                contents=unique_pending_texts,
             )
             embeddings = list(getattr(embed_response, "embeddings", []) or [])
-            if len(embeddings) != len(pending_texts):
+            if len(embeddings) != len(unique_pending_texts):
                 # Size mismatch – fall back to individual calls
-                for i, text in zip(pending_indexes, pending_texts):
-                    results[i] = self.find_schema_term(text, confidence_threshold, kinds)
+                for text in unique_pending_texts:
+                    hit = self.find_schema_term(text, confidence_threshold, kinds)
+                    normalized_result_cache[text] = hit
+                    for i in unique_pending_map.get(text, []):
+                        results[i] = hit
                 return results
         except Exception as exc:
             self.logger.warning("Batch embed failed (%s); skipping vector search", exc)
             return results
 
         # --- Pass 3: per-embedding Qdrant search (vectors differ per phrase) ---
-        for slot, (orig_idx, text, emb_obj) in enumerate(
-            zip(pending_indexes, pending_texts, embeddings)
-        ):
+        for slot, (text, emb_obj) in enumerate(zip(unique_pending_texts, embeddings)):
             embedding = list(getattr(emb_obj, "values", []) or [])
             if not embedding:
                 continue
@@ -978,17 +1129,20 @@ class AttributeEmbeddingIndex:
                     if boosted >= confidence_threshold:
                         hit = {"kind": kind, "canonical_name": str(canonical_name), "score": boosted}
                         self.cache[ck] = (hit, now)
-                        results[orig_idx] = hit
+                        normalized_result_cache[text] = hit
+                        for orig_idx in unique_pending_map.get(text, []):
+                            results[orig_idx] = hit
                         break
                 else:
                     # No match above threshold – cache the miss so it isn't re-tried
                     self.cache[ck] = (None, now)
+                    normalized_result_cache[text] = None
             except Exception as exc:
                 self.logger.warning("Qdrant search failed for '%s': %s", text, exc)
 
         self.logger.info(
             "schema_term_batch_summary inputs=%s lexical_hits=%s cache_hits=%s embedded=%s resolved=%s",
-            len(inputs), lexical_hits, cache_hits, len(pending_texts), sum(1 for item in results if item is not None),
+            len(inputs), lexical_hits, cache_hits, len(unique_pending_texts), sum(1 for item in results if item is not None),
         )
 
         return results
@@ -996,6 +1150,8 @@ class AttributeEmbeddingIndex:
     def _dense_search(self, embedding: list[float], limit: int = 8) -> list[Any]:
         """Dense vector search with API compatibility fallback for Qdrant versions."""
         if not self.qdrant or not embedding:
+            return []
+        if self._vector_search_disabled:
             return []
 
         base_url = str(os.getenv("QDRANT_URL") or "http://localhost:6333").rstrip("/")
@@ -1024,6 +1180,13 @@ class AttributeEmbeddingIndex:
                     body = response.json() if response.content else {}
                     result = body.get("result") if isinstance(body, dict) else None
                     return list(result or [])
+                if response.status_code == 400:
+                    body_text = str(response.text or "")
+                    if "Vector dimension error" in body_text or "expected dim" in body_text:
+                        self._disable_vector_search(
+                            f"qdrant_collection='{self.COLLECTION_NAME}' dimension mismatch for model '{self.embedding_model}'"
+                        )
+                        return []
             except Exception as exc:
                 self.logger.warning(
                     "Qdrant REST search failed for collection '%s': %s; falling back to query_points",
@@ -1042,6 +1205,12 @@ class AttributeEmbeddingIndex:
                 )
                 return list(getattr(response, "points", []) or [])
             except Exception as exc:
+                exc_text = str(exc or "")
+                if "Vector dimension error" in exc_text or "expected dim" in exc_text:
+                    self._disable_vector_search(
+                        f"qdrant_collection='{self.COLLECTION_NAME}' dimension mismatch for model '{self.embedding_model}'"
+                    )
+                    return []
                 self.logger.warning(
                     "Qdrant query_points failed for collection '%s': %s; falling back to REST search",
                     self.COLLECTION_NAME, exc,

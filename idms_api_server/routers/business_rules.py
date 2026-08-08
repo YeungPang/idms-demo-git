@@ -11,6 +11,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from idms_api_server.schemas import SolfGenerationFromInspectionRequest
+
 import business_rules
 from idms_api_server import deps
 from idms_api_server.schemas import (
@@ -215,6 +217,26 @@ class SolfGenerationFromIntentRequest(BaseModel):
         description="Fallback SQL clause type for persisted clauses: resolve_policy | ingest_rule | computation_rule",
     )
     temperature: float = Field(default=0.0, ge=0.0, le=1.0, description="LLM sampling temperature")
+
+
+class SolfGenerationFromInspectionRequest(BaseModel):
+    goal: str = Field(..., description="Business goal or workflow intent to convert into executable SOLF artifacts")
+    inspection_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured inspection context gathered from web, internal DB, and external DB sources",
+    )
+    persist: bool = Field(default=True, description="When true, persist validated SOLF into business rules")
+    created_by: str | None = Field(default="api:user", description="Creator identifier when persisting")
+    is_active: bool = Field(default=True, description="Activation flag applied when persisting")
+    default_clause_type: str = Field(
+        default="resolve_policy",
+        description="Fallback SQL clause type for persisted clauses: resolve_policy | ingest_rule | computation_rule",
+    )
+    temperature: float = Field(default=0.0, ge=0.0, le=1.0, description="LLM sampling temperature")
+    workflow_registry: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional workflow-registry payload to create or update alongside the generated SOLF artifacts",
+    )
 
 
 @router.post("")
@@ -539,6 +561,30 @@ def generate_and_ingest_solf_from_intent(payload: SolfGenerationFromIntentReques
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         LOGGER.exception("Failed to generate and ingest SOLF from intent")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/solf-generation-pack/generate-and-ingest-from-inspection")
+def generate_and_ingest_solf_from_inspection(payload: SolfGenerationFromInspectionRequest) -> dict[str, Any]:
+    try:
+        result = business_rules.generate_and_process_solf_from_inspection(
+            goal=payload.goal,
+            inspection_context=payload.inspection_context,
+            persist=payload.persist,
+            created_by=payload.created_by,
+            is_active=payload.is_active,
+            default_clause_type=payload.default_clause_type,
+            temperature=payload.temperature,
+            workflow_registry=payload.workflow_registry,
+        )
+        processed = result.get("processed") if isinstance(result.get("processed"), dict) else {}
+        if bool(processed.get("persisted")):
+            deps.get_tools.cache_clear()
+        return {"success": True, "result": result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        LOGGER.exception("Failed to generate and ingest SOLF from inspection")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

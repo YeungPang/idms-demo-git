@@ -204,7 +204,7 @@ def register_source_database(
         metadata = COALESCE(source_database_registry.metadata, '{}'::jsonb) || EXCLUDED.metadata,
         status = 'active',
         updated_at = NOW()
-    RETURNING source_id, source_key, source_name, db_host, db_port, db_name, db_schema, connection_hint, status, metadata, created_at, updated_at
+    RETURNING source_id, source_key, source_name, db_host, db_port, db_name, db_user, db_schema, connection_hint, status, metadata, created_at, updated_at
     """
 
     with metadata_connection.cursor() as cursor:
@@ -213,9 +213,9 @@ def register_source_database(
             (
                 str(source_key or "").strip(),
                 str(source_name or "").strip(),
-                str(db_name or "").strip(),
                 db_host,
                 db_port,
+                str(db_name or "").strip(),
                 db_user,
                 db_schema,
                 connection_hint,

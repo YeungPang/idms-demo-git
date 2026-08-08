@@ -15,10 +15,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import psycopg2
 from psycopg2.extras import Json
 from action_tool import ActionTool
 from audit_compliance_manager import AuditComplianceManager
@@ -35,7 +36,15 @@ from workflow_transition_executor import WorkflowTransitionExecutor
 from runtime_logging import configure_logging
 from llm_fallback import generate_content_with_openrouter_fallback, get_openrouter_client
 import business_rules
+import domain_db
 import object_db
+from source_database_integration import (
+    discover_source_tables,
+    load_source_mapping,
+    register_source_database,
+    sync_mapped_rows,
+    upsert_source_table_inventory,
+)
 
 try:
     import spacy
@@ -138,6 +147,13 @@ class IDMSInteractionTools:
             1,
             int(str(os.getenv("IDMS_SOLF_LOAD_TIMEOUT_SEC", "8") or "8").strip() or "8"),
         )
+        self._last_nl_request_text = ""
+        try:
+            threshold_raw = str(os.getenv("IDMS_SEMANTIC_BEST_EFFORT_THRESHOLD", "0.88") or "0.88").strip()
+            threshold_val = float(threshold_raw)
+        except Exception:
+            threshold_val = 0.88
+        self._semantic_best_effort_threshold = min(0.99, max(0.50, threshold_val))
         eager_solf_init = str(os.getenv("IDMS_EAGER_SOLF_POLICY_INIT", "false")).strip().lower() in {
             "1", "true", "yes", "on"
         }
@@ -280,6 +296,155 @@ class IDMSInteractionTools:
             "related_entities",
             "parties",
             "tags",
+        }
+
+    @staticmethod
+    def _extract_customer_country_exclusion(question: str) -> str | None:
+        text = str(question or "").strip()
+        lowered = text.lower()
+        if not text:
+            return None
+        if "customer" not in lowered and "customers" not in lowered:
+            return None
+        if "country" not in lowered and "countries" not in lowered:
+            return None
+
+        m = re.search(r"\b(?:except|excluding|exclude|without)\s+([A-Za-z][A-Za-z\-\s]{1,60})", text, flags=re.IGNORECASE)
+        if not m:
+            return None
+        value = re.sub(r"[^A-Za-z\-\s]", " ", m.group(1)).strip()
+        value = re.sub(r"\s+", " ", value)
+        if not value:
+            return None
+
+        # Keep only the first token group to avoid trailing clauses (e.g., "Italy ordered by ...").
+        parts = value.split(" ")
+        if len(parts) > 3:
+            value = " ".join(parts[:3]).strip()
+        return value or None
+
+    @staticmethod
+    def _extract_source_key_hint_from_question(question: str) -> str | None:
+        text = str(question or "").strip()
+        if not text:
+            return None
+        tail_match = re.search(r"\b(?:in|from)\s+([A-Za-z0-9_]+)\s*$", text, flags=re.IGNORECASE)
+        if not tail_match:
+            return None
+        token = str(tail_match.group(1) or "").strip().lower()
+        if not token:
+            return None
+        if token in {"italy", "germany", "switzerland", "china", "france", "spain", "austria"}:
+            return None
+        return token
+
+    def _query_customers_excluding_country(self, excluded_country: str, limit: int = 200) -> dict[str, Any]:
+        country = str(excluded_country or "").strip()
+        if not country:
+            return {"success": False, "count": 0, "rows": [], "excluded_country": ""}
+
+        source_hint = self._extract_source_key_hint_from_question(self._last_nl_request_text)
+        source = self._get_active_source_registration(source_key=source_hint) or self._get_active_source_registration(source_key=None)
+        if not isinstance(source, dict):
+            return {
+                "success": False,
+                "count": 0,
+                "rows": [],
+                "excluded_country": country,
+                "message": "No active integrated source database registration found.",
+            }
+
+        source_id = int(source.get("source_id") or 0)
+        source_key = str(source.get("source_key") or "").strip()
+        if source_id <= 0:
+            return {
+                "success": False,
+                "count": 0,
+                "rows": [],
+                "excluded_country": country,
+                "message": "Active source registration is missing source_id.",
+            }
+
+        sql = """
+        SELECT
+            sem.target_object_id,
+            COALESCE(
+                NULLIF(TRIM(sem.target_metadata->'source_row'->>'customer_name'), ''),
+                NULLIF(TRIM(sem.target_metadata->'source_row'->>'customer_code'), ''),
+                NULLIF(TRIM(oi.object_name), ''),
+                sem.source_pk_value
+            ) AS customer_name,
+            sem.target_class_name,
+            TRIM(
+                COALESCE(
+                    sem.target_metadata->'source_row'->>'country',
+                    sem.target_metadata->'source_row'->>'Country',
+                    sem.target_metadata->'source_row'->>'country_name',
+                    ''
+                )
+            ) AS country,
+            sem.source_pk_value
+        FROM source_entity_mapping sem
+        LEFT JOIN object_instance oi
+          ON oi.object_id = sem.target_object_id
+        WHERE sem.source_id = %s
+          AND LOWER(COALESCE(sem.table_name, '')) = 'customer'
+          AND LOWER(COALESCE(sem.target_class_name, '')) IN ('company', 'organization', 'customer')
+          AND TRIM(
+                COALESCE(
+                    sem.target_metadata->'source_row'->>'country',
+                    sem.target_metadata->'source_row'->>'Country',
+                    sem.target_metadata->'source_row'->>'country_name',
+                    ''
+                )
+          ) <> ''
+          AND LOWER(TRIM(
+                COALESCE(
+                    sem.target_metadata->'source_row'->>'country',
+                    sem.target_metadata->'source_row'->>'Country',
+                    sem.target_metadata->'source_row'->>'country_name',
+                    ''
+                )
+          )) <> LOWER(%s)
+        ORDER BY country ASC, oi.object_name ASC
+        LIMIT %s
+        """
+
+        rows: list[dict[str, Any]] = []
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (source_id, country, max(1, int(limit))))
+                    for rec in cur.fetchall():
+                        rows.append(
+                            {
+                                "object_id": rec[0],
+                                "customer_name": rec[1],
+                                "class_name": rec[2],
+                                "country": rec[3],
+                                "source_pk_value": rec[4],
+                            }
+                        )
+        except Exception as exc:
+            self.logger.exception("Integrated customer-country query failed")
+            return {
+                "success": False,
+                "count": 0,
+                "rows": [],
+                "excluded_country": country,
+                "error": str(exc),
+            }
+
+        countries = sorted({str(item.get("country") or "").strip() for item in rows if str(item.get("country") or "").strip()})
+        return {
+            "success": True,
+            "count": len(rows),
+            "rows": rows,
+            "excluded_country": country,
+            "source_key": source_key,
+            "source_id": source_id,
+            "country_count": len(countries),
+            "countries": countries,
         }
 
     @staticmethod
@@ -3593,31 +3758,58 @@ class IDMSInteractionTools:
             self._solf_load_done_event.set()
 
     def _ensure_solf_interpreter_loaded(self, force_retry: bool = False, wait_for_load: bool = True) -> bool:
-        if self.solf_interpreter is not None:
+        solf_interpreter = getattr(self, "solf_interpreter", None)
+        if solf_interpreter is not None:
             return True
 
-        if self._solf_load_in_progress:
+        if not hasattr(self, "_solf_init_lock"):
+            self._solf_init_lock = threading.Lock()
+        if not hasattr(self, "_solf_load_attempted"):
+            self._solf_load_attempted = False
+        if not hasattr(self, "_solf_last_attempt_ts"):
+            self._solf_last_attempt_ts = 0.0
+        if not hasattr(self, "_solf_retry_cooldown_seconds"):
+            self._solf_retry_cooldown_seconds = 30
+        if not hasattr(self, "_solf_load_timeout_seconds"):
+            self._solf_load_timeout_seconds = 8
+        if not hasattr(self, "_solf_load_in_progress"):
+            self._solf_load_in_progress = False
+        if not hasattr(self, "_solf_load_done_event"):
+            self._solf_load_done_event = threading.Event()
+        if not hasattr(self, "_solf_loader_thread"):
+            self._solf_loader_thread = None
+        if not hasattr(self, "_solf_last_error"):
+            self._solf_last_error = None
+        if not hasattr(self, "_solf_runtime_rules_loaded"):
+            self._solf_runtime_rules_loaded = False
+        if not hasattr(self, "_solf_runtime_rules_in_progress"):
+            self._solf_runtime_rules_in_progress = False
+        if not hasattr(self, "_solf_runtime_lock"):
+            self._solf_runtime_lock = threading.Lock()
+
+        if getattr(self, "_solf_load_in_progress", False):
             if wait_for_load:
                 self._solf_load_done_event.wait(timeout=float(self._solf_load_timeout_seconds))
-                return self.solf_interpreter is not None
+                return getattr(self, "solf_interpreter", None) is not None
             return False
 
         now_ts = time.time()
         if (
             not force_retry
-            and self._solf_load_attempted
+            and getattr(self, "_solf_load_attempted", False)
             and self._solf_retry_cooldown_seconds > 0
             and (now_ts - self._solf_last_attempt_ts) < self._solf_retry_cooldown_seconds
         ):
             return False
 
         with self._solf_init_lock:
-            if self.solf_interpreter is not None:
+            solf_interpreter = getattr(self, "solf_interpreter", None)
+            if solf_interpreter is not None:
                 return True
             now_ts = time.time()
             if (
                 not force_retry
-                and self._solf_load_attempted
+                and getattr(self, "_solf_load_attempted", False)
                 and self._solf_retry_cooldown_seconds > 0
                 and (now_ts - self._solf_last_attempt_ts) < self._solf_retry_cooldown_seconds
             ):
@@ -3643,17 +3835,19 @@ class IDMSInteractionTools:
         if not wait_for_load:
             return False
         self._solf_load_done_event.wait(timeout=float(self._solf_load_timeout_seconds))
-        return self.solf_interpreter is not None
+        return getattr(self, "solf_interpreter", None) is not None
 
     def _invoke_solf_policy(self, clause_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.solf_interpreter is None:
+        solf_interpreter = getattr(self, "solf_interpreter", None)
+        if solf_interpreter is None:
             self._ensure_solf_interpreter_loaded(wait_for_load=False)
-        if self.solf_interpreter is None and not self._ensure_solf_interpreter_loaded(wait_for_load=True):
+            solf_interpreter = getattr(self, "solf_interpreter", None)
+        if solf_interpreter is None and not self._ensure_solf_interpreter_loaded(wait_for_load=True):
             return self._default_policy("solf_unavailable")
 
         try:
             self.logger.info("Invoking SOLF policy clause=%s", clause_name)
-            result = self.solf_interpreter._invoke_clause(clause_name, [payload])
+            result = solf_interpreter._invoke_clause(clause_name, [payload])
         except Exception:
             self.logger.exception("SOLF policy clause invocation failed: %s", clause_name)
             return self._default_policy("solf_invocation_failed")
@@ -4091,6 +4285,764 @@ class IDMSInteractionTools:
         plan = self._as_string_key_dict(raw)
         return plan or None
 
+    def _normalize_integrate_source_action_request(self, action_name: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        def _extract_db_name_from_text(text: str) -> str:
+            candidate_text = str(text or "").strip()
+            if not candidate_text:
+                return ""
+
+            patterns = [
+                r"integrate\s+(?:the\s+)?database\s+([a-zA-Z0-9_\-]+)\s+into\s+(?:the\s+)?system",
+                r"integrate\s+(?:the\s+)?source\s+database\s+([a-zA-Z0-9_\-]+)",
+                r"database\s+name\s*[:=]\s*([a-zA-Z0-9_\-]+)",
+                r"db[_\s-]?name\s*[:=]\s*([a-zA-Z0-9_\-]+)",
+                r"\bdatabase\s+([a-zA-Z0-9_\-]+)\b",
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, candidate_text, flags=re.IGNORECASE)
+                if match:
+                    return str(match.group(1) or "").strip()
+            return ""
+
+        action_raw = str(action_name or "").strip()
+        action = action_raw.lower()
+        resolved_payload = dict(payload or {}) if isinstance(payload, dict) else {}
+
+        # Accept compact forms where db_name is embedded in action token.
+        embedded_match = re.match(
+            r"^\s*(?:integrate_source_database|integrate-source-database|integrate_database|integrate\s+database|integrate_db)\s+([a-zA-Z0-9_\-]+)\s*$",
+            action_raw,
+            flags=re.IGNORECASE,
+        )
+        if embedded_match and not resolved_payload.get("db_name"):
+            resolved_payload["db_name"] = str(embedded_match.group(1) or "").strip()
+        if embedded_match:
+            action = "integrate_source_database"
+
+        if not resolved_payload.get("db_name"):
+            direct_candidates = [
+                resolved_payload.get("database"),
+                resolved_payload.get("source_database"),
+                resolved_payload.get("db"),
+            ]
+            for candidate in direct_candidates:
+                text_candidate = str(candidate or "").strip()
+                if text_candidate:
+                    resolved_payload["db_name"] = text_candidate
+                    break
+
+        if not resolved_payload.get("db_name") and isinstance(resolved_payload.get("args"), list):
+            for raw_arg in list(resolved_payload.get("args") or []):
+                arg = str(raw_arg or "").strip()
+                if re.match(r"^[a-zA-Z0-9_\-]+$", arg):
+                    resolved_payload["db_name"] = arg
+                    break
+
+        if not resolved_payload.get("db_name"):
+            text_fields = [
+                "text",
+                "request",
+                "instruction",
+                "command",
+                "message",
+                "prompt",
+                "query",
+                "user_query",
+                "user_request",
+            ]
+            merged_text = "\n".join(
+                str(resolved_payload.get(field) or "").strip()
+                for field in text_fields
+                if str(resolved_payload.get(field) or "").strip()
+            )
+            inferred = _extract_db_name_from_text(merged_text)
+            if inferred:
+                resolved_payload["db_name"] = inferred
+
+        integrate_action_aliases = {
+            "integrate_source_database",
+            "integrate-source-database",
+            "integrate_database",
+            "integrate database",
+            "integrate_db",
+        }
+
+        if not resolved_payload.get("db_name") and action in integrate_action_aliases:
+            # Fallback to last NL context captured in this tool session.
+            history_candidates: list[str] = []
+            if str(self._last_nl_request_text or "").strip():
+                history_candidates.append(str(self._last_nl_request_text or "").strip())
+
+            for turn in reversed(list(self.state.history or [])):
+                if str(turn.get("role") or "").strip().lower() != "user":
+                    continue
+                text = str(turn.get("content") or "").strip()
+                if text:
+                    history_candidates.append(text)
+                if len(history_candidates) >= 3:
+                    break
+
+            history_text = "\n".join(history_candidates)
+            inferred = _extract_db_name_from_text(history_text)
+            if inferred:
+                resolved_payload["db_name"] = inferred
+
+        if not resolved_payload.get("db_name") and action in integrate_action_aliases:
+            # Last-resort LLM extraction when NL text exists but deterministic regex missed.
+            llm_text_parts = [
+                str(resolved_payload.get("message") or "").strip(),
+                str(resolved_payload.get("text") or "").strip(),
+                str(self._last_nl_request_text or "").strip(),
+            ]
+            llm_text = "\n".join(part for part in llm_text_parts if part)
+            if llm_text:
+                try:
+                    prompt = (
+                        "Extract the database name from this user request. "
+                        "Return JSON only with key db_name. If missing, return {\"db_name\":\"\"}.\n\n"
+                        f"Request:\n{llm_text}"
+                    )
+                    response = generate_content_with_openrouter_fallback(
+                        primary_call=lambda: self.client.models.generate_content(
+                            model=EXTRACT_MODEL,
+                            contents=[prompt],
+                        ),
+                        model=EXTRACT_MODEL,
+                        contents=[prompt],
+                        temperature=0.0,
+                        call_name="integrate_db_name_extraction",
+                        complexity="simple",
+                    )
+                    parsed = self._extract_json_object(response.text or "")
+                    candidate = str(parsed.get("db_name") or "").strip()
+                    if re.match(r"^[a-zA-Z0-9_\-]+$", candidate):
+                        resolved_payload["db_name"] = candidate
+                except Exception:
+                    pass
+
+        if not resolved_payload.get("db_name") and action in integrate_action_aliases:
+            # Stateless fallback for clients that call /api/action with empty payload.
+            # Reuse the most recent successful integration target or active source entry.
+            connection = None
+            try:
+                connection = self.get_connection()
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT COALESCE(payload->>'db_name', payload->>'database', '')
+                        FROM workflow_action_log
+                        WHERE action_name = 'integrate_source_database'
+                          AND success = TRUE
+                          AND COALESCE(payload->>'db_name', payload->>'database', '') <> ''
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    )
+                    row = cursor.fetchone()
+                    candidate = str(row[0] or "").strip() if row else ""
+                    if candidate:
+                        resolved_payload["db_name"] = candidate
+
+                if not resolved_payload.get("db_name"):
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            SELECT db_name
+                            FROM source_database_registry
+                            WHERE status = 'active'
+                              AND COALESCE(db_name, '') <> ''
+                            ORDER BY updated_at DESC, source_id DESC
+                            LIMIT 1
+                            """
+                        )
+                        row = cursor.fetchone()
+                        candidate = str(row[0] or "").strip() if row else ""
+                        if candidate:
+                            resolved_payload["db_name"] = candidate
+            except Exception:
+                pass
+            finally:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+
+        if action in integrate_action_aliases:
+            if not resolved_payload.get("db_name"):
+                phrase_db = str(resolved_payload.get("database") or resolved_payload.get("source_database") or "").strip()
+                if phrase_db:
+                    resolved_payload["db_name"] = phrase_db
+            return "integrate_source_database", resolved_payload
+
+        match = re.match(
+            r"^\s*integrate\s+(?:the\s+)?database\s+([a-zA-Z0-9_\-]+)\s+into\s+(?:the\s+)?system\s*[\.!?]?\s*$",
+            action_raw,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            if not resolved_payload.get("db_name"):
+                resolved_payload["db_name"] = str(match.group(1) or "").strip()
+            return "integrate_source_database", resolved_payload
+
+        sync_action_aliases = {
+            "sync_source_database_entities",
+            "sync-source-database-entities",
+            "sync_source_entities",
+            "sync_db",
+            "db_sync",
+            "synchronize_db",
+            "synchronize_source_database",
+        }
+
+        if action in sync_action_aliases:
+            text_fields = [
+                "text",
+                "request",
+                "instruction",
+                "command",
+                "message",
+                "prompt",
+                "query",
+                "user_query",
+                "user_request",
+            ]
+            merged_text = "\n".join(
+                str(resolved_payload.get(field) or "").strip()
+                for field in text_fields
+                if str(resolved_payload.get(field) or "").strip()
+            )
+
+            if not resolved_payload.get("source_key") and merged_text:
+                # Prefer explicit trailing source db mention: "... in aphotonix_test".
+                tail_match = re.search(r"\bin\s+([a-zA-Z0-9_\-]+)\s*[\.!?]?\s*$", merged_text, flags=re.IGNORECASE)
+                if tail_match:
+                    resolved_payload["source_key"] = str(tail_match.group(1) or "").strip().lower()
+                else:
+                    stop_tokens = {
+                        "customer",
+                        "contact",
+                        "contact_person",
+                        "table",
+                        "tables",
+                        "customer_name",
+                        "contact_name",
+                        "system",
+                        "database",
+                        "source",
+                    }
+                    source_matches = re.findall(
+                        r"\b(?:in|from|source|database)\s+([a-zA-Z0-9_\-]+)\b",
+                        merged_text,
+                        flags=re.IGNORECASE,
+                    )
+                    for candidate in reversed(source_matches):
+                        token = str(candidate or "").strip().lower()
+                        if token and token not in stop_tokens:
+                            resolved_payload["source_key"] = token
+                            break
+
+            if not resolved_payload.get("use_default_customer_contact_mapping") and merged_text:
+                if ("customer" in merged_text.lower()) and ("contact" in merged_text.lower()):
+                    resolved_payload["use_default_customer_contact_mapping"] = True
+
+            return "sync_source_database_entities", resolved_payload
+
+        sync_match = re.match(
+            r"^\s*synchroni(?:s|z)e\s+the\s+company_name\s+and\s+contact\s+persons\s+with\s+(?:the\s+)?system\s*$",
+            action_raw,
+            flags=re.IGNORECASE,
+        )
+        if sync_match:
+            resolved_payload.setdefault("use_default_customer_contact_mapping", True)
+            return "sync_source_database_entities", resolved_payload
+
+        return action, resolved_payload
+
+    def _resolve_source_db_password(self, source_key: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9]", "_", str(source_key or "").upper())
+        per_source_key = f"IDMS_SOURCE_DB_PASSWORD_{sanitized}" if sanitized else ""
+        return (
+            (os.getenv(per_source_key, "") if per_source_key else "")
+            or os.getenv("IDMS_SOURCE_DB_PASSWORD", "")
+            or os.getenv("IDMS_DB_PASSWORD", "")
+        )
+
+    def _build_integrate_source_database_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        db_name = str(payload.get("db_name") or payload.get("database") or "").strip()
+        if not db_name:
+            return {
+                "action": "integrate_source_database",
+                "success": False,
+                "message": "db_name is required for integrate_source_database.",
+            }
+
+        source_key = str(payload.get("source_key") or db_name).strip().lower()
+        source_name = str(payload.get("source_name") or db_name).strip() or db_name
+        db_host = str(payload.get("db_host") or os.getenv("IDMS_DB_HOST", "localhost")).strip() or "localhost"
+        db_port = int(payload.get("db_port") or os.getenv("IDMS_DB_PORT", "5432") or 5432)
+        db_user = str(payload.get("db_user") or os.getenv("IDMS_DB_USER", "postgres")).strip() or "postgres"
+        db_schema = str(payload.get("db_schema") or "").strip()
+        include_views = bool(payload.get("include_views", False))
+        schema_names = [str(item).strip() for item in list(payload.get("schema_names") or []) if str(item).strip()]
+
+        return {
+            "action": "integrate_source_database",
+            "success": True,
+            "dry_run": True,
+            "message": "Integration preview prepared. Execution will register the source and inventory all non-system schemas/tables.",
+            "plan": {
+                "source_key": source_key,
+                "source_name": source_name,
+                "db_name": db_name,
+                "db_host": db_host,
+                "db_port": db_port,
+                "db_user": db_user,
+                "db_schema": db_schema or None,
+                "schema_names": schema_names,
+                "include_views": include_views,
+                "sync_tables": False,
+                "analyze_all_schemas": not bool(schema_names or db_schema),
+            },
+        }
+
+    def _integrate_source_database_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        preview = self._build_integrate_source_database_preview(payload)
+        if not preview.get("success"):
+            return preview
+        if bool(payload.get("dry_run")):
+            return preview
+
+        plan = preview.get("plan") if isinstance(preview.get("plan"), dict) else {}
+        source_key = str(plan.get("source_key") or "").strip()
+        source_name = str(plan.get("source_name") or source_key).strip() or source_key
+        db_name = str(plan.get("db_name") or "").strip()
+        db_host = str(plan.get("db_host") or "localhost").strip() or "localhost"
+        db_port = int(plan.get("db_port") or 5432)
+        db_user = str(plan.get("db_user") or "postgres").strip() or "postgres"
+        db_schema = str(plan.get("db_schema") or "").strip() or None
+        schema_names = [str(item).strip() for item in list(plan.get("schema_names") or []) if str(item).strip()]
+        include_views = bool(plan.get("include_views"))
+        db_password = str(payload.get("db_password") or "").strip() or self._resolve_source_db_password(source_key)
+        if not db_password:
+            return {
+                "action": "integrate_source_database",
+                "success": False,
+                "message": "Source database password is missing. Provide db_password or configure IDMS_SOURCE_DB_PASSWORD(_<SOURCE_KEY>).",
+                "plan": plan,
+            }
+
+        try:
+            source_connection = psycopg2.connect(
+                host=db_host,
+                port=db_port,
+                database=db_name,
+                user=db_user,
+                password=db_password,
+                connect_timeout=5,
+            )
+        except Exception as exc:
+            return {
+                "action": "integrate_source_database",
+                "success": False,
+                "message": f"Unable to connect to source database: {exc}",
+                "plan": plan,
+            }
+
+        metadata_connection = self.get_connection()
+        try:
+            domain_db.create_tables(metadata_connection, recreate=False)
+            registration = register_source_database(
+                metadata_connection,
+                source_key=source_key,
+                source_name=source_name,
+                db_name=db_name,
+                db_host=db_host,
+                db_port=db_port,
+                db_user=db_user,
+                db_schema=db_schema,
+                connection_hint=str(payload.get("connection_hint") or "action:integrate_source_database").strip() or None,
+                metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+            )
+            tables = discover_source_tables(
+                source_connection,
+                schema_names=schema_names or ([db_schema] if db_schema else None),
+                include_views=include_views,
+            )
+            for table_info in tables:
+                upsert_source_table_inventory(metadata_connection, int(registration["source_id"]), table_info)
+
+            tables_by_schema: dict[str, int] = {}
+            for table in tables:
+                schema_name = str(table.schema_name or "").strip() or "public"
+                tables_by_schema[schema_name] = tables_by_schema.get(schema_name, 0) + 1
+
+            return {
+                "action": "integrate_source_database",
+                "success": True,
+                "message": f"Integrated source database '{db_name}' and inventoried {len(tables)} schema objects.",
+                "data": {
+                    "source": registration,
+                    "inventory_count": len(tables),
+                    "tables_by_schema": tables_by_schema,
+                    "sample_tables": [
+                        {
+                            "schema_name": table.schema_name,
+                            "table_name": table.table_name,
+                            "object_kind": table.object_kind,
+                            "fingerprint": table.fingerprint,
+                        }
+                        for table in tables[:20]
+                    ],
+                    "sync_tables": False,
+                },
+                "plan": plan,
+            }
+        except Exception as exc:
+            return {
+                "action": "integrate_source_database",
+                "success": False,
+                "message": f"Source integration failed: {exc}",
+                "plan": plan,
+            }
+        finally:
+            try:
+                source_connection.close()
+            except Exception:
+                pass
+            try:
+                metadata_connection.close()
+            except Exception:
+                pass
+
+    def _get_active_source_registration(self, source_key: str | None = None) -> dict[str, Any] | None:
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    if source_key:
+                        cur.execute(
+                            """
+                            SELECT source_id, source_key, source_name, db_host, db_port, db_name, db_user, db_schema, connection_hint, status, metadata
+                            FROM source_database_registry
+                            WHERE status = 'active' AND source_key = %s
+                            LIMIT 1
+                            """,
+                            (str(source_key).strip().lower(),),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT source_id, source_key, source_name, db_host, db_port, db_name, db_user, db_schema, connection_hint, status, metadata
+                            FROM source_database_registry
+                            WHERE status = 'active'
+                            ORDER BY updated_at DESC, source_id DESC
+                            LIMIT 1
+                            """
+                        )
+                    row = cur.fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "source_id": int(row[0]),
+            "source_key": str(row[1] or "").strip(),
+            "source_name": str(row[2] or "").strip(),
+            "db_host": str(row[3] or "").strip(),
+            "db_port": int(row[4] or 5432),
+            "db_name": str(row[5] or "").strip(),
+            "db_user": str(row[6] or "").strip(),
+            "db_schema": str(row[7] or "").strip() or None,
+            "connection_hint": str(row[8] or "").strip() or None,
+            "status": str(row[9] or "").strip(),
+            "metadata": row[10] if isinstance(row[10], dict) else {},
+        }
+
+    def _list_source_inventory(self, source_id: int) -> list[dict[str, Any]]:
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT schema_name, table_name, object_kind, metadata
+                    FROM source_schema_inventory
+                    WHERE source_id = %s
+                    ORDER BY schema_name, table_name
+                    """,
+                    (int(source_id),),
+                )
+                rows = cur.fetchall() or []
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "schema_name": str(row[0] or "").strip(),
+                    "table_name": str(row[1] or "").strip(),
+                    "object_kind": str(row[2] or "").strip(),
+                    "metadata": row[3] if isinstance(row[3], dict) else {},
+                }
+            )
+        return out
+
+    def _ensure_object_classes(self, connection: Any, class_names: list[str]) -> None:
+        with connection.cursor() as cur:
+            for class_name in class_names:
+                normalized = str(class_name or "").strip().lower()
+                if not normalized:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO object_class (class_name, metadata)
+                    VALUES (%s, '{}'::jsonb)
+                    ON CONFLICT (class_name) DO NOTHING
+                    """,
+                    (normalized,),
+                )
+        connection.commit()
+
+    def _json_safe_value(self, value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {str(k): self._json_safe_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_safe_value(item) for item in value]
+        return str(value)
+
+    @staticmethod
+    def _inventory_columns(entry: dict[str, Any]) -> set[str]:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        cols = metadata.get("columns") if isinstance(metadata.get("columns"), list) else []
+        return {str(item.get("column_name") or "").strip().lower() for item in cols if isinstance(item, dict)}
+
+    def _infer_default_customer_contact_sync_spec(self, source: dict[str, Any], inventory: list[dict[str, Any]]) -> dict[str, Any] | None:
+        customer_entry = None
+        contact_entry = None
+        for entry in inventory:
+            table_name = str(entry.get("table_name") or "").strip().lower()
+            columns = self._inventory_columns(entry)
+            if table_name == "customer" and {"customer_pk", "customer_name"}.issubset(columns):
+                customer_entry = entry
+            if table_name == "contact_person" and {"contact_pk", "customer_pk"}.issubset(columns):
+                contact_entry = entry
+        if not customer_entry or not contact_entry:
+            return None
+        return {
+            "source_key": source.get("source_key"),
+            "parent": {
+                "schema_name": customer_entry.get("schema_name") or "public",
+                "table_name": customer_entry.get("table_name") or "customer",
+                "pk_column": "customer_pk",
+                "name_column": "customer_name",
+                "class_name": "company",
+                "updated_at_column": "last_update",
+                "metadata_columns": [
+                    "customer_pk", "customer_code", "customer_name", "country", "address",
+                    "telephone_no", "mobile_no", "email_address", "website", "agency", "entry_date", "last_update",
+                ],
+            },
+            "child": {
+                "schema_name": contact_entry.get("schema_name") or "public",
+                "table_name": contact_entry.get("table_name") or "contact_person",
+                "pk_column": "contact_pk",
+                "name_column": "contact_name",
+                "class_name": "person",
+                "updated_at_column": "last_update",
+                "metadata_columns": [
+                    "contact_pk", "customer_pk", "contact_name", "telephone_no", "mobile_no",
+                    "email_address", "is_primary", "source_row_no", "entry_date", "last_update",
+                ],
+                "parent_fk_column": "customer_pk",
+                "relationship_name": "contact_person_of",
+                "relationship_cat": "business_contact",
+            },
+        }
+
+    def _build_sync_source_database_entities_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        source_key = str(payload.get("source_key") or "").strip().lower() or None
+        source = self._get_active_source_registration(source_key=source_key)
+        if not source:
+            return {
+                "action": "sync_source_database_entities",
+                "success": False,
+                "message": "No active integrated source database found. Run integration first or provide source_key.",
+            }
+        inventory = self._list_source_inventory(int(source["source_id"]))
+        spec = payload.get("mapping") if isinstance(payload.get("mapping"), dict) else None
+        if not spec and bool(payload.get("use_default_customer_contact_mapping", False)):
+            spec = self._infer_default_customer_contact_sync_spec(source, inventory)
+        if not spec:
+            return {
+                "action": "sync_source_database_entities",
+                "success": False,
+                "message": "No sync mapping available. Provide mapping or use a supported default customer/contact schema.",
+                "source": source,
+            }
+        return {
+            "action": "sync_source_database_entities",
+            "success": True,
+            "dry_run": True,
+            "message": "Sync preview prepared. Execution will sync parent and child tables plus relationships.",
+            "plan": spec,
+            "source": source,
+        }
+
+    def _sync_source_database_entities_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        preview = self._build_sync_source_database_entities_preview(payload)
+        if not preview.get("success"):
+            return preview
+        if bool(payload.get("dry_run")):
+            return preview
+
+        source = preview.get("source") if isinstance(preview.get("source"), dict) else {}
+        plan = preview.get("plan") if isinstance(preview.get("plan"), dict) else {}
+        parent = plan.get("parent") if isinstance(plan.get("parent"), dict) else {}
+        child = plan.get("child") if isinstance(plan.get("child"), dict) else {}
+        source_key = str(source.get("source_key") or "").strip()
+        db_password = str(payload.get("db_password") or "").strip() or self._resolve_source_db_password(source_key)
+        if not db_password:
+            return {
+                "action": "sync_source_database_entities",
+                "success": False,
+                "message": "Source database password is missing. Provide db_password or configure IDMS_SOURCE_DB_PASSWORD(_<SOURCE_KEY>).",
+                "source": source,
+                "plan": plan,
+            }
+
+        source_connection = psycopg2.connect(
+            host=str(source.get("db_host") or "localhost"),
+            port=int(source.get("db_port") or 5432),
+            database=str(source.get("db_name") or ""),
+            user=str(source.get("db_user") or "postgres"),
+            password=db_password,
+            connect_timeout=5,
+        )
+        idms_connection = self.get_connection()
+        try:
+            object_db.create_tables(idms_connection, recreate=False)
+            domain_db.create_tables(idms_connection, recreate=False)
+            self._ensure_object_classes(idms_connection, [str(parent.get("class_name") or "company"), str(child.get("class_name") or "person")])
+
+            def _map_parent_row(row: dict[str, Any]) -> dict[str, Any]:
+                name_column = str(parent.get("name_column") or parent.get("pk_column") or "").strip()
+                object_name = str(row.get(name_column) or row.get(parent.get("pk_column")) or "").strip()
+                metadata = {"source_system": source_key, "source_schema": parent.get("schema_name"), "source_table": parent.get("table_name"), "source_row": self._json_safe_value(row)}
+                return {"object_name": object_name, "class_name": str(parent.get("class_name") or "company").strip().lower(), "metadata": metadata, "status": "active"}
+
+            parent_results = sync_mapped_rows(
+                source_connection=source_connection,
+                idms_connection=idms_connection,
+                metadata_connection=idms_connection,
+                source_id=int(source.get("source_id") or 0),
+                schema_name=str(parent.get("schema_name") or "public"),
+                table_name=str(parent.get("table_name") or ""),
+                target_class_name=str(parent.get("class_name") or "company").strip().lower(),
+                pk_column=str(parent.get("pk_column") or "id"),
+                map_row_to_object=_map_parent_row,
+                updated_at_column=str(parent.get("updated_at_column") or "").strip() or None,
+                metadata_columns=list(parent.get("metadata_columns") or []) or None,
+            )
+
+            def _map_child_row(row: dict[str, Any]) -> dict[str, Any]:
+                name_column = str(child.get("name_column") or child.get("pk_column") or "").strip()
+                object_name = str(row.get(name_column) or row.get(child.get("pk_column")) or row.get("email_address") or "").strip()
+                metadata = {"source_system": source_key, "source_schema": child.get("schema_name"), "source_table": child.get("table_name"), "source_row": self._json_safe_value(row)}
+                return {"object_name": object_name, "class_name": str(child.get("class_name") or "person").strip().lower(), "metadata": metadata, "status": "active"}
+
+            child_results = sync_mapped_rows(
+                source_connection=source_connection,
+                idms_connection=idms_connection,
+                metadata_connection=idms_connection,
+                source_id=int(source.get("source_id") or 0),
+                schema_name=str(child.get("schema_name") or "public"),
+                table_name=str(child.get("table_name") or ""),
+                target_class_name=str(child.get("class_name") or "person").strip().lower(),
+                pk_column=str(child.get("pk_column") or "id"),
+                map_row_to_object=_map_child_row,
+                updated_at_column=str(child.get("updated_at_column") or "").strip() or None,
+                metadata_columns=list(child.get("metadata_columns") or []) or None,
+            )
+
+            relationship_count = 0
+            parent_pk = str(parent.get("pk_column") or "id")
+            child_pk = str(child.get("pk_column") or "id")
+            parent_fk = str(child.get("parent_fk_column") or parent_pk)
+            relationship_name = str(child.get("relationship_name") or "related_to").strip().lower() or "related_to"
+            relationship_cat = str(child.get("relationship_cat") or "source_link").strip().lower() or "source_link"
+            select_cols = list(dict.fromkeys([child_pk, parent_fk]))
+            sql = (
+                f"SELECT {', '.join('"' + col.replace('"','""') + '"' for col in select_cols)} "
+                f"FROM {'"' + str(child.get('schema_name') or 'public').replace('"','""') + '"'}.{'"' + str(child.get('table_name') or '').replace('"','""') + '"'}"
+            )
+            with source_connection.cursor() as src_cur:
+                src_cur.execute(sql)
+                relation_rows = src_cur.fetchall() or []
+            for rel_row in relation_rows:
+                child_id = rel_row[0]
+                parent_id = rel_row[1] if len(rel_row) > 1 else None
+                if child_id in (None, "") or parent_id in (None, ""):
+                    continue
+                child_mapping = load_source_mapping(
+                    idms_connection,
+                    source_id=int(source.get("source_id") or 0),
+                    schema_name=str(child.get("schema_name") or "public"),
+                    table_name=str(child.get("table_name") or ""),
+                    source_pk_value=str(child_id),
+                    target_class_name=str(child.get("class_name") or "person").strip().lower(),
+                )
+                parent_mapping = load_source_mapping(
+                    idms_connection,
+                    source_id=int(source.get("source_id") or 0),
+                    schema_name=str(parent.get("schema_name") or "public"),
+                    table_name=str(parent.get("table_name") or ""),
+                    source_pk_value=str(parent_id),
+                    target_class_name=str(parent.get("class_name") or "company").strip().lower(),
+                )
+                if not child_mapping or not parent_mapping:
+                    continue
+                if not child_mapping.get("target_object_id") or not parent_mapping.get("target_object_id"):
+                    continue
+                object_db.upsert_object_relationship(
+                    idms_connection,
+                    relationship_name=relationship_name,
+                    relationship_cat=relationship_cat,
+                    src_object_id=int(child_mapping["target_object_id"]),
+                    tar_object_id=int(parent_mapping["target_object_id"]),
+                    metadata={"source_system": source_key, "source_parent_fk": str(parent_id)},
+                )
+                relationship_count += 1
+
+            return {
+                "action": "sync_source_database_entities",
+                "success": True,
+                "message": f"Synchronized source database entities from '{source_key}'.",
+                "data": {
+                    "source": source,
+                    "plan": plan,
+                    "parent_results": {"count": len(parent_results), "summary": [r.__dict__ for r in parent_results[:20]]},
+                    "child_results": {"count": len(child_results), "summary": [r.__dict__ for r in child_results[:20]]},
+                    "relationship_count": relationship_count,
+                },
+            }
+        except Exception as exc:
+            return {
+                "action": "sync_source_database_entities",
+                "success": False,
+                "message": f"Source entity sync failed: {exc}",
+                "source": source,
+                "plan": plan,
+            }
+        finally:
+            try:
+                source_connection.close()
+            except Exception:
+                pass
+            try:
+                idms_connection.close()
+            except Exception:
+                pass
+
     def _compose_scheduler_command(self, command_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         command = str(command_name or "").strip().lower()
         raw = self._invoke_solf_clause_raw("scheduler_command", [command, payload])
@@ -4331,6 +5283,33 @@ class IDMSInteractionTools:
                 }
         return best_request
 
+    @staticmethod
+    def _should_dispatch_solf_clause(question: str, clause_request: dict[str, Any] | None) -> bool:
+        if not isinstance(clause_request, dict):
+            return False
+
+        dispatch_mode = str(clause_request.get("dispatch_mode") or "").strip().lower()
+        if dispatch_mode == "explicit":
+            return True
+        if dispatch_mode != "generic_nl":
+            return True
+
+        text = re.sub(r"\s+", " ", str(question or "").strip().lower())
+        if not text:
+            return False
+
+        # Keep generic SOLF dispatch for imperative/action-style requests, but
+        # let ordinary information retrieval questions route through query_engine.
+        info_request = bool(
+            re.match(
+                r"^(?:what|which|who|when|where|why|how|show|list|find|give me|tell me|"
+                r"was|welche(?:r|s|n)?|wer|wann|wo|warum|wie|zeige|liste|finde|gib mir)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        return not info_request
+
     def _format_direct_solf_query_result(self, question: str, evaluated: dict[str, Any]) -> dict[str, Any]:
         success = bool(evaluated.get("success"))
         clause_name = str(evaluated.get("clause_name") or "").strip()
@@ -4364,7 +5343,7 @@ class IDMSInteractionTools:
                 return cached
 
         clause_request = self._resolve_solf_clause_request(question)
-        if isinstance(clause_request, dict):
+        if self._should_dispatch_solf_clause(question, clause_request):
             result = self._dispatch_solf_clause_request(question, clause_request)
             if self.query_cache:
                 self.query_cache.put(question, result)
@@ -4487,6 +5466,7 @@ class IDMSInteractionTools:
         user_message = str(user_message or "").strip()
         if not user_message:
             raise ValueError("user_message must not be empty")
+        self._last_nl_request_text = user_message
 
         clause_request = self._resolve_solf_clause_request(user_message)
         if isinstance(clause_request, dict):
@@ -5032,6 +6012,7 @@ class IDMSInteractionTools:
         normalized_request = str(request_text or "").strip()
         if not normalized_request:
             raise ValueError("request_text must not be empty")
+        self._last_nl_request_text = normalized_request
 
         iterations = min(max(1, int(max_iterations)), 8)
         working_context = context if isinstance(context, dict) else {}
@@ -5183,6 +6164,7 @@ class IDMSInteractionTools:
         normalized_request = str(request_text or "").strip()
         if not normalized_request:
             raise ValueError("request_text must not be empty")
+        self._last_nl_request_text = normalized_request
 
         iterations = min(max(1, int(max_iterations)), 8)
         working_context = context if isinstance(context, dict) else {}
@@ -5643,6 +6625,10 @@ class IDMSInteractionTools:
             if action_type == "interaction":
                 action_name = str(name or payload.get("action_name") or "").strip().lower()
                 action_payload = payload.get("action_payload") if isinstance(payload.get("action_payload"), dict) else payload
+                if isinstance(action_payload, dict) and request_text:
+                    action_payload.setdefault("message", request_text)
+                if isinstance(action_payload, dict) and args and not action_payload.get("db_name"):
+                    action_payload.setdefault("args", list(args))
                 if action_name:
                     out = self.perform_action(action_name, action_payload)
                     executed = True
@@ -5771,6 +6757,7 @@ class IDMSInteractionTools:
         normalized_request = str(request_text or "").strip()
         if not normalized_request:
             raise ValueError("request_text must not be empty")
+        self._last_nl_request_text = normalized_request
 
         iterations = min(max(1, int(max_iterations)), 8)
         retrieval_rounds = min(max(1, int(max_retrieval_rounds)), 6)
@@ -6468,8 +7455,355 @@ class IDMSInteractionTools:
 
         return intro + "\n" + "\n".join(lines)
 
-    def _build_query_evidence_bundle(self, question: str, query_result: dict[str, Any] | None) -> dict[str, Any]:
-        parsed = self.query_engine.parse_query(question)
+    def _is_value_question(self, question: str, parsed: Any | None = None) -> bool:
+        normalized = str(question or "").strip().lower()
+        if not normalized:
+            return False
+
+        value_pattern = re.compile(
+            r"\b(?:how\s+much|amount|total|cost|price|value|due|sum|payable|balance|outstanding|net|gross|vat|tax|fee|charge)\b",
+            flags=re.IGNORECASE,
+        )
+        asks_value = bool(value_pattern.search(normalized))
+
+        attribute_hint = ""
+        if parsed is not None:
+            try:
+                attribute_hint = str(getattr(parsed, "attribute_name", "") or "").strip().lower()
+            except Exception:
+                attribute_hint = ""
+        if attribute_hint and value_pattern.search(attribute_hint):
+            asks_value = True
+
+        return asks_value
+
+    def _is_phone_like_answer(self, text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return False
+        has_phone_hint = bool(
+            re.search(
+                r"\b(?:phone|telephone|telefon|mobile\s+number|telefonnummer|contact\s+number)\b",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+        )
+        has_phone_digits = bool(re.search(r"(?:\+\d[\d\s()./-]{6,}|\b\d{2,4}[\s-]\d{2,4}[\s-]\d{2,4}\b)", normalized))
+        has_money_hint = bool(
+            re.search(
+                r"\b(?:chf|eur|usd|gbp|amount|total|due|cost|price|value|betrag|gesamt|kosten|preis)\b",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+        )
+        return bool((has_phone_hint or has_phone_digits) and not has_money_hint)
+
+    def _is_value_like_answer(self, text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return False
+        if not re.search(r"\d", normalized):
+            return False
+        if self._is_phone_like_answer(normalized):
+            return False
+
+        has_value_hint = bool(
+            re.search(
+                r"(?:\b(?:chf|eur|usd|gbp|amount|total|due|cost|price|value|balance|outstanding|paid|payable|betrag|gesamt|kosten|preis)\b|[$€£])",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+        )
+        has_statement_hint = bool(re.search(r"\b(?:was|is|are|equals?|total(?:ed)?|amount)\b", normalized, flags=re.IGNORECASE))
+        return bool(has_value_hint or has_statement_hint)
+
+    def _is_generic_entity_value_answer(self, text: str, entity_name: str | None) -> bool:
+        normalized = str(text or "").strip().lower()
+        entity_norm = str(entity_name or "").strip().lower()
+        if not normalized or not entity_norm:
+            return False
+
+        escaped_entity = re.escape(entity_norm)
+        generic_patterns = [
+            rf"\b(?:the\s+)?(?:total\s+)?amount\s+for\s+{escaped_entity}\s+(?:is|was)\b",
+            rf"\b(?:the\s+)?(?:total\s+)?value\s+for\s+{escaped_entity}\s+(?:is|was)\b",
+            rf"\b(?:the\s+)?(?:total\s+)?bill\s+for\s+{escaped_entity}\s+(?:is|was)\b",
+            rf"\b{escaped_entity}\s*[-:]?\s*>?\s*(?:credit|debit)?\s*total\b",
+        ]
+        return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in generic_patterns)
+
+    def _build_generic_value_rewrite_candidates(self, question: str, parsed: Any | None = None) -> list[str]:
+        normalized_question = str(question or "").strip()
+        if not normalized_question:
+            return []
+
+        rewrites: list[str] = []
+        patterns = [
+            r"(?is)^\s*what\s+(?:was|is)\s+the\s+(.+?)\s+for\s+(.+?)\s*[?.!]?\s*$",
+            r"(?is)^\s*what\s+(?:was|is)\s+(.+?)\s+for\s+(.+?)\s*[?.!]?\s*$",
+            r"(?is)^\s*what\s+is\s+the\s+total\s+for\s+(.+?)\s*[?.!]?\s*$",
+        ]
+        for pattern in patterns:
+            match = re.match(pattern, normalized_question)
+            if not match:
+                continue
+            if len(match.groups()) == 2:
+                phrase = str(match.group(1) or "").strip()
+                entity = str(match.group(2) or "").strip()
+                if phrase and entity:
+                    rewrites.append(f"How much was the {phrase} for {entity}?")
+            elif len(match.groups()) == 1:
+                entity = str(match.group(1) or "").strip()
+                if entity:
+                    rewrites.append(f"How much was the total amount for {entity}?")
+
+        attribute_hint = ""
+        entity_hint = ""
+        if parsed is not None:
+            try:
+                attribute_hint = str(getattr(parsed, "attribute_name", "") or "").strip()
+            except Exception:
+                attribute_hint = ""
+            try:
+                entity_hint = str(getattr(parsed, "entity_name", "") or "").strip()
+            except Exception:
+                entity_hint = ""
+
+        if attribute_hint and entity_hint:
+            rewrites.append(f"How much was the {attribute_hint} for {entity_hint}?")
+
+        normalized_lower = normalized_question.lower()
+        if entity_hint and re.search(r"\b(?:bill|invoice|receipt|payment|charge|fee|rechnung|beleg|zahlung|quittung)\b", normalized_lower, flags=re.IGNORECASE):
+            qualifier_tokens = [
+                token
+                for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{2,}", normalized_lower)
+                if token
+                not in {
+                    "what", "was", "is", "the", "for", "how", "much", "amount", "value", "total",
+                    "cost", "price", "due", "sum", "bill", "invoice", "receipt", "payment", "charge",
+                    "fee", "rechnung", "beleg", "zahlung", "quittung",
+                }
+                and token not in {t.lower() for t in re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{2,}", entity_hint.lower())}
+            ]
+            qualifier_phrase = " ".join(qualifier_tokens[:3]).strip()
+            if qualifier_phrase:
+                rewrites.append(f"What was the {qualifier_phrase} invoice total for {entity_hint}?")
+            rewrites.append(f"What was the invoice total for {entity_hint}?")
+
+        parsed_criteria: dict[str, Any] = {}
+        if parsed is not None:
+            try:
+                parsed_criteria = getattr(parsed, "criteria", {}) or {}
+            except Exception:
+                parsed_criteria = {}
+        if isinstance(parsed_criteria, dict):
+            must_contain_terms = [
+                str(item).strip()
+                for item in list(parsed_criteria.get("must_contain") or [])
+                if str(item).strip()
+            ]
+            if must_contain_terms and entity_hint:
+                compact_focus = " ".join(must_contain_terms[:4]).strip()
+                if compact_focus:
+                    rewrites.append(f"How much was the {compact_focus} amount for {entity_hint}?")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in rewrites:
+            normalized = ""
+            try:
+                normalized = self.query_engine._normalize_semantic_text(candidate)
+            except Exception:
+                normalized = candidate.strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            try:
+                same_as_original = (
+                    normalized
+                    == self.query_engine._normalize_semantic_text(normalized_question)
+                )
+            except Exception:
+                same_as_original = normalized == normalized_question.strip().lower()
+            if same_as_original:
+                continue
+            seen.add(normalized)
+            deduped.append(candidate)
+
+        return deduped
+
+    def _extract_value_focus_terms(self, question: str, parsed: Any | None = None) -> list[str]:
+        normalized_question = str(question or "").strip().lower()
+        if not normalized_question:
+            return []
+
+        generic_value_terms = {
+            "how",
+            "much",
+            "what",
+            "was",
+            "is",
+            "the",
+            "a",
+            "an",
+            "for",
+            "of",
+            "and",
+            "or",
+            "to",
+            "from",
+            "amount",
+            "total",
+            "cost",
+            "price",
+            "value",
+            "due",
+            "sum",
+            "bill",
+            "invoice",
+            "payment",
+            "charge",
+            "fee",
+            "rechnung",
+            "betrag",
+            "kosten",
+            "preis",
+            "gesamt",
+            "services",
+            "service",
+        }
+
+        entity_tokens: set[str] = set()
+        attribute_tokens: list[str] = []
+        criteria_tokens: list[str] = []
+        if parsed is not None:
+            try:
+                entity_hint = str(getattr(parsed, "entity_name", "") or "").strip().lower()
+            except Exception:
+                entity_hint = ""
+            if entity_hint:
+                entity_tokens = {
+                    token
+                    for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{1,}", entity_hint)
+                    if token
+                }
+
+            try:
+                attribute_hint = str(getattr(parsed, "attribute_name", "") or "").strip().lower()
+            except Exception:
+                attribute_hint = ""
+            if attribute_hint:
+                attribute_tokens.extend(re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{1,}", attribute_hint))
+
+            try:
+                parsed_criteria = getattr(parsed, "criteria", {}) or {}
+            except Exception:
+                parsed_criteria = {}
+            if isinstance(parsed_criteria, dict):
+                for item in list(parsed_criteria.get("must_contain") or []):
+                    criteria_tokens.extend(re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{1,}", str(item).lower()))
+
+        question_tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{1,}", normalized_question)
+        candidate_tokens = list(question_tokens) + attribute_tokens + criteria_tokens
+
+        focus_terms: list[str] = []
+        seen: set[str] = set()
+        for token in candidate_tokens:
+            if not token:
+                continue
+            if token in seen:
+                continue
+            if token in generic_value_terms:
+                continue
+            if token in entity_tokens:
+                continue
+            if len(token) < 3:
+                continue
+            seen.add(token)
+            focus_terms.append(token)
+
+        return focus_terms[:8]
+
+    def _try_generic_value_contextual_resolution(
+        self,
+        question: str,
+        parsed: Any,
+        candidates: list[dict[str, Any]],
+        discovery_results: list[dict[str, Any]],
+        telemetry: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._is_value_question(question, parsed):
+            return None
+
+        focus_terms = self._extract_value_focus_terms(question, parsed)
+        has_qualified_focus = bool(focus_terms)
+
+        try:
+            entity_hint = str(getattr(parsed, "entity_name", "") or "").strip()
+        except Exception:
+            entity_hint = ""
+
+        def _is_generic_entity_value_answer(text: str) -> bool:
+            normalized = str(text or "").strip().lower()
+            if not normalized or not entity_hint:
+                return False
+            entity_norm = entity_hint.strip().lower()
+            if not entity_norm:
+                return False
+            escaped_entity = re.escape(entity_norm)
+            generic_patterns = [
+                rf"\b(?:the\s+)?(?:total\s+)?amount\s+for\s+{escaped_entity}\s+(?:is|was)\b",
+                rf"\b(?:the\s+)?(?:total\s+)?value\s+for\s+{escaped_entity}\s+(?:is|was)\b",
+                rf"\b(?:the\s+)?(?:total\s+)?bill\s+for\s+{escaped_entity}\s+(?:is|was)\b",
+                rf"\b{escaped_entity}\s*[-:]?\s*>?\s*(?:credit|debit)?\s*total\b",
+            ]
+            return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in generic_patterns)
+
+        attempts = [str(question or "").strip()]
+        attempts.extend(self._build_generic_value_rewrite_candidates(question, parsed))
+
+        for attempt_question in attempts:
+            if not attempt_question:
+                continue
+            try:
+                resolved = self.query_engine._contextual_llm_resolution_fallback(
+                    question=attempt_question,
+                    parsed=parsed,
+                    candidates=candidates,
+                    discovery_results=discovery_results,
+                )
+                if isinstance(telemetry, dict):
+                    telemetry["contextual_fallback_calls"] = int(telemetry.get("contextual_fallback_calls", 0)) + 1
+            except Exception:
+                resolved = None
+
+            if not isinstance(resolved, dict):
+                continue
+
+            answer_text = str(resolved.get("answer") or "").strip()
+            answer_source = str(resolved.get("source") or "").strip().lower()
+            if not answer_text:
+                continue
+            if answer_source in {"criteria_sql", "criteria_docs_sql"}:
+                continue
+            if not self._is_value_like_answer(answer_text):
+                continue
+            if has_qualified_focus and _is_generic_entity_value_answer(answer_text):
+                continue
+
+            resolved_payload = dict(resolved)
+            if attempt_question != str(question or "").strip():
+                resolved_payload["rewrite_question"] = attempt_question
+            return resolved_payload
+
+        return None
+
+    def _build_query_evidence_bundle(
+        self,
+        question: str,
+        query_result: dict[str, Any] | None,
+        parsed_override: Any | None = None,
+    ) -> dict[str, Any]:
+        parsed = parsed_override if parsed_override is not None else self.query_engine.parse_query(question)
         parsed_data = {
             "intent": getattr(parsed, "intent", None),
             "entity_name": getattr(parsed, "entity_name", None),
@@ -6488,10 +7822,40 @@ class IDMSInteractionTools:
             answer_sources = self._answer_sources(query_result.get("grounding") if isinstance(query_result.get("grounding"), dict) else {})
 
         provenance_snapshot = self._extract_provenance_snapshot(query_result)
-        try:
-            scope = self.query_engine.resolve_search_scope(question)
-        except Exception:
-            scope = {}
+
+        scope: dict[str, Any] = {}
+        if isinstance(query_result, dict):
+            grounding_payload = query_result.get("grounding") if isinstance(query_result.get("grounding"), dict) else {}
+            if isinstance(grounding_payload.get("scope"), dict):
+                scope = dict(grounding_payload.get("scope") or {})
+
+        if not scope:
+            semantic_sources = {
+                "qdrant",
+                "qdrant_sql",
+                "qdrant_sql_fallback",
+                "qdrant_semantic",
+                "discovery",
+                "discovery_fallback",
+                "discovery_semantic",
+                "semantic_llm_fallback",
+                "contextual_llm_resolution_fallback",
+                "criteria_contextual_llm",
+            }
+            source_hints = {
+                str(item).strip().lower()
+                for item in answer_sources
+                if str(item).strip()
+            }
+            if isinstance(query_result, dict):
+                source_hints.add(str(query_result.get("source") or "").strip().lower())
+                source_hints.add(str(query_result.get("answer_source") or "").strip().lower())
+
+            if any(item in semantic_sources for item in source_hints):
+                try:
+                    scope = self.query_engine.resolve_search_scope(question)
+                except Exception:
+                    scope = {}
 
         entities: list[str] = []
         attributes: list[str] = []
@@ -6542,6 +7906,7 @@ class IDMSInteractionTools:
                 "answer_sources": answer_sources,
                 "candidate_count": int(query_result.get("candidate_count", 0) or 0) if isinstance(query_result, dict) else 0,
             },
+            "telemetry": dict(query_result.get("request_telemetry") or {}) if isinstance(query_result, dict) and isinstance(query_result.get("request_telemetry"), dict) else {},
             "evidence": {
                 "primary_data": result_data,
                 "provenance_snapshot": provenance_snapshot,
@@ -6567,9 +7932,14 @@ class IDMSInteractionTools:
         """Tool: Search Discovery Engine directly for media-heavy results."""
         return self.query_engine.search_discovery(question, limit=limit)
 
-    def search_criteria(self, question: str, scope: dict[str, Any] | None = None) -> dict[str, Any]:
+    def search_criteria(
+        self,
+        question: str,
+        scope: dict[str, Any] | None = None,
+        parsed: Any | None = None,
+    ) -> dict[str, Any]:
         """Tool: Execute list/filter criteria queries against structured records."""
-        parsed = self.query_engine.parse_query(question)
+        parsed = parsed if parsed is not None else self.query_engine.parse_query(question)
         criteria_result = self.query_engine.search_by_criteria(
             question=question,
             parsed=parsed,
@@ -6745,10 +8115,25 @@ class IDMSInteractionTools:
                     "scope_retry": "scope_documents",
                 }
 
+        requires_contextual_bridge = False
+        if str(getattr(parsed, "intent", "") or "").strip().lower() == "attribute_lookup":
+            try:
+                requires_contextual_bridge = self.query_engine._requires_contextual_value_resolution(
+                    question=question,
+                    parsed=parsed,
+                    criteria=parsed.criteria if isinstance(parsed.criteria, dict) else {},
+                    direct_result={"attribute_name": getattr(parsed, "attribute_name", None)},
+                )
+            except Exception:
+                requires_contextual_bridge = False
+
         if (
             not criteria_result
             and str(getattr(parsed, "intent", "") or "").strip().lower() == "attribute_lookup"
-            and self.query_engine._is_value_document_context_question(question)
+            and (
+                self.query_engine._is_value_document_context_question(question)
+                or requires_contextual_bridge
+            )
         ):
             parsed_criteria = parsed.criteria if isinstance(parsed.criteria, dict) else {}
             relation_filters: list[dict[str, Any]] = []
@@ -6819,6 +8204,68 @@ class IDMSInteractionTools:
                     scope=scope,
                     limit=20,
                 )
+
+        # Some criteria SQL paths can return only count/source with sparse match rows.
+        # For value-context attribute queries we hydrate top document matches from
+        # semantic scope so contextual value extraction has grounded evidence.
+        if (
+            isinstance(criteria_result, dict)
+            and int(criteria_result.get("count", 0) or 0) > 0
+            and not list(criteria_result.get("matches") or [])
+            and str(getattr(parsed, "intent", "") or "").strip().lower() == "attribute_lookup"
+            and (
+                self.query_engine._is_value_document_context_question(question)
+                or requires_contextual_bridge
+            )
+        ):
+            try:
+                resolved_scope = scope if isinstance(scope, dict) and scope else self.query_engine.resolve_search_scope(question, limit=24)
+                scope_docs = list((resolved_scope or {}).get("documents") or []) if isinstance(resolved_scope, dict) else []
+                hydrated_matches: list[dict[str, Any]] = []
+                seen_doc_ids: set[int] = set()
+                must_terms = [
+                    str(item).strip()
+                    for item in list(((parsed.criteria or {}) if isinstance(parsed.criteria, dict) else {}).get("must_contain") or [])
+                    if str(item).strip()
+                ]
+
+                for item in scope_docs:
+                    if not isinstance(item, dict):
+                        continue
+                    doc_id = item.get("doc_id")
+                    if not isinstance(doc_id, int) or doc_id in seen_doc_ids:
+                        continue
+                    seen_doc_ids.add(doc_id)
+                    hydrated_matches.append(
+                        {
+                            "object_id": None,
+                            "entity_name": str(item.get("doc_name") or item.get("title") or item.get("doc_path") or f"document_{doc_id}").strip(),
+                            "entity_type": "document",
+                            "doc_id": doc_id,
+                            "doc_name": item.get("doc_name") or item.get("title"),
+                            "doc_path": item.get("doc_path") or item.get("file_path") or "",
+                            "doc_date": item.get("doc_date"),
+                            "title": item.get("title"),
+                            "file_name": item.get("file_name"),
+                            "file_path": item.get("file_path") or item.get("doc_path") or "",
+                            "matched_terms": must_terms[:6],
+                            "score": float(item.get("score") or 0.0),
+                            "doc_theme": item.get("doc_theme"),
+                            "doc_cat": item.get("doc_cat"),
+                            "doc_type": item.get("doc_type"),
+                            "keyword_text": item.get("keyword_text"),
+                        }
+                    )
+                    if len(hydrated_matches) >= 20:
+                        break
+
+                if hydrated_matches:
+                    criteria_result = dict(criteria_result)
+                    criteria_result["matches"] = hydrated_matches
+                    criteria_result["source"] = str(criteria_result.get("source") or "criteria_sql")
+                    criteria_result["scope_retry"] = "scope_documents_hydrated"
+            except Exception:
+                pass
 
         if not criteria_result:
             return {
@@ -6918,12 +8365,26 @@ class IDMSInteractionTools:
 
     def perform_action(self, action_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Execute SOLF-guarded workflow action using ActionTool."""
-        action = str(action_name or "").strip().lower()
-        payload = payload if isinstance(payload, dict) else {}
+        normalized_payload = payload if isinstance(payload, dict) else {}
+        if isinstance(normalized_payload, dict) and not any(
+            str(normalized_payload.get(field) or "").strip()
+            for field in ("message", "text", "request", "instruction", "command", "prompt", "query")
+        ):
+            last_request = str(self._last_nl_request_text or "").strip()
+            if last_request:
+                normalized_payload = dict(normalized_payload)
+                normalized_payload["message"] = last_request
+
+        action, payload = self._normalize_integrate_source_action_request(action_name, normalized_payload)
 
         def _respond(out: dict[str, Any]) -> dict[str, Any]:
             self._log_action_execution(action, payload, out)
             return out
+
+        if action == "integrate_source_database":
+            return _respond(self._integrate_source_database_action(payload))
+        if action == "sync_source_database_entities":
+            return _respond(self._sync_source_database_entities_action(payload))
 
         # Compose and enforce SOLF semantic plan first.
         semantic_plan = self._compose_action_plan(action, payload)
@@ -7785,8 +9246,15 @@ class IDMSInteractionTools:
 
     def preview_action_plan(self, action_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Dry-run SOLF composition: return semantic plan + SQL plan without execution."""
-        action = str(action_name or "").strip().lower()
-        payload = payload if isinstance(payload, dict) else {}
+        action, payload = self._normalize_integrate_source_action_request(action_name, payload if isinstance(payload, dict) else {})
+        if action == "integrate_source_database":
+            preview_payload = dict(payload)
+            preview_payload["dry_run"] = True
+            return self._build_integrate_source_database_preview(preview_payload)
+        if action == "sync_source_database_entities":
+            preview_payload = dict(payload)
+            preview_payload["dry_run"] = True
+            return self._build_sync_source_database_entities_preview(preview_payload)
         semantic_plan = self._compose_action_plan(action, payload)
         if not semantic_plan:
             return {
@@ -8559,9 +10027,10 @@ class IDMSInteractionTools:
         question = str(question or "").strip()
         if not question:
             raise ValueError("question must not be empty")
+        self._last_nl_request_text = question
 
         clause_request = self._resolve_solf_clause_request(question)
-        if isinstance(clause_request, dict):
+        if self._should_dispatch_solf_clause(question, clause_request):
             query_like = self._dispatch_solf_clause_request(question, clause_request)
             answer_text = str(query_like.get("answer") or "").strip()
             if record_history:
@@ -8613,19 +10082,115 @@ class IDMSInteractionTools:
             }
 
         self.logger.info("Autonomous query started: max_steps=%s question=%s", max_steps, question)
+
+        excluded_country = self._extract_customer_country_exclusion(question)
         
         # Check cache first (avoid expensive planner + retrieval for repeated queries).
         if self.query_cache:
             cached = self.query_cache.get(question)
-            if cached is not None and "answer" in cached:
+            if cached is not None and "answer" in cached and not excluded_country:
                 cached = dict(cached)
                 cached["_cache_hit"] = True
                 self.logger.info("Autonomous query cache hit")
                 return cached
 
+        # Deterministic integrated-DB fast path for list/filter customer-country queries.
+        if excluded_country:
+            integrated = self._query_customers_excluding_country(excluded_country)
+            if integrated.get("success"):
+                rows = list(integrated.get("rows") or [])
+                preview = rows[:10]
+                preview_text = ", ".join(
+                    f"{str(item.get('customer_name') or '').strip()} ({str(item.get('country') or '').strip()})"
+                    for item in preview
+                    if str(item.get("customer_name") or "").strip()
+                )
+                if rows:
+                    answer_text = (
+                        f"[source: integrated_db_sql] Found {int(integrated.get('count', 0) or 0)} customers "
+                        f"from {int(integrated.get('country_count', 0) or 0)} countries excluding {excluded_country}."
+                    )
+                    if preview_text:
+                        answer_text += f" Sample: {preview_text}."
+                else:
+                    answer_text = (
+                        f"[source: integrated_db_sql] No customers found outside {excluded_country} "
+                        "in integrated database records."
+                    )
+
+                result = {
+                    "answer": answer_text,
+                    "answer_source": "integrated_db_sql",
+                    "answer_sources": ["integrated_db_sql"],
+                    "grounding": {
+                        "parsed": {
+                            "intent": "criteria_lookup",
+                            "entity_name": "customer",
+                            "attribute_name": "country",
+                            "confidence": 1.0,
+                            "criteria": {
+                                "entity_type": "customer",
+                                "exclude_country": excluded_country,
+                            },
+                        },
+                        "query_style": {
+                            "mode": "allow",
+                            "query_style": "criteria_list",
+                            "initial_action": "search_criteria",
+                            "reason": "integrated_db_customer_country_exclusion_fast_path",
+                        },
+                        "integrated_db_result": {
+                            "count": integrated.get("count"),
+                            "country_count": integrated.get("country_count"),
+                            "excluded_country": excluded_country,
+                            "rows": preview,
+                        },
+                    },
+                    "policy": {
+                        "query": {"mode": "allow", "reason": "deterministic_integrated_db_fast_path"},
+                        "style": {"mode": "allow", "reason": "deterministic_integrated_db_fast_path"},
+                        "answer": {"mode": "allow", "reason": "deterministic_integrated_db_fast_path"},
+                    },
+                    "trace": [
+                        {
+                            "step": 0,
+                            "tool": "integrated_db_customer_country_filter",
+                            "excluded_country": excluded_country,
+                            "count": int(integrated.get("count", 0) or 0),
+                        }
+                    ],
+                    "model": "deterministic_integrated_db",
+                    "data": integrated,
+                }
+                if record_history:
+                    self.state.history.append({"role": "user", "content": question})
+                    self.state.history.append({"role": "assistant", "content": answer_text})
+                if self.query_cache:
+                    self.query_cache.put(question, result)
+                return result
+
         # Hard cap to prevent excessive planner costs.
         max_steps = min(max(1, int(max_steps)), 4)
         parsed = self.query_engine.parse_query(question)
+
+        normalized_attr_name = str(parsed.attribute_name or "").strip().lower()
+        looks_like_billing_amount_attr = bool(
+            re.search(r"\b(?:bill|invoice|receipt|payment|charge|fee|rechnung|beleg|zahlung|quittung)\b", normalized_attr_name)
+            and re.search(r"\b(?:amount|total|value|cost|price|due|sum|betrag|gesamt|kosten|preis)\b", normalized_attr_name)
+        )
+        if parsed.intent in {"attribute_lookup", "criteria_lookup"} and looks_like_billing_amount_attr:
+            parsed.attribute_name = "amount"
+            parsed_criteria = dict(parsed.criteria) if isinstance(parsed.criteria, dict) else {}
+            attr_hints = [str(item).strip() for item in list(parsed_criteria.get("attribute_hints") or []) if str(item).strip()]
+            for hint in ["amount", "total_amount", "gross_amount", "amount_total_due", "debit_total", "credit_total", "currency"]:
+                if hint not in attr_hints:
+                    attr_hints.append(hint)
+            parsed_criteria["attribute_hints"] = attr_hints[:12]
+            parsed_criteria.setdefault("semantic_frame", "interaction_value_document_context_bridge")
+            parsed_criteria.setdefault("response_shape", "scalar")
+            parsed_criteria["preferred_amount_semantics"] = "document_total_due"
+            parsed.criteria = parsed_criteria
+
         parsed_payload = {
             "intent": parsed.intent,
             "entity_name": parsed.entity_name,
@@ -8645,11 +10210,24 @@ class IDMSInteractionTools:
             "criteria_result": None,
             "criteria_contextual_result": None,
             "trace": [],
+            "telemetry": {
+                "parser_calls": 1,
+                "planner_llm_calls": 0,
+                "query_engine_answer_calls": 0,
+                "criteria_contextual_calls": 0,
+                "contextual_fallback_calls": 0,
+                "media_intent_llm_calls": 0,
+                "deterministic_loop_used": False,
+            },
         }
 
         def _attach_evidence_bundle(result: dict[str, Any]) -> dict[str, Any]:
             enriched = dict(result)
-            enriched["evidence_bundle"] = self._build_query_evidence_bundle(question, enriched)
+            enriched["evidence_bundle"] = self._build_query_evidence_bundle(
+                question,
+                enriched,
+                parsed_override=parsed,
+            )
             return enriched
 
         query_policy_payload = {
@@ -8754,6 +10332,18 @@ class IDMSInteractionTools:
         if query_policy.get("mode") == "escalate":
             max_steps = min(max(1, int(max_steps)) + 1, 8)
 
+        require_contextual_resolution = False
+        if parsed.intent in {"attribute_lookup", "criteria_lookup"}:
+            try:
+                require_contextual_resolution = self.query_engine._requires_contextual_value_resolution(
+                    question=question,
+                    parsed=parsed,
+                    criteria=parsed.criteria if isinstance(parsed.criteria, dict) else {},
+                    direct_result={"attribute_name": parsed.attribute_name},
+                )
+            except Exception:
+                require_contextual_resolution = False
+
         # Direct factual fallback: if QueryEngine can already answer, use it and skip planner drift.
         # This prevents false [source: not_found] when resolve_scope returns empty but SQL facts exist.
         aggregate_value_question = bool(
@@ -8761,12 +10351,16 @@ class IDMSInteractionTools:
             and self.query_engine._looks_like_travel_expense_total_question(question)
         )
         if (
-            parsed.intent in {"attribute_lookup", "semantic_lookup", "relationship_lookup"}
+            parsed.intent in {"attribute_lookup", "semantic_lookup", "relationship_lookup", "criteria_lookup"}
             and (
                 aggregate_value_question
-                or not self.query_engine._is_value_document_context_question(question)
+                or (
+                    not self.query_engine._is_value_document_context_question(question)
+                    and not require_contextual_resolution
+                )
             )
         ):
+            state["telemetry"]["query_engine_answer_calls"] = int((state.get("telemetry") or {}).get("query_engine_answer_calls", 0)) + 1
             try:
                 direct_answer = self.query_engine.answer(question)
             except Exception:
@@ -8818,6 +10412,7 @@ class IDMSInteractionTools:
                             "answer_source": "policy_blocked",
                             "answer_sources": ["policy_blocked"],
                             "grounding": grounding,
+                            "request_telemetry": dict(state.get("telemetry") or {}),
                             "policy": {
                                 "query": query_policy,
                                 "style": style_policy,
@@ -8834,6 +10429,7 @@ class IDMSInteractionTools:
                         "answer_source": direct_source,
                         "answer_sources": answer_sources,
                         "grounding": grounding,
+                        "request_telemetry": dict(state.get("telemetry") or {}),
                         "policy": {
                             "query": query_policy,
                             "style": style_policy,
@@ -8851,7 +10447,8 @@ class IDMSInteractionTools:
 
         # Fast path: direct attribute questions should hit SQL/object lookup first.
         # This avoids planner drift when Qdrant/Discovery scope is empty but structured data exists.
-        if parsed.intent == "attribute_lookup" and parsed.entity_name and parsed.attribute_name:
+        # Keep contextual value questions on grounded criteria/LLM resolution paths.
+        if parsed.intent == "attribute_lookup" and parsed.entity_name and parsed.attribute_name and not require_contextual_resolution:
             direct = self.query_engine.lookup_attribute(
                 attribute_name=parsed.attribute_name,
                 entity_name=parsed.entity_name,
@@ -8909,10 +10506,11 @@ class IDMSInteractionTools:
                     }
 
                 display_attr = self.query_engine._get_attribute_display_name(direct["attribute_name"], parsed.language)
+                display_value = self.query_engine._repair_mojibake_value(direct.get("attribute_value")) if hasattr(self.query_engine, "_repair_mojibake_value") else direct.get("attribute_value")
                 if str(parsed.language or "en").lower() == "de":
-                    answer_text = f"[source: sql_exact] {display_attr} für {direct['entity_name']} ist {direct['attribute_value']}."
+                    answer_text = f"[source: sql_exact] {display_attr} für {direct['entity_name']} ist {display_value}."
                 else:
-                    answer_text = f"[source: sql_exact] {display_attr} for {direct['entity_name']} is {direct['attribute_value']}."
+                    answer_text = f"[source: sql_exact] {display_attr} for {direct['entity_name']} is {display_value}."
 
                 if record_history:
                     self.state.history.append({"role": "user", "content": question})
@@ -8923,6 +10521,7 @@ class IDMSInteractionTools:
                     "answer_source": "sql_exact",
                     "answer_sources": ["sql_exact"],
                     "grounding": grounding,
+                    "request_telemetry": dict(state.get("telemetry") or {}),
                     "policy": {
                         "query": query_policy,
                         "style": style_policy,
@@ -8935,11 +10534,65 @@ class IDMSInteractionTools:
                     self.query_cache.put(question, _attach_evidence_bundle(result))
                 return _attach_evidence_bundle(result)
 
+        parsed_intent_hint = str((state.get("parsed") or {}).get("intent") or "").strip().lower()
+        parsed_confidence_hint = float((state.get("parsed") or {}).get("confidence") or 0.0)
+        use_deterministic_loop = bool(
+            parsed_intent_hint in {"attribute_lookup", "criteria_lookup"}
+            and (
+                parsed_confidence_hint >= 0.85
+                or require_contextual_resolution
+            )
+        )
+        state["telemetry"]["deterministic_loop_used"] = bool(use_deterministic_loop)
+
         for step in range(max(1, int(max_steps))):
             self.logger.info("Autonomous query workflow step=%s", step)
-            if (
+            parsed_intent = str((state.get("parsed") or {}).get("intent") or "").strip().lower()
+            has_criteria_result = bool(state.get("criteria_result"))
+
+            if use_deterministic_loop:
+                if (
+                    not has_criteria_result
+                    and (
+                        parsed_intent == "criteria_lookup"
+                        or self.query_engine._is_value_document_context_question(question)
+                        or require_contextual_resolution
+                    )
+                ):
+                    decision = {
+                        "action": "search_criteria",
+                        "attribute_name": str((state.get("parsed") or {}).get("attribute_name") or "").strip() or None,
+                        "entity_name": str((state.get("parsed") or {}).get("entity_name") or "").strip() or None,
+                        "rationale": "High-confidence parsed intent allows deterministic criteria retrieval without planner LLM.",
+                    }
+                elif (
+                    parsed_intent == "attribute_lookup"
+                    and not state.get("attribute_result")
+                    and str((state.get("parsed") or {}).get("attribute_name") or "").strip()
+                    and not (
+                        require_contextual_resolution
+                        or self.query_engine._is_value_document_context_question(question)
+                    )
+                ):
+                    decision = {
+                        "action": "lookup_attribute",
+                        "attribute_name": str((state.get("parsed") or {}).get("attribute_name") or "").strip() or None,
+                        "entity_name": str((state.get("parsed") or {}).get("entity_name") or "").strip() or None,
+                        "rationale": "High-confidence parsed intent allows deterministic attribute lookup without planner LLM.",
+                    }
+                else:
+                    decision = {
+                        "action": "finalize",
+                        "attribute_name": None,
+                        "entity_name": None,
+                        "rationale": "Deterministic retrieval path is complete; finalize without planner LLM.",
+                    }
+            elif (
                 step == 0
-                and self.query_engine._is_value_document_context_question(question)
+                and (
+                    self.query_engine._is_value_document_context_question(question)
+                    or require_contextual_resolution
+                )
                 and not state.get("criteria_result")
             ):
                 decision = {
@@ -8950,9 +10603,8 @@ class IDMSInteractionTools:
                 }
             else:
                 decision = self._planner_step(question, state, step)
+                state["telemetry"]["planner_llm_calls"] = int((state.get("telemetry") or {}).get("planner_llm_calls", 0)) + 1
             action = decision["action"]
-            parsed_intent = str((state.get("parsed") or {}).get("intent") or "").strip().lower()
-            has_criteria_result = bool(state.get("criteria_result"))
 
             # Criteria-intent guardrail: run SQL criteria retrieval before semantic-only
             # discovery loops when the parser has already identified a list/filter ask.
@@ -8987,6 +10639,56 @@ class IDMSInteractionTools:
                         "Scope resolution already returned no Qdrant or Discovery candidates, "
                         "so repeating resolve_scope would not add new evidence."
                     )
+
+            # Re-running scope resolution with the same question is redundant once
+            # scope data already exists in state; route to the next productive step.
+            if action == "resolve_scope" and isinstance(state.get("scope"), dict):
+                if parsed_intent == "criteria_lookup" and not has_criteria_result:
+                    action = "search_criteria"
+                    decision["rationale"] = (
+                        "Scope already resolved for this request; continue with criteria retrieval "
+                        "instead of repeating vector scope search."
+                    )
+                elif parsed_intent == "attribute_lookup" and not state.get("attribute_result"):
+                    action = "lookup_attribute"
+                    decision["rationale"] = (
+                        "Scope already resolved for this request; continue with attribute lookup "
+                        "instead of repeating vector scope search."
+                    )
+                elif parsed_intent == "semantic_lookup" and not isinstance(state.get("discovery_search"), dict):
+                    action = "search_discovery"
+                    decision["rationale"] = (
+                        "Scope already resolved for this request; continue with discovery search "
+                        "instead of repeating vector scope search."
+                    )
+                else:
+                    action = "finalize"
+                    decision["rationale"] = (
+                        "Scope was already resolved and no additional retrieval step is pending; "
+                        "finalizing to avoid repeated identical searches."
+                    )
+                decision["action"] = action
+
+            if action == "search_discovery" and isinstance(state.get("discovery_search"), dict):
+                if parsed_intent == "criteria_lookup" and not has_criteria_result:
+                    action = "search_criteria"
+                    decision["rationale"] = (
+                        "Discovery search already ran for this request; continue with criteria retrieval "
+                        "instead of repeating discovery search."
+                    )
+                elif parsed_intent == "attribute_lookup" and not state.get("attribute_result"):
+                    action = "lookup_attribute"
+                    decision["rationale"] = (
+                        "Discovery search already ran for this request; continue with attribute lookup "
+                        "instead of repeating discovery search."
+                    )
+                else:
+                    action = "finalize"
+                    decision["rationale"] = (
+                        "Discovery search was already executed and no new retrieval step is pending; "
+                        "finalizing to avoid repeated identical searches."
+                    )
+                decision["action"] = action
             state["trace"].append({"step": step, "planner": decision})
 
             if action == "resolve_scope":
@@ -9205,7 +10907,7 @@ class IDMSInteractionTools:
 
             if action == "search_criteria":
                 scope_payload = state.get("scope") if isinstance(state.get("scope"), dict) else None
-                criteria_result = self.search_criteria(question, scope=scope_payload)
+                criteria_result = self.search_criteria(question, scope=scope_payload, parsed=parsed)
                 state["criteria_result"] = criteria_result if criteria_result.get("success") else None
                 state["trace"].append(
                     {
@@ -9235,13 +10937,228 @@ class IDMSInteractionTools:
         parsed_intent = str((state.get("parsed") or {}).get("intent") or "").strip().lower()
         parsed_criteria = (state.get("parsed") or {}).get("criteria") if isinstance((state.get("parsed") or {}).get("criteria"), dict) else {}
         response_format = str((parsed_criteria or {}).get("response_format") or "").strip().lower()
+        parsed_attribute_name = str((state.get("parsed") or {}).get("attribute_name") or "").strip().lower()
+        attr_value_like = bool(
+            re.search(
+                r"(?:amount|total|cost|price|value|due|balance|sum|fee|charge)",
+                parsed_attribute_name,
+                flags=re.IGNORECASE,
+            )
+        )
         criteria_result_payload = state.get("criteria_result") if isinstance(state.get("criteria_result"), dict) else None
+        needs_value_evidence_hydration = bool(
+            self._is_value_question(question, parsed)
+            or self.query_engine._is_value_document_context_question(question)
+            or require_contextual_resolution
+        )
         if (
             isinstance(criteria_result_payload, dict)
             and bool(criteria_result_payload.get("success"))
-            and self.query_engine._is_value_document_context_question(question)
-            and not self.query_engine._criteria_question_prefers_listing(question, response_format)
+            and (
+                self.query_engine._is_value_document_context_question(question)
+                or require_contextual_resolution
+            )
+            and (
+                require_contextual_resolution
+                or attr_value_like
+                or not self.query_engine._criteria_question_prefers_listing(question, response_format)
+            )
         ):
+            criteria_for_context = dict(criteria_result_payload)
+            if (
+                needs_value_evidence_hydration
+                and not list(criteria_for_context.get("matches") or [])
+                and int(criteria_for_context.get("count", 0) or 0) > 0
+            ):
+                try:
+                    scope_for_retry = state.get("scope") if isinstance(state.get("scope"), dict) else {}
+                    if not scope_for_retry:
+                        scope_for_retry = self.query_engine.resolve_search_scope(question)
+                        if isinstance(scope_for_retry, dict):
+                            state["scope"] = scope_for_retry
+                            grounding["scope"] = scope_for_retry
+
+                    enriched_criteria = self.search_criteria(
+                        question,
+                        scope=scope_for_retry if isinstance(scope_for_retry, dict) else None,
+                        parsed=parsed,
+                    )
+                    if isinstance(enriched_criteria, dict) and bool(enriched_criteria.get("success")):
+                        enriched_matches = list(enriched_criteria.get("matches") or [])
+                        if enriched_matches:
+                            criteria_for_context = dict(enriched_criteria)
+                except Exception:
+                    pass
+
+            if (
+                needs_value_evidence_hydration
+                and not list(criteria_for_context.get("matches") or [])
+                and int(criteria_for_context.get("count", 0) or 0) > 0
+            ):
+                try:
+                    scope_for_docs = state.get("scope") if isinstance(state.get("scope"), dict) else {}
+                    scope_documents = list(scope_for_docs.get("documents") or []) if isinstance(scope_for_docs, dict) else []
+                    parsed_criteria_for_terms = parsed.criteria if isinstance(parsed.criteria, dict) else {}
+                    must_contain_terms = [
+                        str(item).strip()
+                        for item in list(parsed_criteria_for_terms.get("must_contain") or [])
+                        if str(item).strip()
+                    ]
+
+                    hydrated_matches: list[dict[str, Any]] = []
+                    seen_doc_ids: set[int] = set()
+                    for item in scope_documents:
+                        if not isinstance(item, dict):
+                            continue
+                        doc_id = item.get("doc_id")
+                        if not isinstance(doc_id, int) or doc_id in seen_doc_ids:
+                            continue
+                        doc_blob = " ".join(
+                            [
+                                str(item.get("doc_name") or item.get("title") or ""),
+                                str(item.get("doc_path") or item.get("file_path") or ""),
+                                str(item.get("doc_theme") or ""),
+                                str(item.get("doc_cat") or ""),
+                                str(item.get("doc_type") or ""),
+                                str(item.get("keyword_text") or ""),
+                            ]
+                        ).lower()
+                        matched_terms = [
+                            term
+                            for term in must_contain_terms
+                            if str(term).strip() and str(term).strip().lower() in doc_blob
+                        ]
+                        seen_doc_ids.add(doc_id)
+                        hydrated_matches.append(
+                            {
+                                "doc_id": doc_id,
+                                "doc_name": item.get("doc_name") or item.get("title"),
+                                "doc_path": item.get("doc_path") or item.get("file_path"),
+                                "title": item.get("title") or item.get("doc_name"),
+                                "matched_terms": matched_terms[:4],
+                                "score": float(item.get("score") or 0.0),
+                            }
+                        )
+                        if len(hydrated_matches) >= 12:
+                            break
+
+                    if hydrated_matches:
+                        criteria_for_context = dict(criteria_for_context)
+                        criteria_for_context["matches"] = hydrated_matches
+                except Exception:
+                    pass
+
+            # Deterministic value-evidence hydration pass: even when planner did not
+            # resolve scope, hydrate criteria matches from scope documents so
+            # criteria contextual resolver can extract grounded totals.
+            if (
+                needs_value_evidence_hydration
+                and not list(criteria_for_context.get("matches") or [])
+                and int(criteria_for_context.get("count", 0) or 0) > 0
+            ):
+                try:
+                    scope_for_docs = state.get("scope") if isinstance(state.get("scope"), dict) else {}
+                    scope_documents = list(scope_for_docs.get("documents") or []) if isinstance(scope_for_docs, dict) else []
+
+                    if not scope_documents:
+                        resolved_scope = self.query_engine.resolve_search_scope(question, limit=24)
+                        if isinstance(resolved_scope, dict):
+                            scope_for_docs = resolved_scope
+                            scope_documents = list(resolved_scope.get("documents") or [])
+                            state["scope"] = resolved_scope
+                            grounding["scope"] = resolved_scope
+
+                    if scope_documents:
+                        parsed_criteria_for_terms = parsed.criteria if isinstance(parsed.criteria, dict) else {}
+                        must_contain_terms = [
+                            str(item).strip()
+                            for item in list(parsed_criteria_for_terms.get("must_contain") or [])
+                            if str(item).strip()
+                        ]
+
+                        q_norm = str(question or "").strip().lower()
+                        asks_telecom = bool(re.search(r"\b(?:telephone|phone|mobile|telecom|telefon|mobil)\b", q_norm, flags=re.IGNORECASE))
+                        asks_billing = bool(re.search(r"\b(?:bill|invoice|receipt|payment|charge|fee|rechnung|beleg|zahlung|quittung)\b", q_norm, flags=re.IGNORECASE))
+
+                        ranked_docs: list[tuple[float, dict[str, Any], list[str]]] = []
+                        for item in scope_documents:
+                            if not isinstance(item, dict):
+                                continue
+                            doc_blob = " ".join(
+                                [
+                                    str(item.get("doc_name") or item.get("title") or ""),
+                                    str(item.get("doc_path") or item.get("file_path") or ""),
+                                    str(item.get("doc_theme") or ""),
+                                    str(item.get("doc_cat") or ""),
+                                    str(item.get("doc_type") or ""),
+                                    str(item.get("keyword_text") or ""),
+                                ]
+                            ).lower()
+                            matched_terms = [
+                                term
+                                for term in must_contain_terms
+                                if str(term).strip() and str(term).strip().lower() in doc_blob
+                            ]
+                            topic_score = float(item.get("score") or 0.0) + (0.6 * float(len(matched_terms)))
+
+                            has_telecom = bool(re.search(r"\b(?:telephone|phone|mobile|telecom|telefon|mobil|yallo|sunrise)\b", doc_blob, flags=re.IGNORECASE))
+                            has_billing = bool(re.search(r"\b(?:bill|invoice|receipt|payment|charge|fee|rechnung|beleg|zahlung|quittung)\b", doc_blob, flags=re.IGNORECASE))
+                            looks_non_bill_transport = bool(re.search(r"\b(?:ticket|train|rail|sbb|booking)\b", doc_blob, flags=re.IGNORECASE))
+                            looks_purchase_order = bool(re.search(r"\b(?:purchase\s*order|order\s*no\.|teyu|chiller)\b", doc_blob, flags=re.IGNORECASE))
+
+                            if asks_telecom:
+                                topic_score += 2.2 if has_telecom else -1.6
+                            if asks_billing:
+                                topic_score += 2.2 if has_billing else -1.6
+                            if asks_billing and looks_non_bill_transport:
+                                topic_score -= 2.4
+                            if asks_billing and looks_purchase_order:
+                                topic_score -= 2.0
+
+                            ranked_docs.append((topic_score, item, matched_terms))
+
+                        ranked_docs.sort(key=lambda entry: entry[0], reverse=True)
+
+                        hydrated_matches: list[dict[str, Any]] = []
+                        seen_doc_ids: set[int] = set()
+                        for _rank, item, matched_terms in ranked_docs:
+                            doc_id = item.get("doc_id")
+                            if not isinstance(doc_id, int) or doc_id in seen_doc_ids:
+                                continue
+                            seen_doc_ids.add(doc_id)
+                            hydrated_matches.append(
+                                {
+                                    "doc_id": doc_id,
+                                    "doc_name": item.get("doc_name") or item.get("title"),
+                                    "doc_path": item.get("doc_path") or item.get("file_path"),
+                                    "title": item.get("title") or item.get("doc_name"),
+                                    "matched_terms": matched_terms[:6],
+                                    "score": float(item.get("score") or 0.0),
+                                    "doc_theme": item.get("doc_theme"),
+                                    "doc_cat": item.get("doc_cat"),
+                                    "doc_type": item.get("doc_type"),
+                                    "keyword_text": item.get("keyword_text"),
+                                }
+                            )
+                            if len(hydrated_matches) >= 20:
+                                break
+
+                        if hydrated_matches:
+                            criteria_for_context = dict(criteria_for_context)
+                            criteria_for_context["matches"] = hydrated_matches
+                            state["criteria_result"] = dict(criteria_for_context)
+                            grounding["criteria_result"] = dict(criteria_for_context)
+                            state["trace"].append(
+                                {
+                                    "step": len(state.get("trace", [])),
+                                    "tool": "criteria_value_scope_hydration",
+                                    "hydrated_match_count": len(hydrated_matches),
+                                    "used": True,
+                                }
+                            )
+                except Exception:
+                    pass
+
             scope_payload = state.get("scope") if isinstance(state.get("scope"), dict) else {}
             scoped_candidates = list(scope_payload.get("top_candidates") or []) if isinstance(scope_payload, dict) else []
             if not scoped_candidates:
@@ -9255,10 +11172,11 @@ class IDMSInteractionTools:
             criteria_contextual = self.query_engine._criteria_contextual_llm_resolution_fallback(
                 question=question,
                 parsed=parsed,
-                criteria_result=criteria_result_payload,
+                criteria_result=criteria_for_context,
                 candidates=scoped_candidates,
                 discovery_results=scoped_discovery,
             )
+            state["telemetry"]["criteria_contextual_calls"] = int((state.get("telemetry") or {}).get("criteria_contextual_calls", 0)) + 1
             if isinstance(criteria_contextual, dict) and str(criteria_contextual.get("answer") or "").strip():
                 state["criteria_contextual_result"] = criteria_contextual
                 grounding["criteria_contextual_result"] = criteria_contextual
@@ -9269,6 +11187,24 @@ class IDMSInteractionTools:
                         "success": True,
                     }
                 )
+            elif require_contextual_resolution:
+                contextual_fallback = self.query_engine._contextual_llm_resolution_fallback(
+                    question=question,
+                    parsed=parsed,
+                    candidates=scoped_candidates,
+                    discovery_results=scoped_discovery,
+                )
+                state["telemetry"]["contextual_fallback_calls"] = int((state.get("telemetry") or {}).get("contextual_fallback_calls", 0)) + 1
+                if isinstance(contextual_fallback, dict) and str(contextual_fallback.get("answer") or "").strip():
+                    state["criteria_contextual_result"] = contextual_fallback
+                    grounding["criteria_contextual_result"] = contextual_fallback
+                    state["trace"].append(
+                        {
+                            "step": len(state.get("trace", [])),
+                            "tool": "contextual_llm_resolution_fallback",
+                            "success": True,
+                        }
+                    )
 
         parsed_entity_anchor = str((grounding.get("parsed") or {}).get("entity_name") or "").strip()
         parsed_intent_anchor = str((grounding.get("parsed") or {}).get("intent") or "").strip().lower()
@@ -9308,36 +11244,416 @@ class IDMSInteractionTools:
                 "model": selected_model,
             }
 
+        is_value_question = self._is_value_question(question, parsed)
+        value_focus_terms = self._extract_value_focus_terms(question, parsed) if is_value_question else []
+
         criteria_contextual_result = grounding.get("criteria_contextual_result") if isinstance(grounding, dict) else None
         if isinstance(criteria_contextual_result, dict) and str(criteria_contextual_result.get("answer") or "").strip():
-            answer_text = f"[source: criteria_contextual_llm] {str(criteria_contextual_result.get('answer') or '').strip()}".strip()
-            if record_history:
-                self.state.history.append({"role": "user", "content": question})
-                self.state.history.append({"role": "assistant", "content": answer_text})
+            selected_contextual: dict[str, Any] | None = dict(criteria_contextual_result)
+            if require_contextual_resolution:
+                try:
+                    scope_payload = grounding.get("scope") if isinstance(grounding.get("scope"), dict) else {}
+                    scoped_candidates = list(scope_payload.get("top_candidates") or []) if isinstance(scope_payload, dict) else []
+                    if not scoped_candidates:
+                        scoped_candidates = self.query_engine.qdrant_candidates(question, limit=8)
+                except Exception:
+                    scoped_candidates = []
 
-            result = {
-                "answer": answer_text,
-                "answer_source": "criteria_contextual_llm",
-                "answer_sources": ["criteria_contextual_llm"],
-                "grounding": grounding,
-                "policy": {
-                    "query": query_policy,
-                    "style": style_policy,
-                    "answer": answer_policy,
-                },
-                "trace": state.get("trace", []),
-                "model": "deterministic_criteria_contextual",
-            }
-            if self.query_cache:
-                self.query_cache.put(question, _attach_evidence_bundle(result))
-            return _attach_evidence_bundle(result)
+                try:
+                    discovery_payload = grounding.get("discovery_search") if isinstance(grounding.get("discovery_search"), dict) else {}
+                    scoped_discovery = list(discovery_payload.get("results") or []) if isinstance(discovery_payload, dict) else []
+                except Exception:
+                    scoped_discovery = []
+
+                try:
+                    contextual_override = self.query_engine._contextual_llm_resolution_fallback(
+                        question=question,
+                        parsed=parsed,
+                        candidates=scoped_candidates,
+                        discovery_results=scoped_discovery,
+                    )
+                    state["telemetry"]["contextual_fallback_calls"] = int((state.get("telemetry") or {}).get("contextual_fallback_calls", 0)) + 1
+                except Exception:
+                    contextual_override = None
+
+                if not (isinstance(contextual_override, dict) and str(contextual_override.get("answer") or "").strip()):
+                    normalized_question = str(question or "").strip()
+                    match = re.match(
+                        r"(?is)^\s*what\s+was\s+the\s+(?:total\s+)?(?:amount|cost|price|value)\s+for\s+(.+?)\s*[?.!]?\s*$",
+                        normalized_question,
+                    )
+                    if match:
+                        candidate_phrase = str(match.group(1) or "").strip()
+                        if candidate_phrase:
+                            normalized_question = f"How much was {candidate_phrase}"
+                            try:
+                                contextual_override = self.query_engine._contextual_llm_resolution_fallback(
+                                    question=normalized_question,
+                                    parsed=parsed,
+                                    candidates=scoped_candidates,
+                                    discovery_results=scoped_discovery,
+                                )
+                                state["telemetry"]["contextual_fallback_calls"] = int((state.get("telemetry") or {}).get("contextual_fallback_calls", 0)) + 1
+                            except Exception:
+                                contextual_override = None
+
+                if isinstance(contextual_override, dict) and str(contextual_override.get("answer") or "").strip():
+                    selected_contextual = dict(contextual_override)
+                    state["criteria_contextual_result"] = selected_contextual
+                    grounding["criteria_contextual_result"] = selected_contextual
+                    state["trace"].append(
+                        {
+                            "step": len(state.get("trace", [])),
+                            "tool": "contextual_value_source_preference",
+                            "source": str(selected_contextual.get("source") or "contextual_llm_resolution_fallback"),
+                            "used": True,
+                        }
+                    )
+
+            if isinstance(selected_contextual, dict) and is_value_question:
+                selected_answer = str(selected_contextual.get("answer") or "").strip()
+                entity_hint = str((state.get("parsed") or {}).get("entity_name") or parsed.entity_name or "").strip()
+                is_generic_entity_total = bool(
+                    value_focus_terms
+                    and self._is_generic_entity_value_answer(selected_answer, entity_hint)
+                )
+                if (not self._is_value_like_answer(selected_answer)) or is_generic_entity_total:
+                    selected_contextual = None
+                    state["criteria_contextual_result"] = None
+                    grounding["criteria_contextual_result"] = None
+                    state["trace"].append(
+                        {
+                            "step": len(state.get("trace", [])),
+                            "tool": "generic_value_contextual_validation",
+                            "accepted": False,
+                            "focus_terms": value_focus_terms[:4],
+                            "reason": "generic_entity_total" if is_generic_entity_total else "not_value_like",
+                        }
+                    )
+
+            if isinstance(selected_contextual, dict):
+                contextual_source = str(selected_contextual.get("source") or "contextual_llm_resolution_fallback").strip() or "contextual_llm_resolution_fallback"
+                raw_contextual_answer = str(selected_contextual.get("answer") or "").strip()
+                answer_text = f"[source: {contextual_source}] {raw_contextual_answer}".strip()
+
+                if is_value_question:
+                    try:
+                        contextual_confidence = float(selected_contextual.get("confidence", 1.0))
+                    except Exception:
+                        contextual_confidence = 1.0
+                    if contextual_confidence < self._semantic_best_effort_threshold and raw_contextual_answer:
+                        criteria_docs = (
+                            list(selected_contextual.get("criteria_documents") or [])
+                            if isinstance(selected_contextual.get("criteria_documents"), list)
+                            else []
+                        )
+                        best_doc = criteria_docs[0] if criteria_docs and isinstance(criteria_docs[0], dict) else {}
+                        best_doc_label = str(best_doc.get("doc_name") or best_doc.get("doc_path") or "semantic search result").strip() or "semantic search result"
+                        answer_text = (
+                            f"[source: semantic_best_effort] Confidence is limited ({contextual_confidence:.2f} < {self._semantic_best_effort_threshold:.2f}). "
+                            f"Based on the most relevant semantic match ({best_doc_label}), the best-effort value is: {raw_contextual_answer.rstrip('.')}. "
+                            "This may be uncertain."
+                        ).strip()
+                        contextual_source = "semantic_best_effort"
+                        state["trace"].append(
+                            {
+                                "step": len(state.get("trace", [])),
+                                "tool": "low_confidence_semantic_best_effort",
+                                "confidence": contextual_confidence,
+                                "semantic_doc": best_doc_label,
+                                "used": True,
+                            }
+                        )
+                if record_history:
+                    self.state.history.append({"role": "user", "content": question})
+                    self.state.history.append({"role": "assistant", "content": answer_text})
+
+                result = {
+                    "answer": answer_text,
+                    "answer_source": contextual_source,
+                    "answer_sources": [contextual_source],
+                    "grounding": grounding,
+                    "request_telemetry": dict(state.get("telemetry") or {}),
+                    "policy": {
+                        "query": query_policy,
+                        "style": style_policy,
+                        "answer": answer_policy,
+                    },
+                    "trace": state.get("trace", []),
+                    "model": "deterministic_contextual_value",
+                }
+                if self.query_cache:
+                    self.query_cache.put(question, _attach_evidence_bundle(result))
+                return _attach_evidence_bundle(result)
+
+        def _resolve_scoped_context() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            scope_payload = grounding.get("scope") if isinstance(grounding.get("scope"), dict) else {}
+            scoped_candidates = list(scope_payload.get("top_candidates") or []) if isinstance(scope_payload, dict) else []
+            if not scoped_candidates:
+                try:
+                    scoped_candidates = self.query_engine.qdrant_candidates(question, limit=8)
+                except Exception:
+                    scoped_candidates = []
+
+            discovery_payload = grounding.get("discovery_search") if isinstance(grounding.get("discovery_search"), dict) else {}
+            scoped_discovery = list(discovery_payload.get("results") or []) if isinstance(discovery_payload, dict) else []
+            return scoped_candidates, scoped_discovery
+
+        # Generic value bridge: before criteria-list finalization, try contextual
+        # grounded value resolution for all value-seeking questions.
+        if (require_contextual_resolution or is_value_question) and not isinstance(criteria_contextual_result, dict):
+            scoped_candidates, scoped_discovery = _resolve_scoped_context()
+            contextual_fallback = self._try_generic_value_contextual_resolution(
+                question=question,
+                parsed=parsed,
+                candidates=scoped_candidates,
+                discovery_results=scoped_discovery,
+                telemetry=state.get("telemetry"),
+            )
+
+            if isinstance(contextual_fallback, dict) and str(contextual_fallback.get("answer") or "").strip():
+                contextual_source = str(contextual_fallback.get("source") or "contextual_llm_resolution_fallback").strip() or "contextual_llm_resolution_fallback"
+                answer_text = f"[source: {contextual_source}] {str(contextual_fallback.get('answer') or '').strip()}".strip()
+                grounding["criteria_contextual_result"] = contextual_fallback
+                state["criteria_contextual_result"] = contextual_fallback
+
+                if record_history:
+                    self.state.history.append({"role": "user", "content": question})
+                    self.state.history.append({"role": "assistant", "content": answer_text})
+
+                result = {
+                    "answer": answer_text,
+                    "answer_source": contextual_source,
+                    "answer_sources": [contextual_source],
+                    "grounding": grounding,
+                    "request_telemetry": dict(state.get("telemetry") or {}),
+                    "policy": {
+                        "query": query_policy,
+                        "style": style_policy,
+                        "answer": answer_policy,
+                    },
+                    "trace": state.get("trace", []) + [
+                        {
+                            "step": len(state.get("trace", [])),
+                            "tool": "generic_value_contextual_bridge",
+                            "source": contextual_source,
+                            "rewrite_question": str(contextual_fallback.get("rewrite_question") or "").strip() or None,
+                            "used": True,
+                        }
+                    ],
+                    "model": "deterministic_generic_value_bridge",
+                }
+                if self.query_cache:
+                    self.query_cache.put(question, _attach_evidence_bundle(result))
+                return _attach_evidence_bundle(result)
 
         # Deterministic criteria-list answer to avoid count-only summaries for
         # explicit list/show document queries.
         deterministic_criteria_answer = self._deterministic_criteria_answer(question, grounding)
         if deterministic_criteria_answer:
+            if require_contextual_resolution:
+                try:
+                    state["telemetry"]["query_engine_answer_calls"] = int((state.get("telemetry") or {}).get("query_engine_answer_calls", 0)) + 1
+                    contextual_direct = self.query_engine.answer(question)
+                except Exception:
+                    contextual_direct = None
+
+                if isinstance(contextual_direct, dict):
+                    contextual_source = str(contextual_direct.get("source") or "").strip().lower()
+                    contextual_answer = str(contextual_direct.get("answer") or "").strip()
+                    contextual_acceptable = bool(contextual_answer)
+                    if contextual_acceptable and is_value_question:
+                        entity_hint = str((state.get("parsed") or {}).get("entity_name") or parsed.entity_name or "").strip()
+                        contextual_acceptable = (
+                            self._is_value_like_answer(contextual_answer)
+                            and not (
+                                bool(value_focus_terms)
+                                and self._is_generic_entity_value_answer(contextual_answer, entity_hint)
+                            )
+                        )
+                    if contextual_answer and contextual_source in {
+                        "contextual_llm_resolution_fallback",
+                        "criteria_contextual_llm",
+                        "criteria_contextual_llm_resolution_fallback",
+                    } and contextual_acceptable:
+                        answer_text = contextual_answer
+                        answer_sources = [contextual_source]
+                        if record_history:
+                            self.state.history.append({"role": "user", "content": question})
+                            self.state.history.append({"role": "assistant", "content": answer_text})
+
+                        result = {
+                            "answer": answer_text,
+                            "answer_source": contextual_source,
+                            "answer_sources": answer_sources,
+                            "grounding": grounding,
+                            "request_telemetry": dict(state.get("telemetry") or {}),
+                            "policy": {
+                                "query": query_policy,
+                                "style": style_policy,
+                                "answer": answer_policy,
+                            },
+                            "trace": state.get("trace", []) + [
+                                {
+                                    "step": len(state.get("trace", [])),
+                                    "tool": "query_engine_contextual_value_preference",
+                                    "source": contextual_source,
+                                    "used": True,
+                                }
+                            ],
+                            "model": "deterministic_contextual_preference",
+                        }
+                        if self.query_cache:
+                            self.query_cache.put(question, _attach_evidence_bundle(result))
+                        return _attach_evidence_bundle(result)
+
+            if is_value_question:
+                scoped_candidates, scoped_discovery = _resolve_scoped_context()
+                value_guard_result = self._try_generic_value_contextual_resolution(
+                    question=question,
+                    parsed=parsed,
+                    candidates=scoped_candidates,
+                    discovery_results=scoped_discovery,
+                    telemetry=state.get("telemetry"),
+                )
+                if isinstance(value_guard_result, dict) and str(value_guard_result.get("answer") or "").strip():
+                    contextual_source = str(value_guard_result.get("source") or "contextual_llm_resolution_fallback").strip() or "contextual_llm_resolution_fallback"
+                    answer_text = f"[source: {contextual_source}] {str(value_guard_result.get('answer') or '').strip()}".strip()
+                    grounding["criteria_contextual_result"] = value_guard_result
+                    state["criteria_contextual_result"] = value_guard_result
+                    if record_history:
+                        self.state.history.append({"role": "user", "content": question})
+                        self.state.history.append({"role": "assistant", "content": answer_text})
+
+                    result = {
+                        "answer": answer_text,
+                        "answer_source": contextual_source,
+                        "answer_sources": [contextual_source],
+                        "grounding": grounding,
+                        "request_telemetry": dict(state.get("telemetry") or {}),
+                        "policy": {
+                            "query": query_policy,
+                            "style": style_policy,
+                            "answer": answer_policy,
+                        },
+                        "trace": state.get("trace", []) + [
+                            {
+                                "step": len(state.get("trace", [])),
+                                "tool": "generic_value_criteria_finalization_guard",
+                                "source": contextual_source,
+                                "rewrite_question": str(value_guard_result.get("rewrite_question") or "").strip() or None,
+                                "used": True,
+                            }
+                        ],
+                        "model": "deterministic_generic_value_guard",
+                    }
+                    if self.query_cache:
+                        self.query_cache.put(question, _attach_evidence_bundle(result))
+                    return _attach_evidence_bundle(result)
+
             criteria_result = grounding.get("criteria_result") if isinstance(grounding, dict) else None
             criteria_source = str((criteria_result or {}).get("source") or "criteria_sql").strip() or "criteria_sql"
+
+            if (
+                is_value_question
+                and bool(value_focus_terms)
+                and criteria_source in {"criteria_sql", "criteria_docs_sql"}
+                and not isinstance(grounding.get("criteria_contextual_result"), dict)
+            ):
+                scoped_candidates, scoped_discovery = _resolve_scoped_context()
+                best_effort_result = self._try_generic_value_contextual_resolution(
+                    question=question,
+                    parsed=parsed,
+                    candidates=scoped_candidates,
+                    discovery_results=scoped_discovery,
+                    telemetry=state.get("telemetry"),
+                )
+                if isinstance(best_effort_result, dict) and str(best_effort_result.get("answer") or "").strip():
+                    best_effort_answer = str(best_effort_result.get("answer") or "").strip().rstrip(".")
+                    best_effort_docs = (
+                        list(best_effort_result.get("criteria_documents") or [])
+                        if isinstance(best_effort_result.get("criteria_documents"), list)
+                        else []
+                    )
+                    best_doc = best_effort_docs[0] if best_effort_docs and isinstance(best_effort_docs[0], dict) else {}
+                    best_doc_label = str(best_doc.get("doc_name") or best_doc.get("doc_path") or "semantic search result").strip() or "semantic search result"
+                    try:
+                        best_effort_confidence = float(best_effort_result.get("confidence", 0.75))
+                    except Exception:
+                        best_effort_confidence = 0.75
+
+                    answer_text = (
+                        f"[source: semantic_best_effort] Confidence is limited ({best_effort_confidence:.2f} < {self._semantic_best_effort_threshold:.2f}). "
+                        f"Based on the most relevant semantic match ({best_doc_label}), the best-effort value is: {best_effort_answer}. "
+                        "This may be uncertain."
+                    ).strip()
+                    if record_history:
+                        self.state.history.append({"role": "user", "content": question})
+                        self.state.history.append({"role": "assistant", "content": answer_text})
+
+                    result = {
+                        "answer": answer_text,
+                        "answer_source": "semantic_best_effort",
+                        "answer_sources": ["semantic_best_effort"],
+                        "grounding": grounding,
+                        "request_telemetry": dict(state.get("telemetry") or {}),
+                        "policy": {
+                            "query": query_policy,
+                            "style": style_policy,
+                            "answer": answer_policy,
+                        },
+                        "trace": state.get("trace", []) + [
+                            {
+                                "step": len(state.get("trace", [])),
+                                "tool": "generic_value_semantic_best_effort_guard",
+                                "source": str(best_effort_result.get("source") or "contextual_llm_resolution_fallback"),
+                                "confidence": best_effort_confidence,
+                                "semantic_doc": best_doc_label,
+                                "used": True,
+                            }
+                        ],
+                        "model": "deterministic_generic_value_guard",
+                    }
+                    if self.query_cache:
+                        self.query_cache.put(question, _attach_evidence_bundle(result))
+                    return _attach_evidence_bundle(result)
+
+                focus_label = ", ".join(value_focus_terms[:3])
+                clarification_text = (
+                    f"[source: needs_clarification] I found matching records for {str((state.get('parsed') or {}).get('entity_name') or 'the requested entity').strip()}, "
+                    f"but I could not reliably determine a specific value for '{focus_label}'. "
+                    "Please ask with the exact billed item/attribute name shown in the document."
+                ).strip()
+                if record_history:
+                    self.state.history.append({"role": "user", "content": question})
+                    self.state.history.append({"role": "assistant", "content": clarification_text})
+
+                result = {
+                    "answer": clarification_text,
+                    "answer_source": "needs_clarification",
+                    "answer_sources": ["needs_clarification"],
+                    "grounding": grounding,
+                    "request_telemetry": dict(state.get("telemetry") or {}),
+                    "policy": {
+                        "query": query_policy,
+                        "style": style_policy,
+                        "answer": answer_policy,
+                    },
+                    "trace": state.get("trace", []) + [
+                        {
+                            "step": len(state.get("trace", [])),
+                            "tool": "generic_value_resolution_guard",
+                            "reason": "unresolved_qualified_value",
+                            "focus_terms": value_focus_terms[:4],
+                            "used": True,
+                        }
+                    ],
+                    "model": "deterministic_generic_value_guard",
+                }
+                if self.query_cache:
+                    self.query_cache.put(question, _attach_evidence_bundle(result))
+                return _attach_evidence_bundle(result)
+
             answer_text = f"[source: {criteria_source}] {deterministic_criteria_answer}".strip()
             answer_sources = [criteria_source]
             if record_history:
@@ -9349,6 +11665,7 @@ class IDMSInteractionTools:
                 "answer_source": criteria_source,
                 "answer_sources": answer_sources,
                 "grounding": grounding,
+                "request_telemetry": dict(state.get("telemetry") or {}),
                 "policy": {
                     "query": query_policy,
                     "style": style_policy,
@@ -9356,6 +11673,95 @@ class IDMSInteractionTools:
                 },
                 "trace": state.get("trace", []),
                 "model": "deterministic_criteria_listing",
+            }
+            if self.query_cache:
+                self.query_cache.put(question, _attach_evidence_bundle(result))
+            return _attach_evidence_bundle(result)
+
+        # Final generic safety gate before free-form answer generation.
+        if is_value_question and not isinstance(grounding.get("criteria_contextual_result"), dict):
+            scoped_candidates, scoped_discovery = _resolve_scoped_context()
+            pre_answer_guard = self._try_generic_value_contextual_resolution(
+                question=question,
+                parsed=parsed,
+                candidates=scoped_candidates,
+                discovery_results=scoped_discovery,
+                telemetry=state.get("telemetry"),
+            )
+            if isinstance(pre_answer_guard, dict) and str(pre_answer_guard.get("answer") or "").strip():
+                contextual_source = str(pre_answer_guard.get("source") or "contextual_llm_resolution_fallback").strip() or "contextual_llm_resolution_fallback"
+                answer_text = f"[source: {contextual_source}] {str(pre_answer_guard.get('answer') or '').strip()}".strip()
+                grounding["criteria_contextual_result"] = pre_answer_guard
+                state["criteria_contextual_result"] = pre_answer_guard
+                if record_history:
+                    self.state.history.append({"role": "user", "content": question})
+                    self.state.history.append({"role": "assistant", "content": answer_text})
+
+                result = {
+                    "answer": answer_text,
+                    "answer_source": contextual_source,
+                    "answer_sources": [contextual_source],
+                    "grounding": grounding,
+                    "request_telemetry": dict(state.get("telemetry") or {}),
+                    "policy": {
+                        "query": query_policy,
+                        "style": style_policy,
+                        "answer": answer_policy,
+                    },
+                    "trace": state.get("trace", []) + [
+                        {
+                            "step": len(state.get("trace", [])),
+                            "tool": "generic_value_pre_answer_guard",
+                            "source": contextual_source,
+                            "rewrite_question": str(pre_answer_guard.get("rewrite_question") or "").strip() or None,
+                            "used": True,
+                        }
+                    ],
+                    "model": "deterministic_generic_value_pre_answer_guard",
+                }
+                if self.query_cache:
+                    self.query_cache.put(question, _attach_evidence_bundle(result))
+                return _attach_evidence_bundle(result)
+
+        criteria_payload_for_guard = grounding.get("criteria_result") if isinstance(grounding, dict) else None
+        if (
+            is_value_question
+            and bool(value_focus_terms)
+            and not isinstance(grounding.get("criteria_contextual_result"), dict)
+            and isinstance(criteria_payload_for_guard, dict)
+            and int(criteria_payload_for_guard.get("count", 0) or 0) > 0
+        ):
+            focus_label = ", ".join(value_focus_terms[:3])
+            clarification_text = (
+                f"[source: needs_clarification] I found matching records for {str((state.get('parsed') or {}).get('entity_name') or 'the requested entity').strip()}, "
+                f"but I could not reliably determine a specific value for '{focus_label}'. "
+                "Please ask with the exact billed item/attribute name shown in the document."
+            ).strip()
+            if record_history:
+                self.state.history.append({"role": "user", "content": question})
+                self.state.history.append({"role": "assistant", "content": clarification_text})
+
+            result = {
+                "answer": clarification_text,
+                "answer_source": "needs_clarification",
+                "answer_sources": ["needs_clarification"],
+                "grounding": grounding,
+                "request_telemetry": dict(state.get("telemetry") or {}),
+                "policy": {
+                    "query": query_policy,
+                    "style": style_policy,
+                    "answer": answer_policy,
+                },
+                "trace": state.get("trace", []) + [
+                    {
+                        "step": len(state.get("trace", [])),
+                        "tool": "generic_value_pre_generation_guard",
+                        "reason": "unresolved_qualified_value",
+                        "focus_terms": value_focus_terms[:4],
+                        "used": True,
+                    }
+                ],
+                "model": "deterministic_generic_value_guard",
             }
             if self.query_cache:
                 self.query_cache.put(question, _attach_evidence_bundle(result))
@@ -9399,6 +11805,7 @@ class IDMSInteractionTools:
             "answer_source": source,
             "answer_sources": answer_sources,
             "grounding": grounding,
+            "request_telemetry": dict(state.get("telemetry") or {}),
             "policy": {
                 "query": query_policy,
                 "style": style_policy,
@@ -9669,6 +12076,8 @@ def run_cli() -> int:
         "ingest_document",
         "ingest_information",
         "generate_document",
+        "integrate_source_database",
+        "sync_source_database_entities",
     ])
     action.add_argument("--payload-json", default="{}", help="JSON object payload for action")
     action.add_argument("--dry-run", action="store_true", help="Compose SOLF action/sql plan without executing")

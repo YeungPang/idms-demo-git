@@ -6634,6 +6634,91 @@ def process_solf_llm_generation_output(
     return result
 
 
+def generate_and_process_solf_from_inspection(
+    *,
+    goal: str,
+    inspection_context: dict[str, Any] | None = None,
+    persist: bool = True,
+    created_by: str | None = "api:user",
+    is_active: bool = True,
+    default_clause_type: str = "resolve_policy",
+    temperature: float = 0.0,
+    workflow_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Generate SOLF JSON from a goal plus web/internal/external inspection context and persist it."""
+    goal_text = str(goal or "").strip()
+    if not goal_text:
+        raise ValueError("goal is required")
+
+    pack = get_solf_llm_generation_pack(include_markdown=False)
+    client = _make_genai_client()
+    if client is None:
+        raise RuntimeError("LLM client is unavailable")
+
+    context_payload = inspection_context if isinstance(inspection_context, dict) else {}
+    prompt = (
+        "Generate executable SOLF artifacts for IDMS from the supplied inspection context. "
+        "Return only a JSON object with keys: rule_name, class_definitions, solf_script.\n"
+        "Follow this generation pack strictly:\n"
+        f"{json.dumps(pack, ensure_ascii=False)}\n\n"
+        "Business goal:\n"
+        f"{goal_text}\n\n"
+        "Inspection context:\n"
+        f"{json.dumps(context_payload, ensure_ascii=False)}\n"
+    )
+
+    response = generate_content_with_openrouter_fallback(
+        primary_call=lambda: client.models.generate_content(
+            model=EXTRACT_MODEL,
+            contents=[prompt],
+        ),
+        model=EXTRACT_MODEL,
+        contents=[prompt],
+        temperature=float(temperature),
+        call_name="solf_generation_pack_generate",
+        complexity="medium",
+    )
+
+    raw_text = str(getattr(response, "text", "") or "")
+    llm_output = _extract_json_object(raw_text)
+    if not llm_output:
+        raise ValueError("LLM did not return a valid JSON object for SOLF generation")
+
+    processed = process_solf_llm_generation_output(
+        llm_output=llm_output,
+        persist=persist,
+        created_by=created_by,
+        is_active=is_active,
+        default_clause_type=default_clause_type,
+    )
+
+    workflow_registry_result: dict[str, Any] | None = None
+    if isinstance(workflow_registry, dict) and workflow_registry:
+        workflow_payload = dict(workflow_registry)
+        workflow_key = str(workflow_payload.get("workflow_key") or "").strip()
+        workflow_name = str(workflow_payload.get("workflow_name") or "").strip()
+        if workflow_key and workflow_name and bool(processed.get("persisted")):
+            workflow_registry_result = create_solf_workflow_registry_entry(
+                workflow_key=workflow_key,
+                workflow_name=workflow_name,
+                description=str(workflow_payload.get("description") or "") or None,
+                domain=str(workflow_payload.get("domain") or "") or None,
+                status=str(workflow_payload.get("status") or "draft") or "draft",
+                metadata=workflow_payload.get("metadata") if isinstance(workflow_payload.get("metadata"), dict) else {},
+                is_active=bool(workflow_payload.get("is_active", True)),
+                created_by=str(workflow_payload.get("created_by") or created_by or "api:user") or None,
+            )
+
+    return {
+        "model": EXTRACT_MODEL,
+        "goal": goal_text,
+        "inspection_context": context_payload,
+        "llm_output": llm_output,
+        "processed": processed,
+        "workflow_registry": workflow_registry_result or workflow_registry,
+    }
+
+
 def generate_and_process_solf_from_intent(
     *,
     intent: str,

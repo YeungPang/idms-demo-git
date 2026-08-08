@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class IngestPathRequest(BaseModel):
@@ -202,6 +202,26 @@ class InvoiceFromInstructionGenerateRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=1.0, description="Generation temperature for runtime SOLF creation")
 
 
+class SolfGenerationFromInspectionRequest(BaseModel):
+    goal: str = Field(..., description="Business goal or workflow intent to convert into executable SOLF artifacts")
+    inspection_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured inspection context gathered from web, internal DB, and external DB sources",
+    )
+    persist: bool = Field(default=True, description="When true, persist validated SOLF into business rules")
+    created_by: str | None = Field(default="api:user", description="Creator identifier when persisting")
+    is_active: bool = Field(default=True, description="Activation flag applied when persisting")
+    default_clause_type: str = Field(
+        default="resolve_policy",
+        description="Fallback SQL clause type for persisted clauses: resolve_policy | ingest_rule | computation_rule",
+    )
+    temperature: float = Field(default=0.0, ge=0.0, le=1.0, description="LLM sampling temperature")
+    workflow_registry: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional workflow-registry payload to create or update alongside the generated SOLF artifacts",
+    )
+
+
 class SalesPipelineGenerateRequest(BaseModel):
     pipeline_name: str = Field(default="sales_pipeline", description="Pipeline run label used in output paths")
     stages: list[str] = Field(
@@ -303,8 +323,13 @@ class QueryRequest(BaseModel):
 
 
 class ActionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     action_name: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    request: str = Field(default="", description="Optional natural-language request text")
+    message: str = Field(default="", description="Optional natural-language message text")
+    text: str = Field(default="", description="Optional natural-language text")
 
 
 class SolfClauseQueryRequest(BaseModel):

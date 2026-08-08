@@ -2346,6 +2346,40 @@ def db_accounting_ingest(payload: Any) -> dict[str, Any] | bool:
         object_row = solf_function.db_ingest(entity)
         if not isinstance(object_row, dict) or "object_id" not in object_row:
             return False
+
+        attrs = entity.get("attributes") if isinstance(entity.get("attributes"), dict) else {}
+        source_type = str(attrs.get("source_type") or attrs.get("document_type") or "").strip().lower()
+        review_mode = str(attrs.get("booking_review_mode") or "required").strip().lower()
+        requires_review = source_type in {"invoice", "bill", "receipt"} and review_mode not in {"skip", "bypass", "disabled"}
+
+        if requires_review and hasattr(domain_db, "enqueue_accounting_booking_review"):
+            queued = domain_db.enqueue_accounting_booking_review(
+                connection=connection,
+                payload=entity,
+                object_row=object_row,
+            )
+            merged = dict(object_row)
+            merged.update(
+                {
+                    "accounting_written": False,
+                    "accounting_review_required": True,
+                    "accounting_review_status": "pending",
+                    "accounting_review_id": queued.get("review_id"),
+                    "accounting_validation": queued.get("validation") or {},
+                    "transaction_id": None,
+                    "ledger_lines_written": 0,
+                    "booking_preview": {
+                        "transaction_id": queued.get("transaction_id"),
+                        "transaction_date": queued.get("transaction_date"),
+                        "source_type": queued.get("source_type"),
+                        "legal_entity_ref": queued.get("legal_entity_ref"),
+                        "description": queued.get("description"),
+                        "ledger_lines": queued.get("preview_lines") or [],
+                    },
+                }
+            )
+            return merged
+
         domain_result = domain_db.upsert_transaction_and_lines(connection=connection, payload=entity, object_row=object_row)
         if not domain_result.get("ok"):
             return {
@@ -2353,6 +2387,7 @@ def db_accounting_ingest(payload: Any) -> dict[str, Any] | bool:
                 "object_name": object_row.get("object_name"),
                 "class_name": object_row.get("class_name"),
                 "accounting_written": False,
+                "accounting_review_required": False,
                 "accounting_validation": domain_result.get("validation"),
                 "transaction_id": None,
                 "ledger_lines_written": 0,
@@ -2361,6 +2396,7 @@ def db_accounting_ingest(payload: Any) -> dict[str, Any] | bool:
         merged.update(
             {
                 "accounting_written": True,
+                "accounting_review_required": False,
                 "accounting_validation": domain_result.get("validation"),
                 "transaction_id": domain_result.get("transaction_id"),
                 "ledger_lines_written": domain_result.get("ledger_lines_written"),

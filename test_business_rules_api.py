@@ -89,6 +89,64 @@ class TestBusinessRulesAPI(unittest.TestCase):
         self.assertIn("business_rule_workflow_hint", solf_script)
         self.assertIn("business_rule_sequence_plan", solf_script)
 
+    def test_generate_and_ingest_from_inspection_endpoint_is_wired(self):
+        payload = {
+            "goal": "derive a workflow rule from inspection evidence",
+            "inspection_context": {
+                "web": [{"source": "https://example.com", "summary": "customer contact data"}],
+                "internal_db": [{"table": "company", "observation": "contact person available"}],
+            },
+            "persist": True,
+            "created_by": "test",
+        }
+
+        with patch(
+            "idms_api_server.routers.business_rules.business_rules.generate_and_process_solf_from_inspection",
+            return_value={"processed": {"persisted": True, "accepted": True}},
+        ) as generate_mock:
+            response = self.client.post(
+                "/api/business-rules/solf-generation-pack/generate-and-ingest-from-inspection",
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json().get("success"))
+        self.assertTrue((response.json().get("result") or {}).get("processed", {}).get("persisted"))
+        self.assertEqual(generate_mock.call_args.kwargs.get("goal"), payload["goal"])
+        self.assertEqual(generate_mock.call_args.kwargs.get("created_by"), "test")
+
+    def test_generate_and_ingest_from_inspection_endpoint_forwards_workflow_registry_payload(self):
+        payload = {
+            "goal": "derive a workflow rule from inspection evidence",
+            "inspection_context": {
+                "web": [{"source": "https://example.com", "summary": "customer contact data"}],
+            },
+            "persist": True,
+            "created_by": "test",
+            "workflow_registry": {
+                "workflow_key": "inspection_rule_v1",
+                "workflow_name": "Inspection Rule V1",
+                "description": "Bind the generated rule to a workflow registry entry",
+                "domain": "master_data",
+                "status": "draft",
+                "metadata": {"source": "inspection_ui"},
+                "is_active": True,
+                "created_by": "test",
+            },
+        }
+
+        with patch(
+            "idms_api_server.routers.business_rules.business_rules.generate_and_process_solf_from_inspection",
+            return_value={"processed": {"persisted": True, "accepted": True}},
+        ) as generate_mock:
+            response = self.client.post(
+                "/api/business-rules/solf-generation-pack/generate-and-ingest-from-inspection",
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(generate_mock.call_args.kwargs.get("workflow_registry"), payload["workflow_registry"])
+
     def test_create_and_simulate_endpoints_are_wired(self):
         created_payload = {
             "rule_id": 321,

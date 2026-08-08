@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
 
 import domain_db
 import object_db
@@ -15,6 +16,17 @@ import object_db
 
 router = APIRouter(prefix="/api/accounting", tags=["accounting"])
 LOGGER = logging.getLogger("idms.api")
+
+
+class BookingReviewApproveRequest(BaseModel):
+    reviewed_by: str = "api:user"
+    review_note: str = ""
+    booking_updates: dict[str, Any] = Field(default_factory=dict)
+
+
+class BookingReviewCancelRequest(BaseModel):
+    reviewed_by: str = "api:user"
+    review_note: str = ""
 
 
 def _parse_iso_date(value: str, field_name: str) -> str:
@@ -246,6 +258,123 @@ def export_journal_csv(
         raise
     except Exception as exc:
         LOGGER.exception("Failed to export accounting journal")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+
+@router.get("/reviews")
+def list_booking_reviews(
+    status: str | None = "pending",
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    status_norm = str(status or "").strip().lower() if status is not None else ""
+    if status_norm and status_norm not in {"pending", "approved", "cancelled"}:
+        raise HTTPException(status_code=400, detail="status must be pending, approved, or cancelled")
+
+    connection = object_db.get_connection()
+    try:
+        rows = domain_db.list_accounting_booking_reviews(
+            connection=connection,
+            status=status_norm or None,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "success": True,
+            "count": len(rows),
+            "result": rows,
+            "query": {
+                "status": status_norm or None,
+                "limit": int(limit),
+                "offset": int(offset),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception("Failed to list accounting booking reviews")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+
+@router.get("/reviews/{review_id}")
+def get_booking_review(review_id: int) -> dict[str, Any]:
+    connection = object_db.get_connection()
+    try:
+        row = domain_db.get_accounting_booking_review(connection=connection, review_id=review_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+        return {"success": True, "result": row}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception("Failed to get accounting booking review")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+
+@router.post("/reviews/{review_id}/approve")
+def approve_booking_review(review_id: int, payload: BookingReviewApproveRequest) -> dict[str, Any]:
+    connection = object_db.get_connection()
+    try:
+        result = domain_db.approve_accounting_booking_review(
+            connection=connection,
+            review_id=review_id,
+            booking_updates=payload.booking_updates,
+            reviewed_by=payload.reviewed_by,
+            review_note=payload.review_note,
+        )
+        if not bool(result.get("ok")):
+            reason = str(result.get("reason") or "").strip().lower()
+            if reason == "not_found":
+                raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+            if reason == "not_pending":
+                raise HTTPException(status_code=409, detail=f"Review {review_id} is not pending")
+            if reason == "validation_failed":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Booking validation failed. Please update booking data and try again.",
+                        "validation": result.get("validation") or {},
+                    },
+                )
+            raise HTTPException(status_code=500, detail=result)
+        return {"success": True, "result": result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception("Failed to approve accounting booking review")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+
+@router.post("/reviews/{review_id}/cancel")
+def cancel_booking_review(review_id: int, payload: BookingReviewCancelRequest) -> dict[str, Any]:
+    connection = object_db.get_connection()
+    try:
+        result = domain_db.cancel_accounting_booking_review(
+            connection=connection,
+            review_id=review_id,
+            reviewed_by=payload.reviewed_by,
+            review_note=payload.review_note,
+        )
+        if not bool(result.get("ok")):
+            reason = str(result.get("reason") or "").strip().lower()
+            if reason == "not_found":
+                raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+            if reason == "not_pending":
+                raise HTTPException(status_code=409, detail=f"Review {review_id} is not pending")
+            raise HTTPException(status_code=500, detail=result)
+        return {"success": True, "result": result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception("Failed to cancel accounting booking review")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         connection.close()

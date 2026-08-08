@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 from datetime import datetime
 
@@ -37,6 +39,27 @@ def _trim_log_text(value: Any, limit: int = 300) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "...[truncated]"
+
+
+def _infer_action_name_from_nl(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return ""
+
+    has_sync_signal = (
+        "synchron" in lowered
+        or re.search(r"\bsync\b", lowered) is not None
+    )
+    has_customer_contact_signal = ("customer" in lowered and "contact" in lowered)
+    has_table_sync_signal = ("table" in lowered and ("customer" in lowered or "contact" in lowered))
+    has_named_fields_signal = ("customer_name" in lowered or "contact_name" in lowered)
+    if has_sync_signal and (has_customer_contact_signal or has_table_sync_signal or has_named_fields_signal):
+        return "db_sync"
+
+    if "integrate" in lowered and "database" in lowered:
+        return "integrate_source_database"
+
+    return ""
 
 
 @router.post("/chat")
@@ -206,7 +229,74 @@ def query(payload: QueryRequest) -> dict[str, Any]:
 @router.post("/action")
 def action(payload: ActionRequest) -> dict[str, Any]:
     try:
-        result = get_tools().perform_action(payload.action_name, payload.payload)
+        raw_payload_blob = json.dumps(payload.model_dump(mode="python", exclude_none=False), ensure_ascii=False, default=str)
+        action_payload = dict(payload.payload or {}) if isinstance(payload.payload, dict) else {}
+        nl_field_names = (
+            "request",
+            "message",
+            "text",
+            "query",
+            "prompt",
+            "instruction",
+            "command",
+            "user_request",
+            "user_query",
+        )
+        for field_name in nl_field_names:
+            field_value = str(getattr(payload, field_name, "") or "").strip()
+            if field_value:
+                action_payload.setdefault(field_name, field_value)
+
+        extra_fields = getattr(payload, "model_extra", None)
+        if isinstance(extra_fields, dict):
+            for extra_key, extra_value in extra_fields.items():
+                if extra_key in {"action_name", "payload"}:
+                    continue
+                text_value = str(extra_value or "").strip()
+                if text_value:
+                    action_payload.setdefault(str(extra_key), text_value)
+
+        def _collect_text(value: Any) -> list[str]:
+            chunks: list[str] = []
+            if isinstance(value, dict):
+                for item in value.values():
+                    chunks.extend(_collect_text(item))
+                return chunks
+            if isinstance(value, list):
+                for item in value:
+                    chunks.extend(_collect_text(item))
+                return chunks
+            text = str(value or "").strip()
+            if text:
+                chunks.append(text)
+            return chunks
+
+        action_name = str(payload.action_name or "").strip()
+        if not action_name:
+            primary_parts = [
+                str(action_payload.get(name) or "").strip()
+                for name in nl_field_names
+                if str(action_payload.get(name) or "").strip()
+            ]
+            deep_parts = _collect_text(action_payload)
+            nl_text = "\n".join(dict.fromkeys(primary_parts + deep_parts + [raw_payload_blob]))
+            inferred = _infer_action_name_from_nl(nl_text)
+            if inferred:
+                action_name = inferred
+                if not any(str(action_payload.get(name) or "").strip() for name in ("message", "request", "text")):
+                    action_payload["message"] = nl_text
+
+        if not action_name:
+            return {
+                "success": True,
+                "result": {
+                    "action": "",
+                    "success": False,
+                    "message": "No action_name provided and no actionable intent could be inferred from request text.",
+                },
+            }
+
+        result = get_tools().perform_action(action_name, action_payload)
     except Exception as exc:
         LOGGER.exception("Action execution failed")
         if _is_quota_exhausted_error(exc):

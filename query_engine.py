@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import unicodedata
@@ -10,6 +11,11 @@ from types import SimpleNamespace
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
+
+try:
+    import psycopg2
+except Exception:  # pragma: no cover
+    psycopg2 = None
 
 try:
     import requests
@@ -116,6 +122,10 @@ class QueryEngine:
         "registration_no": {
             "en": ["registration number", "registration_no", "registration no", "company number"],
             "de": ["firmennummer", "unternehmensnummer", "registrierungsnummer", "handelsregisternummer"],
+        },
+        "uid_che": {
+            "en": ["uid", "che", "che number", "company uid", "company registration number"],
+            "de": ["uid", "che", "che nummer", "unternehmens-uid", "che-nummer"],
         },
         "registered_address": {
             "en": ["registered address", "address"],
@@ -368,6 +378,7 @@ class QueryEngine:
         self._pattern_vectors_ready = False
         self._pattern_vectors_last_sync: datetime | None = None
         self._schema_alias_cache: dict[str, str] = {}
+        self._attribute_token_lexicon_cache: set[str] | None = None
         self._refresh_schema_alias_cache()
         self._qdrant_collection_name = self._resolve_qdrant_collection_name()
 
@@ -740,6 +751,602 @@ class QueryEngine:
             raise RuntimeError("Database dependencies are unavailable") from exc
 
         return get_connection()
+
+    @staticmethod
+    def _quote_sql_identifier(identifier: str) -> str:
+        text = str(identifier or "").strip()
+        if not text:
+            raise ValueError("SQL identifier must not be empty")
+        return '"' + text.replace('"', '""') + '"'
+
+    def _extract_federated_list_query(self, question: str) -> dict[str, Any] | None:
+        text = str(question or "").strip()
+        if not text:
+            return None
+
+        filter_field_hint = ""
+        filter_value_hint = ""
+        where_match = re.search(
+            r"\bwhere\s+(?P<field>[a-zA-Z0-9_\- ]{2,64}?)\s*(?:=|is|equals|like|contains)\s*(?P<value>[^\?]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if where_match:
+            filter_field_hint = str(where_match.group("field") or "").strip().lower()
+            filter_value_hint = str(where_match.group("value") or "").strip().strip("\"'").strip()
+            filter_value_hint = re.sub(r"\s+source\s+[a-zA-Z0-9_\-]+\s*$", "", filter_value_hint, flags=re.IGNORECASE).strip()
+
+        query_specs: list[tuple[str, list[re.Pattern[str]]]] = [
+            (
+                "list",
+                [
+                    re.compile(
+                        r"\b(?:list|show|find|get|give|display|retrieve)\b(?:\s+me)?(?:\s+all)?(?:\s+the)?\s+"
+                        r"(?:(?:new|recent|latest)\s+)?"
+                        r"(?P<entity>[a-zA-Z_][a-zA-Z0-9_\- ]{1,80}?)\s+"
+                        r"(?:from|in|since|during)\s+(?P<year>20\d{2}|19\d{2})\b",
+                        flags=re.IGNORECASE,
+                    ),
+                    re.compile(
+                        r"\b(?:new|recent|latest)\s+(?P<entity>[a-zA-Z_][a-zA-Z0-9_\- ]{1,80}?)\s+"
+                        r"(?:from|in|since|during)\s+(?P<year>20\d{2}|19\d{2})\b",
+                        flags=re.IGNORECASE,
+                    ),
+                ],
+            ),
+            (
+                "count",
+                [
+                    re.compile(
+                        r"\b(?:how\s+many|count|number\s+of)\s+"
+                        r"(?P<entity>[a-zA-Z_][a-zA-Z0-9_\- ]{1,80}?)\s+"
+                        r"(?:were\s+)?(?:created|registered|added|entered)?\s*"
+                        r"(?:from|in|since|during)\s+(?P<year>20\d{2}|19\d{2})\b",
+                        flags=re.IGNORECASE,
+                    ),
+                ],
+            ),
+            (
+                "summary",
+                [
+                    re.compile(
+                        r"\b(?:summari(?:s|z)e|summary\s+of|overview\s+of)\s+"
+                        r"(?P<entity>[a-zA-Z_][a-zA-Z0-9_\- ]{1,80}?)\s+"
+                        r"(?:from|in|since|during)\s+(?P<year>20\d{2}|19\d{2})\b",
+                        flags=re.IGNORECASE,
+                    ),
+                ],
+            ),
+        ]
+
+        match = None
+        operation = "list"
+        for op_name, patterns in query_specs:
+            for pattern in patterns:
+                match = pattern.search(text)
+                if match:
+                    operation = op_name
+                    break
+            if match:
+                break
+        if not match:
+            return None
+
+        entity_raw = str(match.group("entity") or "").strip().lower()
+        year = int(match.group("year"))
+        if year < 1900 or year > 2100:
+            return None
+
+        source_key_hint = ""
+        source_match = re.search(r"\bsource\s+([a-zA-Z0-9_\-]+)\b", text, flags=re.IGNORECASE)
+        if source_match:
+            source_key_hint = str(source_match.group(1) or "").strip().lower()
+
+        return {
+            "operation": operation,
+            "entity_hint": entity_raw,
+            "year": year,
+            "source_key_hint": source_key_hint,
+            "filter_field_hint": filter_field_hint,
+            "filter_value_hint": filter_value_hint,
+        }
+
+    @staticmethod
+    def _resolve_inventory_column_hint(field_hint: str, columns: list[dict[str, Any]]) -> str | None:
+        hint = str(field_hint or "").strip().lower()
+        if not hint:
+            return None
+
+        hint_tokens = {tok for tok in re.findall(r"[a-zA-Z0-9]{2,}", hint) if tok}
+        if not hint_tokens:
+            return None
+
+        best_name = None
+        best_score = 0.0
+        for item in columns:
+            if not isinstance(item, dict):
+                continue
+            col_name = str(item.get("column_name") or "").strip()
+            if not col_name:
+                continue
+            col_norm = col_name.lower()
+            col_tokens = {tok for tok in re.findall(r"[a-zA-Z0-9]{2,}", col_norm) if tok}
+            if not col_tokens:
+                continue
+
+            score = 0.0
+            if hint == col_norm:
+                score += 3.0
+            if hint in col_norm or col_norm in hint:
+                score += 1.5
+            overlap = len(hint_tokens & col_tokens)
+            if overlap > 0:
+                score += float(overlap) / float(max(1, len(hint_tokens)))
+
+            if score > best_score:
+                best_score = score
+                best_name = col_name
+
+        if best_score <= 0.2:
+            return None
+        return best_name
+
+    @staticmethod
+    def _semantic_query_tokens(text: str) -> set[str]:
+        stopwords = {
+            "list", "show", "find", "get", "give", "display", "retrieve", "all", "the", "new", "recent", "latest",
+            "from", "in", "since", "during", "source", "database", "records", "record", "entries", "entry", "rows", "row",
+            "and", "for", "with", "that", "this", "those", "these",
+        }
+        normalized = str(text or "").strip().lower()
+        normalized = normalized.replace("_", " ").replace("-", " ")
+        tokens = re.findall(r"[a-zA-Z0-9]{3,}", normalized)
+        return {tok for tok in tokens if tok not in stopwords}
+
+    @staticmethod
+    def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+        if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+            return 0.0
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for a, b in zip(vec_a, vec_b):
+            dot += float(a) * float(b)
+            norm_a += float(a) * float(a)
+            norm_b += float(b) * float(b)
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return 0.0
+        return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+    def _semantic_inventory_candidate_score(
+        self,
+        *,
+        question: str,
+        entity_hint: str,
+        table_name: str,
+        columns: list[dict[str, Any]],
+    ) -> float:
+        col_names = [str(item.get("column_name") or "").strip().lower() for item in columns if isinstance(item, dict)]
+        col_names = [name for name in col_names if name]
+        if not table_name and not col_names:
+            return 0.0
+
+        candidate_text = " ".join([str(table_name or "").strip().lower(), " ".join(col_names)]).strip()
+        if not candidate_text:
+            return 0.0
+
+        semantic = 0.0
+        q_vec = self.embed_text(question)
+        cand_vec = self.embed_text(candidate_text)
+        if isinstance(q_vec, list) and isinstance(cand_vec, list):
+            semantic = max(0.0, self._cosine_similarity(q_vec, cand_vec))
+
+        q_tokens = self._semantic_query_tokens(question)
+        c_tokens = self._semantic_query_tokens(candidate_text)
+        overlap = 0.0
+        if q_tokens and c_tokens:
+            overlap = float(len(q_tokens & c_tokens)) / float(max(1, min(len(q_tokens), 8)))
+
+        entity_bonus = 0.0
+        entity_norm = str(entity_hint or "").strip().lower()
+        if entity_norm:
+            table_norm = str(table_name or "").strip().lower()
+            if entity_norm in table_norm:
+                entity_bonus += 0.35
+            if any(entity_norm in col for col in col_names):
+                entity_bonus += 0.35
+
+        return (semantic * 0.75) + (overlap * 0.65) + entity_bonus
+
+    @staticmethod
+    def _infer_candidate_created_column(columns: list[dict[str, Any]]) -> str | None:
+        candidates = [
+            "created_at",
+            "created_on",
+            "creation_date",
+            "signup_date",
+            "registered_at",
+            "inserted_at",
+            "entry_date",
+            "last_update",
+            "updated_at",
+            "updated_on",
+            "modified_at",
+            "invoice_date",
+            "document_date",
+            "transaction_date",
+            "posting_date",
+            "date",
+        ]
+        available = {str(item.get("column_name") or "").strip().lower() for item in columns if isinstance(item, dict)}
+        for name in candidates:
+            if name in available:
+                return name
+        return None
+
+    @staticmethod
+    def _pick_projection_columns(columns: list[dict[str, Any]]) -> list[str]:
+        preferred = [
+            "id",
+            "customer_id",
+            "client_id",
+            "account_id",
+            "name",
+            "customer_name",
+            "client_name",
+            "company_name",
+            "email",
+            "created_at",
+            "created_on",
+            "signup_date",
+            "entry_date",
+        ]
+        available = [str(item.get("column_name") or "").strip() for item in columns if isinstance(item, dict)]
+        available_lut = {name.lower(): name for name in available if name}
+        selected: list[str] = []
+        for p in preferred:
+            col = available_lut.get(p)
+            if col and col not in selected:
+                selected.append(col)
+        if not selected:
+            selected = available[:6]
+        return selected[:8]
+
+    def _resolve_source_password(self, source_key: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9]", "_", str(source_key or "").upper())
+        per_source_key = f"IDMS_SOURCE_DB_PASSWORD_{sanitized}" if sanitized else ""
+        return (
+            (os.getenv(per_source_key, "") if per_source_key else "")
+            or os.getenv("IDMS_SOURCE_DB_PASSWORD", "")
+            or os.getenv("IDMS_DB_PASSWORD", "")
+        )
+
+    def _build_federated_read_plan(self, question: str) -> dict[str, Any] | None:
+        parsed = self._extract_federated_list_query(question)
+        if not parsed:
+            return None
+
+        operation = str(parsed.get("operation") or "list").strip().lower() or "list"
+        entity_hint = str(parsed.get("entity_hint") or "").strip().lower()
+        year = int(parsed.get("year") or 0)
+        source_key_hint = str(parsed.get("source_key_hint") or "").strip().lower()
+        filter_field_hint = str(parsed.get("filter_field_hint") or "").strip().lower()
+        filter_value_hint = str(parsed.get("filter_value_hint") or "").strip()
+        if year <= 0:
+            return None
+
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT source_id, source_key, source_name, db_host, db_port, db_name, db_user, db_schema
+                        FROM source_database_registry
+                        WHERE status = 'active'
+                        ORDER BY updated_at DESC, source_id DESC
+                        LIMIT 50
+                        """
+                    )
+                    sources = cur.fetchall() or []
+                if not sources:
+                    return None
+
+                for src in sources:
+                    source_id = int(src[0])
+                    source_key = str(src[1] or "").strip()
+                    if source_key_hint and source_key.lower() != source_key_hint:
+                        continue
+
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT schema_name, table_name, metadata
+                            FROM source_schema_inventory
+                            WHERE source_id = %s
+                            ORDER BY table_name
+                            """,
+                            (source_id,),
+                        )
+                        inventory = cur.fetchall() or []
+
+                    best_plan: dict[str, Any] | None = None
+                    best_score = 0
+                    for row in inventory:
+                        schema_name = str(row[0] or "").strip()
+                        table_name = str(row[1] or "").strip()
+                        metadata = row[2] if isinstance(row[2], dict) else {}
+                        columns = metadata.get("columns") if isinstance(metadata.get("columns"), list) else []
+                        if not schema_name or not table_name or not columns:
+                            continue
+
+                        table_lower = table_name.lower()
+                        score = 0.0
+                        singular_hint = entity_hint[:-1] if entity_hint.endswith("s") else entity_hint
+                        if entity_hint and entity_hint in table_lower:
+                            score += 4.0
+                        if singular_hint and singular_hint in table_lower:
+                            score += 3.0
+                        if any(token in table_lower for token in ("customer", "client", "account", "buyer")):
+                            score += 2.0
+
+                        semantic_score = self._semantic_inventory_candidate_score(
+                            question=question,
+                            entity_hint=entity_hint,
+                            table_name=table_name,
+                            columns=columns,
+                        )
+                        score += max(0.0, semantic_score) * 6.0
+
+                        created_col = self._infer_candidate_created_column(columns)
+                        if created_col:
+                            score += 3.0
+                        if score <= 0 or not created_col:
+                            continue
+
+                        filter_column = None
+                        if filter_field_hint and filter_value_hint:
+                            filter_column = self._resolve_inventory_column_hint(filter_field_hint, columns)
+                            if not filter_column:
+                                continue
+                            score += 1.0
+
+                        projection_cols = self._pick_projection_columns(columns)
+                        if created_col not in [c.lower() for c in projection_cols]:
+                            projection_cols.append(created_col)
+
+                        candidate = {
+                            "source": {
+                                "source_id": source_id,
+                                "source_key": source_key,
+                                "source_name": str(src[2] or "").strip(),
+                                "db_host": str(src[3] or "").strip(),
+                                "db_port": int(src[4] or 5432),
+                                "db_name": str(src[5] or "").strip(),
+                                "db_user": str(src[6] or "").strip(),
+                                "db_schema": str(src[7] or "").strip() or schema_name,
+                            },
+                            "query": {
+                                "schema_name": schema_name,
+                                "table_name": table_name,
+                                "created_column": created_col,
+                                "select_columns": projection_cols[:8],
+                                "year": year,
+                                "limit": 200,
+                                "operation": operation,
+                                "filter_column": filter_column,
+                                "filter_value": filter_value_hint if filter_column else None,
+                            },
+                            "routing": {
+                                "mode": "federated_read",
+                                "reason": "direct_source_list_new_entities",
+                            },
+                        }
+
+                        if score > best_score:
+                            best_score = score
+                            best_plan = candidate
+
+                    if best_plan:
+                        return best_plan
+        except Exception:
+            return None
+
+        return None
+
+    def _execute_federated_read_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
+        if psycopg2 is None:
+            raise RuntimeError("psycopg2 is required for federated source execution")
+
+        source = plan.get("source") if isinstance(plan.get("source"), dict) else {}
+        query = plan.get("query") if isinstance(plan.get("query"), dict) else {}
+
+        source_key = str(source.get("source_key") or "").strip()
+        password = self._resolve_source_password(source_key)
+        if not password:
+            raise RuntimeError(
+                f"Missing source DB password. Set IDMS_SOURCE_DB_PASSWORD_{re.sub(r'[^A-Za-z0-9]', '_', source_key.upper())} or IDMS_SOURCE_DB_PASSWORD"
+            )
+
+        schema_name = str(query.get("schema_name") or "").strip()
+        table_name = str(query.get("table_name") or "").strip()
+        created_column = str(query.get("created_column") or "").strip()
+        select_columns = [str(item).strip() for item in list(query.get("select_columns") or []) if str(item).strip()]
+        year = int(query.get("year") or 0)
+        limit = max(1, min(int(query.get("limit") or 200), 500))
+        operation = str(query.get("operation") or "list").strip().lower() or "list"
+        filter_column = str(query.get("filter_column") or "").strip()
+        filter_value = str(query.get("filter_value") or "").strip()
+
+        if not schema_name or not table_name or not created_column or not select_columns or year <= 0:
+            raise ValueError("Invalid federated read plan")
+
+        start = date(year, 1, 1)
+        end = date(year + 1, 1, 1)
+
+        where_clauses = [
+            f"{self._quote_sql_identifier(created_column)} >= %s",
+            f"{self._quote_sql_identifier(created_column)} < %s",
+        ]
+        params: list[Any] = [start, end]
+        if filter_column and filter_value:
+            where_clauses.append(f"CAST({self._quote_sql_identifier(filter_column)} AS TEXT) ILIKE %s")
+            params.append(f"%{filter_value}%")
+
+        where_sql = " AND ".join(where_clauses)
+        table_sql = f"{self._quote_sql_identifier(schema_name)}.{self._quote_sql_identifier(table_name)}"
+        select_sql = ", ".join(self._quote_sql_identifier(col) for col in select_columns)
+
+        count_sql = f"SELECT COUNT(*)::bigint AS matched_count FROM {table_sql} WHERE {where_sql}"
+        list_sql = (
+            f"SELECT {select_sql} "
+            f"FROM {table_sql} "
+            f"WHERE {where_sql} "
+            f"ORDER BY {self._quote_sql_identifier(created_column)} DESC "
+            f"LIMIT %s"
+        )
+
+        conn = psycopg2.connect(
+            host=str(source.get("db_host") or "localhost"),
+            port=int(source.get("db_port") or 5432),
+            database=str(source.get("db_name") or ""),
+            user=str(source.get("db_user") or "postgres"),
+            password=password,
+            connect_timeout=5,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(count_sql, tuple(params))
+                count_row = cur.fetchone()
+                matched_count = int((count_row[0] if isinstance(count_row, (list, tuple)) else count_row) or 0)
+
+                if operation == "count":
+                    return {
+                        "sql": count_sql,
+                        "params": [str(p) for p in params],
+                        "rows": [],
+                        "count": matched_count,
+                        "matched_count": matched_count,
+                        "operation": "count",
+                    }
+
+                cur.execute(list_sql, tuple(params + [limit]))
+                rows = cur.fetchall() or []
+                column_names = [desc[0] for desc in list(cur.description or [])]
+
+            output_rows: list[dict[str, Any]] = []
+            for row in rows:
+                payload: dict[str, Any] = {}
+                for idx, col in enumerate(column_names):
+                    value = row[idx] if idx < len(row) else None
+                    if isinstance(value, (datetime, date)):
+                        payload[col] = value.isoformat()
+                    else:
+                        payload[col] = value
+                output_rows.append(payload)
+
+            return {
+                "sql": list_sql,
+                "params": [str(p) for p in (params + [limit])],
+                "rows": output_rows,
+                "count": len(output_rows),
+                "matched_count": matched_count,
+                "operation": operation,
+                "count_sql": count_sql,
+            }
+        finally:
+            conn.close()
+
+    def _try_federated_sql_read(self, question: str) -> dict[str, Any] | None:
+        plan = self._build_federated_read_plan(question)
+        if not isinstance(plan, dict):
+            return None
+        try:
+            execution = self._execute_federated_read_plan(plan)
+        except Exception as exc:
+            return {
+                "question": question,
+                "intent": "federated_read",
+                "answer": self._prefix_source(
+                    f"Federated source query was planned but failed: {str(exc)}",
+                    "federated_sql_error",
+                ),
+                "data": {
+                    "federated_plan": plan,
+                    "error": str(exc),
+                },
+                "source": "federated_sql_error",
+                "candidate_count": 0,
+            }
+
+        rows = execution.get("rows") if isinstance(execution.get("rows"), list) else []
+        source = plan.get("source") if isinstance(plan.get("source"), dict) else {}
+        source_key = str(source.get("source_key") or "source").strip() or "source"
+        year = int(((plan.get("query") or {}).get("year") if isinstance(plan.get("query"), dict) else 0) or 0)
+        operation = str(((plan.get("query") or {}).get("operation") if isinstance(plan.get("query"), dict) else "list") or "list").strip().lower() or "list"
+
+        if operation == "count":
+            count_value = int(execution.get("matched_count") or execution.get("count") or 0)
+            answer = f"Found {count_value} matching records in source '{source_key}' for {year}."
+            return {
+                "question": question,
+                "intent": "federated_read",
+                "answer": self._prefix_source(answer, "federated_sql"),
+                "data": {
+                    "rows": [],
+                    "count": count_value,
+                    "federated_plan": plan,
+                    "execution": {
+                        "sql": execution.get("sql"),
+                        "params": execution.get("params"),
+                    },
+                },
+                "source": "federated_sql",
+                "candidate_count": count_value,
+            }
+
+        if rows:
+            preview = rows[:5]
+            matched_count = int(execution.get("matched_count") or len(rows))
+            if operation == "summary":
+                answer = f"Summary for source '{source_key}' in {year}: {matched_count} matching records (showing {len(preview)} preview rows)."
+            else:
+                answer = f"Found {len(rows)} records in source '{source_key}' for {year}."
+            return {
+                "question": question,
+                "intent": "federated_read",
+                "answer": self._prefix_source(answer, "federated_sql"),
+                "data": {
+                    "rows": rows,
+                    "preview": preview,
+                    "matched_count": matched_count,
+                    "federated_plan": plan,
+                    "execution": {
+                        "sql": execution.get("sql"),
+                        "params": execution.get("params"),
+                        "count_sql": execution.get("count_sql"),
+                    },
+                },
+                "source": "federated_sql",
+                "candidate_count": len(rows),
+            }
+
+        answer = f"No records found in source '{source_key}' for {year}."
+        return {
+            "question": question,
+            "intent": "federated_read",
+            "answer": self._prefix_source(answer, "federated_sql"),
+            "data": {
+                "rows": [],
+                "federated_plan": plan,
+                "execution": {
+                    "sql": execution.get("sql"),
+                    "params": execution.get("params"),
+                },
+            },
+            "source": "federated_sql",
+            "candidate_count": 0,
+        }
+
     def _detect_query_language(self, question: str) -> str:
         """Detect the language of a query without hardcoding language names.
         Returns language code ('en', 'de', etc.). Defaults to 'en'.
@@ -874,6 +1481,44 @@ class QueryEngine:
         ):
             return None
 
+        # Guardrail: relation-style finance document queries (for example
+        # "show me bill related to mobile service for Aphotonix GmbH") should
+        # go through criteria/document retrieval, not strict table grounding.
+        if re.search(r"\b(?:bill|bills|invoice|invoices|receipt|receipts|document|documents)\b", lowered):
+            relation_cue = re.search(
+                r"\b(?:related\s+to|concerning|about|regarding|containing|contains|mentions?|describes?|for)\b",
+                lowered,
+            )
+            if relation_cue:
+                return None
+
+        # Guardrail: value-style amount/cost questions with contextual phrases
+        # (for example "amount for mobile services for Aphotonix GmbH") are
+        # semantic value lookups, not table row/column requests.
+        asks_value_amount = bool(
+            re.search(
+                r"\b(?:amount|total|cost|price|value|due|sum|charge|fee|betrag|gesamt|kosten|preis|wert|summe)\b",
+                lowered,
+            )
+        )
+        has_context_preposition_chain = bool(
+            re.search(r"\b(?:for|of|in|von|fuer|für)\b.*\b(?:for|of|in|von|fuer|für)\b", lowered)
+        )
+        explicit_table_cue = bool(
+            re.search(r"\b(?:row|column|cell|table|line\s*item|zeile|spalte|tabelle)\b", lowered)
+        )
+        generic_relation_list_style = bool(
+            re.search(
+                r"\b(?:show|list|get|find|give\s+me|zeige|zeig|gib\s+mir|finde)\b.*\b(?:of|for|von|fuer|für)\b",
+                lowered,
+                flags=re.IGNORECASE,
+            )
+        )
+        if generic_relation_list_style and not explicit_table_cue and not asks_value_amount:
+            return None
+        if asks_value_amount and has_context_preposition_chain and not explicit_table_cue:
+            return None
+
         context_entity_hint = default_entity_hint
         context_match = re.match(r"^\s*in\s+the\s+(.+?),\s*(.+)$", stripped, flags=re.IGNORECASE)
         if context_match:
@@ -881,9 +1526,9 @@ class QueryEngine:
             stripped = str(context_match.group(2) or "").strip()
 
         patterns = [
-            r"^\s*(?:what(?:'s| is)|show|get|find|give me|how much is)\s+(?:the\s+)?(.+?)\s+(?:in|for)\s+(.+?)(?:\?|$)",
-            r"^\s*(?:what(?:'s| is| was)|show|get|find|give me|how much is|how much was)\s+(?:the\s+)?(?:budget|amount|expenditure|cost)?\s*(?:for|of)\s+(.+?)\s+(?:in|for)\s+(.+?)(?:\?|$)",
-            r"^\s*(?:what(?:'s| is| was)|show|get|find|give me|how much is|how much was)\s+(?:the\s+)?(.+?)\s+of\s+(.+?)(?:\?|$)",
+            r"^\s*(?:what(?:'s| is)|show me|show|get me|get|find me|find|give me|how much is)\s+(?:the\s+)?(.+?)\s+(?:in|for)\s+(.+?)(?:\?|$)",
+            r"^\s*(?:what(?:'s| is| was)|show me|show|get me|get|find me|find|give me|how much is|how much was)\s+(?:the\s+)?(?:budget|amount|expenditure|cost)?\s*(?:for|of)\s+(.+?)\s+(?:in|for)\s+(.+?)(?:\?|$)",
+            r"^\s*(?:what(?:'s| is| was)|show me|show|get me|get|find me|find|give me|how much is|how much was)\s+(?:the\s+)?(.+?)\s+of\s+(.+?)(?:\?|$)",
             r"^\s*(?:wie\s+hoch\s+ist|was\s+ist|zeige|gib\s+mir|finde)\s+(?:der|die|das|den|dem|des)?\s*(.+?)\s+(?:in|im|für|fuer)\s+(.+?)(?:\?|$)",
         ]
 
@@ -894,6 +1539,7 @@ class QueryEngine:
 
             row_raw = str(match.group(1) or "").strip(" .,:;\"'[]()")
             column_raw = str(match.group(2) or "").strip(" .,:;\"'[]()")
+            row_raw = re.sub(r"^(?:me|us)\s+", "", row_raw, flags=re.IGNORECASE)
             # Pattern-specific swap for "<column> of <row>" shape.
             if "\\s+of\\s+" in pattern:
                 row_raw, column_raw = column_raw, row_raw
@@ -1415,7 +2061,8 @@ class QueryEngine:
                         SELECT DISTINCT rel.relationship_name
                         FROM object_instance oi
                         JOIN object_relationship rel
-                          ON rel.tar_object_id = oi.object_id
+                          ON rel.src_object_id = oi.object_id
+                          OR rel.tar_object_id = oi.object_id
                         WHERE LOWER(oi.object_name) = LOWER(%s)
                                                     AND COALESCE(oi.status, 'active') = 'active'
                                                     AND oi.valid_from <= CURRENT_DATE
@@ -2427,7 +3074,11 @@ class QueryEngine:
                 merged["related_entities"] = candidate_names if len(candidate_names) > 1 else related_entity
                 return merged
 
-        return related_result
+        # If the relationship itself is the object and the requested attribute is
+        # a field of that related object (for example email/telephone of a contact
+        # person), do not stop here with the related person's name. Let the later
+        # generic relationship-payload extraction path resolve the actual field.
+        return None
 
     def _llm_extract_intent(self, question: str) -> "ParsedQuery | None":
         """Last-resort fallback: ask the LLM to extract entity + attribute as JSON.
@@ -2988,7 +3639,7 @@ class QueryEngine:
             if raw_key not in schema_aliases:
                 return normalized or raw_key or None, "attribute"
 
-        if self.attr_embedding_index:
+        if self.attr_embedding_index and self._semantic_attribute_search_allowed(raw, entity_name):
             allowed_kinds = {"attribute", "relationship"}
             if entity_name:
                 schema_terms = self._get_entity_schema_terms(entity_name)
@@ -3079,6 +3730,208 @@ class QueryEngine:
         candidates = self._attribute_rescue_candidates_from_text(text)
         return candidates[0] if candidates else None
 
+    @staticmethod
+    def _is_attribute_candidate_token(token: str) -> bool:
+        value = str(token or "").strip().lower()
+        if len(value) < 3:
+            return False
+        if not re.search(r"[a-zA-ZäöüÄÖÜß]", value):
+            return False
+        if value.isdigit():
+            return False
+        return True
+
+    def _attribute_token_lexicon(self) -> set[str]:
+        cache = getattr(self, "_attribute_token_lexicon_cache", None)
+        if cache is not None:
+            return set(cache)
+
+        lexicon: set[str] = set()
+
+        for alias_key in self._schema_alias_fallback_map().keys():
+            for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", str(alias_key or "")):
+                if self._is_attribute_candidate_token(tok):
+                    lexicon.add(tok)
+
+        for canonical_name, translations in self.ATTRIBUTE_DISPLAY_NAMES.items():
+            for candidate in [canonical_name, canonical_name.replace("_", " ")]:
+                for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", str(candidate or "")):
+                    if self._is_attribute_candidate_token(tok):
+                        lexicon.add(tok)
+            if isinstance(translations, dict):
+                for names in translations.values():
+                    if not isinstance(names, list):
+                        continue
+                    for name in names:
+                        for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", str(name or "")):
+                            if self._is_attribute_candidate_token(tok):
+                                lexicon.add(tok)
+
+        self._attribute_token_lexicon_cache = set(lexicon)
+        return set(lexicon)
+
+    def _extract_attribute_phrases_via_spacy(self, text: str, entity_name: str | None = None) -> list[str]:
+        """Use spaCy syntax cues (noun/adjective phrases) to propose generic attribute phrases.
+
+        This avoids hardcoded legal-entity tokens by relying on grammatical structure
+        and later schema-aware gating.
+        """
+        nlp = self._get_spacy_nlp()
+        if nlp is None:
+            return []
+
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return []
+
+        try:
+            doc = nlp(raw_text)
+        except Exception:
+            return []
+
+        entity_tokens: set[str] = set()
+        if entity_name:
+            entity_tokens = {
+                tok
+                for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", str(entity_name or "").lower())
+                if self._is_attribute_candidate_token(tok)
+            }
+
+        phrases: list[str] = []
+
+        # Noun chunks capture core attribute phrases like "invoice date" or "contact email".
+        if hasattr(doc, "noun_chunks"):
+            try:
+                for chunk in doc.noun_chunks:
+                    chunk_tokens = []
+                    for token in chunk:
+                        pos = str(getattr(token, "pos_", "") or "").upper()
+                        if pos in {"DET", "PRON", "ADP", "CCONJ", "SCONJ", "PART", "AUX", "PUNCT"}:
+                            continue
+                        token_text = str(getattr(token, "text", "") or "").strip().lower()
+                        if self._is_attribute_candidate_token(token_text):
+                            chunk_tokens.append(token_text)
+
+                    if not chunk_tokens:
+                        continue
+
+                    if entity_tokens and all(tok in entity_tokens for tok in chunk_tokens):
+                        continue
+
+                    phrase = " ".join(chunk_tokens).strip()
+                    if phrase:
+                        phrases.append(phrase)
+            except Exception:
+                pass
+
+        # Token-level fallback for models without parser chunks.
+        for token in doc:
+            pos = str(getattr(token, "pos_", "") or "").upper()
+            if pos not in {"NOUN", "PROPN", "ADJ"}:
+                continue
+            token_text = str(getattr(token, "text", "") or "").strip().lower()
+            if not self._is_attribute_candidate_token(token_text):
+                continue
+            if entity_tokens and token_text in entity_tokens:
+                continue
+            phrases.append(token_text)
+
+        ordered: list[str] = []
+        for phrase in phrases:
+            normalized = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+            if normalized and normalized not in ordered:
+                ordered.append(normalized)
+        return ordered
+
+    def _semantic_attribute_search_allowed(
+        self,
+        phrase: str | None,
+        entity_name: str | None = None,
+        relation_name: str | None = None,
+    ) -> bool:
+        text = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+        if not text:
+            return False
+
+        tokens = [
+            tok
+            for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", text)
+            if tok
+        ]
+        if not tokens:
+            return False
+
+        if len(tokens) > 8:
+            return False
+
+        content_tokens = [tok for tok in tokens if self._is_attribute_candidate_token(tok)]
+        if not content_tokens:
+            return False
+
+        entity_tokens: set[str] = set()
+        if entity_name:
+            entity_tokens = {
+                tok
+                for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", str(entity_name or "").lower())
+                if tok and self._is_attribute_candidate_token(tok)
+            }
+        if entity_tokens and all(tok in entity_tokens for tok in content_tokens):
+            return False
+
+        # Reject likely entity/name fragments when content tokens mostly mirror entity terms.
+        if entity_tokens and len(content_tokens) <= 2:
+            overlap = sum(1 for tok in content_tokens if tok in entity_tokens)
+            if overlap >= len(content_tokens):
+                return False
+
+        normalized = self._normalize_alias_key(text)
+        schema_aliases = self._schema_alias_fallback_map()
+        if normalized in schema_aliases:
+            return True
+
+        relation_text = str(relation_name or "").strip().lower()
+        if len(content_tokens) == 1:
+            if relation_text and text == relation_text:
+                return True
+            # Single-token phrases are too noisy for semantic probing unless
+            # they are explicit schema aliases handled above.
+            return False
+
+        for canonical_name, translations in self.ATTRIBUTE_DISPLAY_NAMES.items():
+            candidates: list[str] = [canonical_name, canonical_name.replace("_", " ")]
+            if isinstance(translations, dict):
+                for names in translations.values():
+                    if isinstance(names, list):
+                        candidates.extend(str(name or "") for name in names)
+            for candidate in candidates:
+                candidate_text = re.sub(r"\s+", " ", str(candidate or "").strip().lower())
+                if candidate_text and candidate_text == text:
+                    return True
+
+        # Generic lexical signal: allow semantic search when phrase tokens overlap
+        # known schema aliases, even if wording is not an exact match.
+        alias_overlap = 0
+        for alias_key in schema_aliases.keys():
+            alias_tokens = [
+                tok
+                for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", str(alias_key or ""))
+                if self._is_attribute_candidate_token(tok)
+            ]
+            if not alias_tokens:
+                continue
+            if any(tok in alias_tokens for tok in content_tokens):
+                alias_overlap += 1
+                if alias_overlap >= 1:
+                    return True
+
+        if any(tok in self._attribute_token_lexicon() for tok in content_tokens):
+            return True
+
+        if relation_text and text == relation_text:
+            return True
+
+        return False
+
     def _expand_query_attribute_candidates(
         self,
         question: str,
@@ -3101,6 +3954,13 @@ class QueryEngine:
 
         seed_phrases: list[str] = []
         seed_phrases.extend(self._attribute_rescue_candidates_from_text(text))
+        explicit_candidates_present = bool(seed_phrases)
+
+        # Add grammar-aware candidates first (noun/adjective phrases), then
+        # schema gating decides which ones can trigger semantic probing.
+        for phrase in self._extract_attribute_phrases_via_spacy(text, entity_name):
+            if self._semantic_attribute_search_allowed(phrase, entity_name, relation_name):
+                seed_phrases.append(phrase)
 
         fragments = [text]
         fragments.extend(
@@ -3109,21 +3969,17 @@ class QueryEngine:
             if str(frag or "").strip()
         )
 
-        token_stopwords = {
-            "show", "me", "the", "of", "for", "what", "is", "are", "please", "give", "tell", "find", "get",
-            "zeige", "mir", "die", "der", "das", "von", "fur", "fuer", "was", "ist", "sind", "bitte", "gib", "lautet",
-        }
-
         for frag in fragments[:24]:
             normalized = re.sub(r"\s+", " ", str(frag or "").strip())
             if not normalized:
                 continue
-            seed_phrases.append(normalized)
+            if not explicit_candidates_present and self._semantic_attribute_search_allowed(normalized, entity_name, relation_name):
+                seed_phrases.append(normalized)
 
             tokens = [
                 tok
                 for tok in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]{3,}", normalized.lower())
-                if tok not in token_stopwords and tok not in self.SEMANTIC_STOPWORDS
+                if self._is_attribute_candidate_token(tok)
             ]
             if not tokens:
                 continue
@@ -3131,7 +3987,9 @@ class QueryEngine:
             max_n = min(3, len(tokens))
             for n in range(max_n, 0, -1):
                 for i in range(0, len(tokens) - n + 1):
-                    seed_phrases.append(" ".join(tokens[i : i + n]))
+                    candidate_phrase = " ".join(tokens[i : i + n])
+                    if self._semantic_attribute_search_allowed(candidate_phrase, entity_name, relation_name):
+                        seed_phrases.append(candidate_phrase)
 
         ordered_phrases: list[str] = []
         for phrase in seed_phrases:
@@ -3197,9 +4055,12 @@ class QueryEngine:
             return False
         patterns = [
             r"\b(?:all|full|complete|entire|everything|overall|comprehensive)\b",
+            r"\b(?:all\s+(?:data|information|details|fields?|columns?|attributes?))\b",
+            r"\b(?:show|give|list|return|display)\s+(?:me\s+)?(?:all|full|complete)\b",
             r"\b(?:personal\s+information|personal\s+details|profile|full\s+profile|identity\s+details)\b",
             r"\b(?:alle|vollst[aä]ndig(?:e|es|en)?|komplett(?:e|es|en)?|gesamte[nrms]?)\b",
-            r"\b(?:informationen|angaben|profil|details)\b",
+            r"\b(?:alle\s+(?:daten|informationen|angaben|details|felder|spalten|attribute))\b",
+            r"\b(?:informationen|angaben|profil|details|daten|felder|spalten|attribute)\b",
         ]
         return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
 
@@ -3226,6 +4087,7 @@ class QueryEngine:
             return []
 
         has_multi_attr_connector = bool(re.search(r"\b(?:and|und|sowie|plus|with|mit|samt)\b", text, flags=re.IGNORECASE))
+        has_details_cue = bool(re.search(r"\b(?:details?|information|info|daten|data|contact\s+details|contact\s+information|kontaktdaten|kontaktinformationen)\b", text, flags=re.IGNORECASE))
         has_name_cue = bool(
             re.search(
                 r"\b(?:name|namen|person\s*name|kontaktname|kontakt\s*name|contact\s*name|ansprechpartner(?:in)?|contact\s*person|kontaktperson)\b",
@@ -3261,10 +4123,10 @@ class QueryEngine:
             hints.append("email")
             hints.extend(["phone", "telephone"])
 
-        if has_multi_attr_connector or has_email_cue or has_phone_cue or has_role_cue:
-            if has_email_cue:
+        if has_details_cue or has_multi_attr_connector or has_email_cue or has_phone_cue or has_role_cue:
+            if has_email_cue or has_details_cue:
                 hints.append("email")
-            if has_phone_cue:
+            if has_phone_cue or has_details_cue:
                 hints.extend(["phone", "telephone"])
             if has_role_cue:
                 hints.append("role")
@@ -3339,6 +4201,7 @@ class QueryEngine:
 
         normalized = dict(result)
         normalized["temporal_scope"] = temporal_scope
+        normalized["attribute_value"] = self._repair_mojibake_value(normalized.get("attribute_value"))
 
         value = normalized.get("attribute_value")
         if (
@@ -3351,6 +4214,150 @@ class QueryEngine:
                 normalized["attribute_value"] = collapsed[0]
                 normalized["temporal_value_candidates"] = collapsed
         return normalized
+
+    @staticmethod
+    def _repair_mojibake_text(text: str) -> str:
+        raw = str(text or "")
+        if not raw:
+            return raw
+
+        suspicious_markers = ("Ã", "Â", "â", "ð", "œ", "ž")
+        if not any(marker in raw for marker in suspicious_markers):
+            return raw
+
+        try:
+            repaired = raw.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+            if repaired and repaired != raw:
+                return repaired
+        except Exception:
+            pass
+        return raw
+
+    def _repair_mojibake_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._repair_mojibake_text(value)
+        if isinstance(value, list):
+            return [self._repair_mojibake_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._repair_mojibake_value(item) for key, item in value.items()}
+        return value
+
+    def _format_mapping_value_for_answer(self, mapping: dict[str, Any]) -> str:
+        if not isinstance(mapping, dict):
+            return str(mapping)
+
+        def _clean(value: Any) -> str:
+            text = str(value or "").strip()
+            return text
+
+        name_value = _clean(mapping.get("name"))
+        preferred_keys = ["email", "phone", "telephone", "mobile", "role", "title", "id", "value"]
+
+        details: list[str] = []
+        used: set[str] = set()
+        for key in preferred_keys:
+            if key not in mapping:
+                continue
+            text = _clean(mapping.get(key))
+            if not text:
+                continue
+            details.append(f"{key}: {text}")
+            used.add(key)
+
+        for key, raw_value in mapping.items():
+            if key in used or key == "name":
+                continue
+            text = _clean(raw_value)
+            if not text:
+                continue
+            details.append(f"{key}: {text}")
+
+        if name_value and details:
+            return f"{name_value} ({', '.join(details)})"
+        if name_value:
+            return name_value
+        return ", ".join(details) if details else ""
+
+    def _related_object_attribute_map(
+        self,
+        conn,
+        related_object_ids: list[int],
+        max_attrs_per_object: int = 12,
+    ) -> dict[int, dict[str, Any]]:
+        """Fetch a compact latest attribute map for related objects.
+
+        This is intentionally generic and schema-agnostic so broad-scope
+        relationship requests can surface rich related-object details.
+        """
+        ids = [int(item) for item in related_object_ids if isinstance(item, int)]
+        if not ids:
+            return {}
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT src_id, attr_type, attr_json->>'value' AS attr_value
+                FROM (
+                    SELECT
+                        a.src_id,
+                        a.attr_type,
+                        a.attr_json,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY a.src_id, LOWER(a.attr_type)
+                            ORDER BY a.entry_date DESC NULLS LAST, a.attr_id DESC
+                        ) AS rn
+                    FROM attribute a
+                    WHERE a.src_type = 'object'
+                      AND a.src_id = ANY(%s)
+                      AND a.valid_from <= CURRENT_DATE
+                      AND (a.valid_until IS NULL OR a.valid_until > CURRENT_DATE)
+                ) ranked
+                WHERE rn = 1
+                ORDER BY src_id, attr_type;
+                """,
+                (ids,),
+            )
+            rows = cur.fetchall() or []
+
+        per_object: dict[int, dict[str, Any]] = {}
+        per_object_count: dict[int, int] = {}
+        for row in rows:
+            obj_id = int(row[0]) if isinstance(row[0], int) else None
+            if obj_id is None:
+                continue
+            attr_type = str(row[1] or "").strip()
+            attr_value = str(row[2] or "").strip()
+            if not attr_type or not attr_value:
+                continue
+
+            used = per_object_count.get(obj_id, 0)
+            if used >= max_attrs_per_object:
+                continue
+
+            object_map = per_object.setdefault(obj_id, {})
+            if attr_type in object_map:
+                continue
+            object_map[attr_type] = self._repair_mojibake_text(attr_value)
+            per_object_count[obj_id] = used + 1
+
+        return per_object
+
+    def _format_attribute_value_for_answer(self, value: Any) -> str:
+        if isinstance(value, dict):
+            rendered = self._format_mapping_value_for_answer(value)
+            return rendered or "None found"
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    rendered = self._format_mapping_value_for_answer(item)
+                else:
+                    rendered = str(item or "").strip()
+                if rendered:
+                    parts.append(rendered)
+            return "; ".join(parts) if parts else "None found"
+        rendered = str(value or "").strip()
+        return rendered or "None found"
 
     # Keep old name as alias for backward compatibility with any callers
     def _has_eori_contact_email_intent(self, text: str) -> bool:
@@ -3506,6 +4513,17 @@ class QueryEngine:
             lowered_text, flags=re.IGNORECASE
         ))
         if not has_contact_cue:
+            return None
+
+        # Keep this gate process-specific. Generic relationship contact queries
+        # (e.g. "contact persons of <entity>") should route through the
+        # relationship parser instead of process_contact_* attributes.
+        has_process_anchor = bool(re.search(
+            r"\b(?:process|eori|customs|zoll|vat|mwst|registration|registrierung|application|antrag|clearance|permit|license|lizenz)\b",
+            lowered_text,
+            flags=re.IGNORECASE,
+        ))
+        if not has_process_anchor:
             return None
 
         has_email = self._has_email_intent(lowered_text)
@@ -4457,11 +5475,199 @@ class QueryEngine:
 
         return None
 
+    def _schema_attribute_match_for_text(self, text: str, entity_name: str | None) -> str | None:
+        candidate_text = str(text or "").strip()
+        if not candidate_text or not entity_name:
+            return None
+
+        schema_names = [
+            str(item).strip()
+            for item in self._get_entity_attribute_names(entity_name)
+            if str(item).strip()
+        ]
+        if not schema_names:
+            return None
+
+        normalized_schema = {
+            self._normalize_alias_key(item): item for item in schema_names if self._normalize_alias_key(item)
+        }
+        if not normalized_schema:
+            return None
+
+        candidates: list[str] = []
+        candidates.extend(self._attribute_rescue_candidates_from_text(candidate_text))
+        for token in re.findall(r"[a-zA-ZäöüÄÖÜß0-9_\-]+", candidate_text.lower()):
+            if len(token) >= 3:
+                candidates.append(token)
+
+        # First try exact/normalised literal schema matches.
+        for candidate in candidates:
+            normalized = self._normalize_alias_key(candidate)
+            if not normalized:
+                continue
+            if normalized in normalized_schema:
+                return normalized_schema[normalized]
+
+        # Then allow semantic schema resolution (alias/embedding-backed) when the
+        # wording is a paraphrase or near-synonym rather than an exact column name.
+        for candidate in candidates:
+            resolved_attr, kind = self._resolve_schema_term(candidate, entity_name)
+            if kind in {"attribute", "relationship"}:
+                attr_name = str(resolved_attr or "").strip()
+                if attr_name and attr_name in schema_names:
+                    return attr_name
+
+        resolved_attr, kind = self._resolve_schema_term(candidate_text, entity_name)
+        if kind in {"attribute", "relationship"}:
+            attr_name = str(resolved_attr or "").strip()
+            if attr_name and attr_name in schema_names:
+                return attr_name
+
+        return None
+
+    def _extract_contact_person_details_intent(
+        self,
+        text: str,
+        detected_language: str,
+        default_entity_hint: str | None = None,
+    ) -> ParsedQuery | None:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return None
+
+        broad_scope = self._has_broad_attribute_scope_cue(text)
+        has_process_anchor = bool(re.search(
+            r"\b(?:process|eori|customs|zoll|vat|mwst|registration|registrierung|application|antrag|clearance|permit|license|lizenz)\b",
+            lowered,
+            flags=re.IGNORECASE,
+        ))
+        if has_process_anchor:
+            return None
+
+        has_contact_person_cue = bool(
+            re.search(
+                r"\b(?:contact\s+persons?|contact\s+person|contacts?|kontaktpersonen?|kontaktperson|ansprechpartner(?:in)?(?:s)?)\b",
+                lowered,
+                flags=re.IGNORECASE,
+            )
+        )
+        if not has_contact_person_cue:
+            return None
+
+        requested_attrs: list[str] = []
+        if self._has_email_intent(text):
+            requested_attrs.append("email")
+        if re.search(r"\b(?:telephone|phone|mobile|tel|telefon|phone\s*number|telephone\s*number)\b", lowered, flags=re.IGNORECASE):
+            requested_attrs.append("telephone")
+        if re.search(r"\b(?:name|contact\s*name|person\s*name|kontaktname)\b", lowered, flags=re.IGNORECASE):
+            requested_attrs.append("name")
+        if re.search(r"\b(?:role|position|function|title|rolle|funktion|titel)\b", lowered, flags=re.IGNORECASE):
+            requested_attrs.append("role")
+
+        if not broad_scope and not requested_attrs:
+            return None
+
+        entity_match = re.search(
+            r"(?:contact\s+persons?|contact\s+person|contacts?|kontaktpersonen?|kontaktperson|ansprechpartner(?:in)?(?:s)?)\s+(?:of|for|von|f[üu]r)\s+([A-Za-z0-9 .&äöüÄÖÜß_\-/]+?)(?:[\?\.!]|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not entity_match:
+            return None
+
+        entity_hint = self._normalize_entity_name_hint((entity_match.group(1) or "").strip(" ."))
+        if not entity_hint:
+            entity_hint = default_entity_hint
+        if not entity_hint:
+            return None
+
+        schema_attr = self._schema_attribute_match_for_text(text, entity_hint)
+        if schema_attr:
+            return ParsedQuery(
+                intent="attribute_lookup",
+                entity_name=entity_hint,
+                attribute_name=schema_attr,
+                confidence=0.89,
+                language=detected_language,
+                criteria={
+                    "parse_method": "schema_attribute_gate",
+                    "schema_attribute": schema_attr,
+                    "broad_scope": True,
+                },
+            )
+
+        if requested_attrs:
+            return ParsedQuery(
+                intent="attribute_lookup",
+                entity_name=entity_hint,
+                attribute_name="contact_person",
+                confidence=0.9,
+                language=detected_language,
+                relation_name="contact_person",
+                attribute_names=requested_attrs,
+                criteria={
+                    "parse_method": "contact_person_details_gate",
+                    "relationship_concept": "contact_person",
+                    "broad_scope": True,
+                },
+            )
+
+        return ParsedQuery(
+            intent="attribute_lookup",
+            entity_name=entity_hint,
+            attribute_name="contact_person",
+            confidence=0.9,
+            language=detected_language,
+            relation_name="contact_person",
+            criteria={
+                "parse_method": "contact_person_details_gate",
+                "relationship_concept": "contact_person",
+                "broad_scope": True,
+            },
+        )
+
     def parse_query(self, question: str) -> ParsedQuery:
         text = question.strip()
         lowered = text.lower()
         detected_language = self._detect_query_language(question)
         default_entity_hint = self._best_entity_hint(text)
+
+        contact_person_details_query = self._extract_contact_person_details_intent(text, detected_language, default_entity_hint)
+        if contact_person_details_query:
+            return contact_person_details_query
+
+        # Generic relation-details gate: catches forms like
+        # "<relationship> details for <entity>" and validates the relationship
+        # against the entity schema before routing to attribute lookup.
+        relation_detail_match = re.search(
+            r"^\s*([A-Za-z0-9äöüÄÖÜß_\- ]+?)\s+details?\s+(?:of|for|von|fuer|für)\s+([A-Za-z0-9 .&äöüÄÖÜß_\-/]+?)(?:[\?\.!]|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if relation_detail_match:
+            relation_raw = str(relation_detail_match.group(1) or "").strip()
+            entity_raw = str(relation_detail_match.group(2) or "").strip(" .")
+            entity_hint = self._normalize_entity_name_hint(entity_raw)
+            if relation_raw and entity_hint:
+                matched_rel = self._match_entity_relationship_name(entity_hint, relation_raw)
+                if not matched_rel:
+                    try:
+                        with self._get_connection() as _conn:
+                            resolved_hint = self._resolve_entity_name_for_lookup(_conn, entity_hint) or entity_hint
+                        matched_rel = self._match_entity_relationship_name(resolved_hint, relation_raw)
+                        if matched_rel:
+                            entity_hint = resolved_hint
+                    except Exception:
+                        pass
+                if matched_rel:
+                    return ParsedQuery(
+                        intent="attribute_lookup",
+                        entity_name=entity_hint,
+                        attribute_name=matched_rel,
+                        confidence=0.9,
+                        language=detected_language,
+                        criteria={"parse_method": "generic_relation_detail_gate", "relationship_concept": relation_raw},
+                    )
 
         # ── Generic relationship query gate ──────────────────────────────────
         # "who/what are the <rel> of <entity>?" maps to entity+relationship lookup
@@ -4714,22 +5920,27 @@ class QueryEngine:
                             criteria={"parse_method": "identifier_multilang_gate"},
                         ))
 
-        # Resolve criteria intents before attribute pattern matching so document/note
-        # requests are not hijacked by semantically-near attribute patterns.
-        criteria_query = self._route_semantic_intent_frame(
-            text=text,
-            language=detected_language,
+        # Resolve explicit criteria intents before semantic frames so entity-of-person
+        # questions like "invoices of Alice Example" are not hijacked by document-note
+        # semantic fallback.
+        criteria_query = self._extract_criteria_query(
+            text,
+            detected_language,
             default_entity_hint=default_entity_hint,
         )
         if not criteria_query:
-            criteria_query = self._extract_criteria_query(
-                text,
-                detected_language,
+            criteria_query = self._route_semantic_intent_frame(
+                text=text,
+                language=detected_language,
                 default_entity_hint=default_entity_hint,
             )
-            if criteria_query and isinstance(criteria_query.criteria, dict):
-                criteria_query.criteria.setdefault("parse_method", "criteria_rule")
         if criteria_query:
+            if isinstance(criteria_query.criteria, dict):
+                parse_method = str(criteria_query.criteria.get("parse_method") or "").strip()
+                if not parse_method and criteria_query.intent == "criteria_lookup":
+                    criteria_query.criteria.setdefault("parse_method", "criteria_rule")
+                elif not parse_method and criteria_query.intent == "semantic_lookup":
+                    criteria_query.criteria.setdefault("parse_method", "semantic_frame_registry")
             arbitration_candidates.append(criteria_query)
 
         # Identifier-first multilingual parser: extract attribute phrase before a legal entity
@@ -5878,15 +7089,6 @@ class QueryEngine:
         # Extract time window once — applied to any criteria pattern that matches.
         time_window = self._extract_time_window(text)
 
-        semantic_doc_query = self._extract_semantic_doc_note_entity_criteria(
-            text=text,
-            language=language,
-            time_window=time_window,
-            default_entity_hint=default_entity_hint,
-        )
-        if semantic_doc_query:
-            return semantic_doc_query
-
         # --- Pattern: "<entity_type> of <person>" with optional time constraint ---
         # e.g. "Show me the expenses of Alex Example in the last three months"
         _etype_pattern = "|".join(re.escape(k) for k in self._ENTITY_TYPE_MAP)
@@ -5915,6 +7117,15 @@ class QueryEngine:
                 language=language,
                 criteria=criteria,
             )
+
+        semantic_doc_query = self._extract_semantic_doc_note_entity_criteria(
+            text=text,
+            language=language,
+            time_window=time_window,
+            default_entity_hint=default_entity_hint,
+        )
+        if semantic_doc_query:
+            return semantic_doc_query
 
         entity_directory = re.search(
             r"(?:show|list|get|find|generate|give\s+me)\s+(?:me\s+)?(?:a\s+)?(?:list\s+of\s+)?([A-Za-z][A-Za-z0-9 _\-/&äöüÄÖÜß]+?)(?:\s+(?:records?|entries|data))?\s+(?:with\s+their\s+)?(.+?)\s+(?:from|in)\s+([A-Za-z0-9 .,&'\-/äöüÄÖÜß]+?)(?:[\?\.!]|$)",
@@ -6166,6 +7377,8 @@ class QueryEngine:
             # Extended: graph/profile/record phrasing users naturally write
             "node", "nodes", "knoten", "profile", "profiles", "profil", "profile",
             "record", "records", "eintrag", "eintraege", "entry", "entries",
+            # Finance-document phrasing users often use instead of the generic word "document"
+            "bill", "bills", "invoice", "invoices", "receipt", "receipts", "rechnung", "rechnungen", "beleg", "belege",
         }
         note_tokens = {
             "note", "notes", "notiz", "notizen", "memo", "memos",
@@ -6178,6 +7391,14 @@ class QueryEngine:
         has_note_token = any(tok in lexical_tokens for tok in note_tokens)
         if not has_document_token and not has_note_token:
             return None
+
+        # Do not let document semantic-frame parsing hijack value-style questions
+        # (e.g. "How much was the telephone bill for ..."). These should prefer
+        # attribute/value resolution paths, which can still bridge to documents later.
+        if self._is_value_document_context_question(raw_text):
+            has_listing_action = any(tok in lexical_tokens for tok in action_tokens)
+            if not has_listing_action:
+                return None
 
         # Relation phrases intentionally include multilingual paraphrases.
         # We split them into direct-content vs graph-relation intent to control
@@ -6638,6 +7859,49 @@ class QueryEngine:
                 return False
             return not _has_full_term_coverage(list(existing.get("matched_terms") or []))
 
+        q_norm = self._normalize_semantic_text(question)
+        q_asks_money = bool(
+            re.search(
+                r"\b(total|amount|cost|price|due|sum|charge|fee|bill|invoice|rechnung|betrag|gesamt|kosten|preis)\b",
+                q_norm,
+                flags=re.IGNORECASE,
+            )
+        )
+        telecom_terms = {
+            "telecom", "telecommunication", "telecommunications", "telephone", "phone", "mobile", "cell", "cellular", "gsm",
+            "telefon", "telefonie", "mobil", "mobilfunk", "telekommunikation",
+        }
+        billing_terms = {
+            "bill", "bills", "invoice", "invoices", "receipt", "receipts", "statement",
+            "rechnung", "rechnungen", "beleg", "belege", "quittung", "payment", "payments", "charge", "charges",
+            "amount", "cost", "price", "due", "total", "betrag", "kosten", "preis", "gesamt", "sum",
+        }
+        total_terms = {
+            "amount due", "total due", "total amount", "grand total", "payable", "zu bezahlen", "zahlbar", "gesamtbetrag",
+        }
+        q_wants_telecom = any(term in q_norm for term in telecom_terms)
+        q_wants_billing = any(term in q_norm for term in billing_terms)
+
+        def _semantic_doc_boost(haystack_text: str) -> float:
+            hay = self._normalize_semantic_text(haystack_text)
+            if not hay:
+                return 0.0
+
+            boost = 0.0
+            has_telecom = any(term in hay for term in telecom_terms)
+            has_billing = any(term in hay for term in billing_terms)
+            has_total = any(term in hay for term in total_terms)
+
+            if q_wants_telecom and has_telecom:
+                boost += 1.20
+            if q_wants_billing and has_billing:
+                boost += 1.20
+            if q_wants_telecom and q_wants_billing and has_telecom and has_billing:
+                boost += 0.90
+            if q_asks_money and has_total:
+                boost += 0.60
+            return boost
+
         query_sql = """
                         SELECT
                             d.doc_id,
@@ -6770,7 +8034,7 @@ class QueryEngine:
             if not matched_terms:
                 continue
 
-            score = float(len(matched_terms))
+            score = float(len(matched_terms)) + _semantic_doc_boost(blob)
             _d_meta = row[8] if isinstance(row[8], dict) else {}
             item = {
                 "object_id": None,
@@ -6783,6 +8047,10 @@ class QueryEngine:
                 "title": self._resolve_doc_title(row[1], _d_meta),
                 "file_name": self._resolve_file_name(row[1], row[2], _d_meta),
                 "file_path": row[2],
+                "doc_cat": str(row[3] or ""),
+                "doc_type": str(row[4] or ""),
+                "doc_theme": str(row[6] or ""),
+                "keyword_text": str(row[7] or ""),
                 "matched_terms": matched_terms,
                 "score": score,
             }
@@ -6890,6 +8158,15 @@ class QueryEngine:
                         continue
 
                     metadata = row[4] if isinstance(row[4], dict) else {}
+                    doc_semantic_text = " ".join(
+                        [
+                            str(row[1] or ""),
+                            str(row[2] or ""),
+                            str(row[6] or ""),
+                            str(row[7] or ""),
+                            str(row[8] or ""),
+                        ]
+                    )
                     item = {
                         "object_id": row[5] if isinstance(row[5], int) else None,
                         "entity_name": str(row[1] or row[2] or f"document_{doc_id}"),
@@ -6903,7 +8180,7 @@ class QueryEngine:
                         "file_path": row[2],
                         "matched_terms": matched_terms,
                         # Strong direct evidence: explicit object link in part table.
-                        "score": float(len(matched_terms)) + 2.25,
+                        "score": float(len(matched_terms)) + 2.25 + _semantic_doc_boost(doc_semantic_text),
                     }
                     _upsert_scored(item)
             except Exception:
@@ -6939,7 +8216,7 @@ class QueryEngine:
                 if not matched_terms:
                     continue
 
-                score = float(len(matched_terms)) + 0.75
+                score = float(len(matched_terms)) + 0.75 + _semantic_doc_boost(haystack)
                 prev_hit = candidate_hits.get(cand_doc_id)
                 if prev_hit is None or score > float(prev_hit.get("score") or 0.0):
                     candidate_hits[cand_doc_id] = {
@@ -7024,6 +8301,7 @@ class QueryEngine:
                             "title": self._resolve_doc_title(row[1], metadata),
                             "file_name": self._resolve_file_name(row[1], row[2], metadata),
                             "file_path": row[2],
+                            "doc_theme": str(metadata.get("doc_theme") or ""),
                             "matched_terms": list(hit.get("matched_terms") or []),
                             "score": float(hit.get("score") or 0.0),
                         }
@@ -7127,6 +8405,15 @@ class QueryEngine:
                     if not matched_terms:
                         continue
 
+                    md_semantic_text = " ".join(
+                        [
+                            str(row[1] or ""),
+                            str(row[2] or ""),
+                            str(metadata.get("doc_theme") or ""),
+                            str(metadata.get("keyword_text") or ""),
+                            md_text[:1400],
+                        ]
+                    )
                     item = {
                         "object_id": None,
                         "entity_name": str(row[1] or row[2] or f"document_{doc_id}"),
@@ -7139,7 +8426,7 @@ class QueryEngine:
                         "file_name": self._resolve_file_name(row[1], row[2], metadata),
                         "file_path": row[2],
                         "matched_terms": matched_terms,
-                        "score": float(len(matched_terms)) + 0.65,
+                        "score": float(len(matched_terms)) + 0.65 + _semantic_doc_boost(md_semantic_text),
                     }
                     _upsert_scored(item)
             except Exception:
@@ -7471,7 +8758,7 @@ class QueryEngine:
                         "file_path": row[2],
                         "matched_terms": matched_terms,
                         # Linked-entity evidence is strong; boost to ensure inclusion.
-                        "score": float(len(matched_terms) + 2.0),
+                        "score": float(len(matched_terms) + 2.0) + _semantic_doc_boost(haystack),
                     }
                     _upsert_scored(item)
 
@@ -7507,7 +8794,7 @@ class QueryEngine:
                         "file_path": row[2],
                         "matched_terms": matched_terms,
                         # Second-hop evidence is slightly weaker than direct linked_name evidence.
-                        "score": float(len(matched_terms) + 1.5),
+                        "score": float(len(matched_terms) + 1.5) + _semantic_doc_boost(haystack),
                     }
                     _upsert_scored(item)
 
@@ -7528,10 +8815,26 @@ class QueryEngine:
                         "title": self._resolve_doc_title(row[1], metadata),
                         "file_name": self._resolve_file_name(row[1], row[2], metadata),
                         "file_path": row[2],
+                        "doc_theme": str(row[5] or ""),
+                        "keyword_text": str(row[6] or ""),
+                        "doc_cat": str(row[7] or ""),
+                        "doc_type": str(row[8] or ""),
                         # Keep the original queried entity as the matched term, because this match
                         # is supported via relationship-connected entity names.
                         "matched_terms": list(must_contain),
-                        "score": float(len(must_contain) + 1.25),
+                        "score": float(len(must_contain) + 1.25)
+                        + _semantic_doc_boost(
+                            " ".join(
+                                [
+                                    str(row[1] or ""),
+                                    str(row[2] or ""),
+                                    str(row[5] or ""),
+                                    str(row[6] or ""),
+                                    str(row[7] or ""),
+                                    str(row[8] or ""),
+                                ]
+                            )
+                        ),
                     }
                     _upsert_scored(item)
             except Exception:
@@ -7945,7 +9248,13 @@ class QueryEngine:
         if name == "registration_no":
             return {
                 "registration", "register", "reg", "company", "firm", "firma",
-                "handelsregister", "unternehmens", "uid", "che", "tax",
+                "unternehmens", "uid", "che", "tax",
+                "vat", "mwst", "must", "ust", "iva", "tva",
+            }
+        if name == "uid_che":
+            return {
+                "registration", "register", "reg", "company", "firm", "firma",
+                "unternehmens", "uid", "che", "tax",
                 "vat", "mwst", "must", "ust", "iva", "tva",
             }
         if name == "tr_number":
@@ -8008,12 +9317,12 @@ class QueryEngine:
         if any(tok in tokens for tok in {"eori"}):
             suggestions.append("eori_no")
         if any(tok in tokens for tok in {"tax", "vat", "mwst", "must", "ust", "uid", "registration", "register", "reg", "che", "iva", "tva"}):
-            suggestions.append("registration_no")
+            suggestions.append("uid_che")
         if any(tok in tokens for tok in {"trade", "tr", "handelsregister"}):
             suggestions.append("tr_number")
 
         # Stable fallback shortlist for identifier requests.
-        for item in ("eori_no", "registration_no", "tr_number"):
+        for item in ("eori_no", "uid_che", "tr_number"):
             if item not in suggestions:
                 suggestions.append(item)
         return suggestions[:4]
@@ -8084,6 +9393,14 @@ class QueryEngine:
         if not raw:
             return None
 
+        raw_text = str(raw or "").strip().lower()
+        if (
+            re.search(r"\b(?:phone|telephone|telefon|mobile|mobil|telecom|telecommunication)\b", raw_text)
+            and re.search(r"\b(?:bill|invoice|rechnung|charge|charges|cost|amount|fee|total|price|payment|services?)\b", raw_text)
+        ):
+            # Billing phrasing should resolve to monetary value, not contact number.
+            return "net_amount"
+
         normalized = self._normalize_alias_key(raw)
         schema_aliases = self._schema_alias_fallback_map()
 
@@ -8102,6 +9419,15 @@ class QueryEngine:
             "eori_nr": "eori_no",
             "eorinr": "eori_no",
             "eori_nummer": "eori_no",
+            "uid": "uid_che",
+            "uid_che": "uid_che",
+            "che": "uid_che",
+            "che_number": "uid_che",
+            "company_uid": "uid_che",
+            "company_registration_number": "uid_che",
+            "registration_number": "uid_che",
+            "registration_no": "uid_che",
+            "company_number": "uid_che",
             "total_capital": "total_capital",
             "totalcapital": "total_capital",
             "share_capital": "total_capital",
@@ -8119,7 +9445,7 @@ class QueryEngine:
             return normalized or None
 
         # Prefer ingestion-backed schema index (lexical + vector) before hardcoded aliases.
-        if self.attr_embedding_index:
+        if self.attr_embedding_index and self._semantic_attribute_search_allowed(raw):
             try:
                 schema_match = self.attr_embedding_index.find_schema_term(
                     raw,
@@ -8156,6 +9482,84 @@ class QueryEngine:
             if variant in payload and payload[variant] not in (None, ""):
                 return payload[variant]
         return None
+
+    def _extract_attribute_value_from_related_payload(
+        self,
+        payload: Any,
+        attribute_name: str,
+        relation_name: str | None = None,
+    ) -> Any:
+        attr = str(attribute_name or "").strip()
+        if not attr:
+            return None
+
+        variants = []
+        direct_variants = [attr, self._normalize_attribute_name(attr)]
+        for item in direct_variants:
+            if item and item not in variants:
+                variants.append(item)
+
+        relation_like_attrs = {"contact_person", "contact_person_name", "person_name", "contact_name", "name"}
+        if attr in relation_like_attrs or str(relation_name or "").strip().lower() in relation_like_attrs:
+            for item in self._candidate_source_row_keys(attr, relation_name):
+                if item and item not in variants:
+                    variants.append(item)
+        else:
+            for item in self._candidate_source_row_keys(attr):
+                if item and item not in variants:
+                    variants.append(item)
+
+        if attr in relation_like_attrs:
+            for item in ["name", "contact_person", "contact_name", "person_name"]:
+                if item and item not in variants:
+                    variants.append(item)
+
+        if isinstance(payload, dict):
+            for variant in variants:
+                if variant in payload and payload[variant] not in (None, ""):
+                    return payload[variant]
+            if "attribute_value" in payload:
+                value = self._extract_attribute_value_from_related_payload(
+                    payload.get("attribute_value"),
+                    attr,
+                    relation_name,
+                )
+                if value not in (None, "", [], {}):
+                    return value
+            if "name" in payload and payload["name"] not in (None, ""):
+                return payload["name"]
+            return None
+
+        if isinstance(payload, list):
+            extracted_values: list[Any] = []
+            for item in payload:
+                if isinstance(item, dict):
+                    value = self._extract_attribute_value_from_related_payload(item, attr, relation_name)
+                    if value is None:
+                        continue
+                    if isinstance(value, list):
+                        extracted_values.extend(value)
+                    else:
+                        extracted_values.append(value)
+            if extracted_values:
+                deduped: list[Any] = []
+                for value in extracted_values:
+                    text = str(value or "").strip()
+                    if text and text not in {str(item or "").strip() for item in deduped if isinstance(item, str)}:
+                        deduped.append(value)
+                return deduped if len(deduped) > 1 else deduped[0] if deduped else None
+            return None
+
+        return None
+
+    @staticmethod
+    def _is_placeholder_identifier_value(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        if not text:
+            return True
+        if text in {"none", "null", "n/a", "na", "-", "--"}:
+            return True
+        return bool(re.fullmatch(r"0+(?:[.]0+)?", text))
 
     def _structured_table_term_forms(self, value: Any) -> list[str]:
         text = str(value or "").strip()
@@ -8200,6 +9604,40 @@ class QueryEngine:
         if not isinstance(record, dict):
             return None, None
 
+        monetary_request = any(
+            str(self._normalize_attribute_name(candidate) or "").strip().lower()
+            in {"amount", "net_amount", "gross_amount", "tax_amount", "total_amount", "price", "cost", "value"}
+            for candidate in attribute_candidates
+        )
+
+        if monetary_request:
+            preferred_monetary_keys = {
+                "amount",
+                "net_amount",
+                "gross_amount",
+                "tax_amount",
+                "total_amount",
+                "total_amount_chf",
+                "amount_chf",
+                "amount_source_currency",
+                "unit_price",
+                "unit_price_chf",
+                "unit_price_cny",
+                "price",
+                "cost",
+                "value",
+            }
+            normalized_record = {
+                self._normalize_attribute_name(key): (key, value)
+                for key, value in record.items()
+                if str(key).strip()
+            }
+            for preferred_key in preferred_monetary_keys:
+                if preferred_key in normalized_record:
+                    original_key, value = normalized_record[preferred_key]
+                    if value not in (None, ""):
+                        return original_key, value
+
         for candidate in attribute_candidates:
             for variant in self._key_variants(candidate):
                 if variant in record and record[variant] not in (None, ""):
@@ -8213,6 +9651,76 @@ class QueryEngine:
 
         return None, None
 
+    def _attribute_filters_from_criteria(self, criteria: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(criteria, dict):
+            return []
+        llm_plan = criteria.get("llm_query_plan") if isinstance(criteria.get("llm_query_plan"), dict) else {}
+        filters = llm_plan.get("filters") if isinstance(llm_plan.get("filters"), dict) else {}
+        raw_filters = filters.get("attribute_filters") if isinstance(filters.get("attribute_filters"), list) else []
+
+        parsed_filters: list[dict[str, Any]] = []
+        for item in raw_filters:
+            if not isinstance(item, dict):
+                continue
+            attr_name = str(item.get("attribute") or "").strip()
+            operator = str(item.get("operator") or "eq").strip().lower() or "eq"
+            value = item.get("value")
+            if not attr_name or value in (None, ""):
+                continue
+            parsed_filters.append(
+                {
+                    "attribute": attr_name,
+                    "operator": operator,
+                    "value": value,
+                }
+            )
+        return parsed_filters
+
+    def _structured_table_record_matches_attribute_filters(
+        self,
+        record: dict[str, Any],
+        metadata: dict[str, Any],
+        attribute_filters: list[dict[str, Any]],
+    ) -> bool:
+        if not attribute_filters:
+            return True
+
+        record_text = self._structured_table_text(record)
+        metadata_text = self._structured_table_text(metadata)
+
+        for item in attribute_filters:
+            attr_name = str(item.get("attribute") or "").strip()
+            operator = str(item.get("operator") or "eq").strip().lower() or "eq"
+            expected_value = item.get("value")
+            if not attr_name or expected_value in (None, ""):
+                continue
+
+            expected_text = str(expected_value).strip()
+            expected_forms = self._structured_table_term_forms(expected_text)
+            filter_candidates = self._expand_query_attribute_candidates(attr_name, None)
+            if attr_name not in filter_candidates:
+                filter_candidates.insert(0, attr_name)
+
+            matched_key, matched_value = self._record_matches_structured_table_attribute(record, filter_candidates)
+            if matched_value not in (None, ""):
+                actual_text = str(matched_value).strip().lower()
+                if operator == "eq":
+                    if not any(form == actual_text for form in expected_forms):
+                        return False
+                else:
+                    if not any(form in actual_text for form in expected_forms):
+                        return False
+                continue
+
+            if operator == "eq":
+                if not any(form and (form in record_text or form in metadata_text) for form in expected_forms):
+                    return False
+            else:
+                if not any(form and (form in record_text or form in metadata_text) for form in expected_forms):
+                    return False
+
+        return True
+
     def _lookup_attribute_in_structured_tables(
         self,
         conn,
@@ -8220,6 +9728,7 @@ class QueryEngine:
         attribute_name: str,
         relation_name: str | None = None,
         scope_doc_ids: list[int] | None = None,
+        attribute_filters: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         if not entity_name or not attribute_name:
             return None
@@ -8250,6 +9759,7 @@ class QueryEngine:
         entity_forms = self._structured_table_term_forms(entity_name)
         relation_forms = self._structured_table_term_forms(relation_name) if relation_name else []
         attribute_forms = self._structured_table_term_forms(attribute_name)
+        active_attribute_filters = list(attribute_filters or [])
 
         for row in doc_rows:
             metadata = row[3] if len(row) > 3 and isinstance(row[3], dict) else {}
@@ -8271,6 +9781,8 @@ class QueryEngine:
                     if not self._record_matches_structured_table_entity(record, entity_name):
                         if not doc_text_matches:
                             continue
+                    if not self._structured_table_record_matches_attribute_filters(record, metadata, active_attribute_filters):
+                        continue
 
                     matched_key, matched_value = self._record_matches_structured_table_attribute(record, attribute_candidates)
                     if matched_value in (None, ""):
@@ -8294,6 +9806,79 @@ class QueryEngine:
                     return result
 
         return None
+
+    def _result_satisfies_attribute_filters(
+        self,
+        conn,
+        result: dict[str, Any] | None,
+        attribute_filters: list[dict[str, Any]] | None,
+    ) -> bool:
+        """Validate that a resolved attribute result satisfies all planner attribute filters.
+
+        Evidence sources (in order):
+        1) direct result attribute/value when filter targets same attribute,
+        2) document structured table records for result.doc_id,
+        3) relaxed textual evidence over result + metadata.
+        """
+        active_filters = list(attribute_filters or [])
+        if not active_filters:
+            return True
+        if not isinstance(result, dict) or not result:
+            return False
+
+        # Fast-path: explicit result attribute equals filter attribute and value satisfies filter.
+        result_attr = str(result.get("attribute_name") or "").strip()
+        result_val = result.get("attribute_value")
+        if result_attr and result_val not in (None, ""):
+            record = {result_attr: result_val}
+            if self._structured_table_record_matches_attribute_filters(record, result, active_filters):
+                return True
+
+        # Try document-level structured evidence when provenance is available.
+        metadata: dict[str, Any] = {}
+        doc_id = result.get("doc_id")
+        if isinstance(doc_id, int):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT metadata
+                        FROM document
+                        WHERE doc_id = %s
+                          AND COALESCE(status, 'active') = 'active'
+                          AND valid_from <= CURRENT_DATE
+                          AND (valid_until IS NULL OR valid_until > CURRENT_DATE)
+                        LIMIT 1
+                        """,
+                        (doc_id,),
+                    )
+                    row = cur.fetchone()
+                if row and isinstance(row[0], dict):
+                    metadata = row[0]
+            except Exception:
+                metadata = {}
+
+        structured = metadata.get("structured_tables") if isinstance(metadata.get("structured_tables"), dict) else {}
+        tables = structured.get("tables") if isinstance(structured.get("tables"), list) else []
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            records = table.get("records") if isinstance(table.get("records"), list) else []
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                if self._structured_table_record_matches_attribute_filters(record, metadata, active_filters):
+                    return True
+
+        # Last resort: textual evidence over result + metadata.
+        haystack = self._structured_table_text({"result": result, "metadata": metadata})
+        if not haystack:
+            return False
+        for item in active_filters:
+            expected_forms = self._structured_table_term_forms(item.get("value"))
+            if not any(form and form in haystack for form in expected_forms):
+                return False
+        return True
 
     def _sql_shareholder_lookup(self, conn, entity_name: str) -> dict[str, Any] | None:
         with conn.cursor() as cur:
@@ -8687,6 +10272,7 @@ class QueryEngine:
         conn,
         entity_name: str,
         relationship_concept: str,
+        broad_scope: bool = False,
     ) -> dict[str, Any] | None:
         """Generic relationship lookup: find all entities related to entity_name through
         any relationship whose name contains the concept keyword (e.g. 'shareholder',
@@ -8722,6 +10308,7 @@ class QueryEngine:
                     """
                     SELECT
                         anchor.object_name            AS anchor_name,
+                        related.object_id             AS related_object_id,
                         related.object_name           AS related_name,
                         related.class_name            AS related_class,
                         rel.relationship_name,
@@ -8731,6 +10318,12 @@ class QueryEngine:
                                          THEN attr.attr_json->>'value' END), '') AS share_nominal_chf,
                         COALESCE(MAX(CASE WHEN attr.attr_type = 'role'
                                          THEN attr.attr_json->>'value' END), '') AS role,
+                        COALESCE(MAX(CASE WHEN LOWER(obj_attr.attr_type) = 'email'
+                                         THEN obj_attr.attr_json->>'value' END), '') AS contact_email,
+                        COALESCE(MAX(CASE WHEN LOWER(obj_attr.attr_type) IN ('phone', 'telephone', 'tel')
+                                         THEN obj_attr.attr_json->>'value' END), '') AS contact_phone,
+                        COALESCE(MAX(CASE WHEN LOWER(obj_attr.attr_type) IN ('mobile', 'mobile_phone', 'cell', 'handy')
+                                         THEN obj_attr.attr_json->>'value' END), '') AS contact_mobile,
                         COALESCE(MAX(doc.doc_id), 0)  AS doc_id,
                         COALESCE(MAX(doc.doc_key), '') AS doc_key,
                         COALESCE(MAX(doc.doc_path), '') AS doc_path
@@ -8745,6 +10338,11 @@ class QueryEngine:
                          END
                     LEFT JOIN attribute attr
                       ON attr.src_type = 'relationship' AND attr.src_id = rel.relationship_id
+                                        LEFT JOIN attribute obj_attr
+                                            ON obj_attr.src_type = 'object'
+                                         AND obj_attr.src_id = related.object_id
+                                         AND obj_attr.valid_from <= CURRENT_DATE
+                                         AND (obj_attr.valid_until IS NULL OR obj_attr.valid_until > CURRENT_DATE)
                     LEFT JOIN part part_rel ON part_rel.relationship_id = rel.relationship_id
                     LEFT JOIN document doc   ON doc.doc_id = part_rel.doc_id
                     WHERE LOWER(anchor.object_name) = LOWER(%s)
@@ -8757,7 +10355,7 @@ class QueryEngine:
                       AND rel.valid_from <= CURRENT_DATE
                       AND (rel.valid_until IS NULL OR rel.valid_until > CURRENT_DATE)
                       AND LOWER(rel.relationship_name) LIKE %s
-                    GROUP BY anchor.object_name, related.object_name, related.class_name, rel.relationship_name
+                    GROUP BY anchor.object_name, related.object_id, related.object_name, related.class_name, rel.relationship_name
                     ORDER BY related.object_name;
                     """,
                     (entity_name, concept_pattern),
@@ -8770,39 +10368,64 @@ class QueryEngine:
             return None
 
         anchor_name = rows[0][0]
-        doc_id = rows[0][7] or None
-        doc_key = rows[0][8] or None
-        doc_path = rows[0][9] or None
+        doc_id = rows[0][11] or None
+        doc_key = rows[0][12] or None
+        doc_path = rows[0][13] or None
+        related_attr_map: dict[int, dict[str, Any]] = {}
+        if broad_scope:
+            related_ids = [int(row[1]) for row in rows if isinstance(row[1], int)]
+            related_attr_map = self._related_object_attribute_map(conn, related_ids)
 
         # Deduplicate by normalised name tokens; keep max share_count per person.
         seen: dict[str, dict[str, Any]] = {}
         for row in rows:
-            name = str(row[1] or "").strip()
+            name = str(row[2] or "").strip()
             if not name:
                 continue
             norm = " ".join(sorted(re.findall(r"[a-zA-ZäöüÄÖÜß0-9]+", name.lower())))
-            sc_raw = str(row[4] or "").strip()
+            sc_raw = str(row[5] or "").strip()
             try:
                 sc = int(sc_raw) if sc_raw else None
             except Exception:
                 sc = None
-            nominal_raw = str(row[5] or "").strip()
+            nominal_raw = str(row[6] or "").strip()
             try:
                 nominal = float(nominal_raw) if nominal_raw else None
             except Exception:
                 nominal = None
-            role = str(row[6] or "").strip() or None
+            role = str(row[7] or "").strip() or None
+            contact_email = str(row[8] or "").strip() or None
+            contact_phone = str(row[9] or "").strip() or None
+            contact_mobile = str(row[10] or "").strip() or None
 
             entry = seen.get(norm)
             if entry is None:
-                seen[norm] = {
+                candidate_entry: dict[str, Any] = {
                     "name": name,
-                    "relationship_name": row[3],
-                    "class_name": row[2] or None,
+                    "relationship_name": row[4],
+                    "class_name": row[3] or None,
                     "share_count": sc,
                     "share_nominal_chf": nominal,
                     "role": role,
                 }
+                if contact_email:
+                    candidate_entry["email"] = contact_email
+                if contact_phone:
+                    candidate_entry["phone"] = contact_phone
+                if contact_mobile:
+                    candidate_entry["mobile"] = contact_mobile
+                if broad_scope:
+                    extra_attrs = related_attr_map.get(int(row[1])) if isinstance(row[1], int) else None
+                    if isinstance(extra_attrs, dict):
+                        for attr_key, attr_value in extra_attrs.items():
+                            key = str(attr_key or "").strip()
+                            if not key or key in candidate_entry:
+                                continue
+                            value_text = str(attr_value or "").strip()
+                            if not value_text:
+                                continue
+                            candidate_entry[key] = value_text
+                seen[norm] = candidate_entry
             else:
                 if sc is not None and (entry["share_count"] is None or sc > entry["share_count"]):
                     entry["share_count"] = sc
@@ -8810,6 +10433,23 @@ class QueryEngine:
                     entry["share_nominal_chf"] = nominal
                 if role and not entry["role"]:
                     entry["role"] = role
+                if contact_email and not entry.get("email"):
+                    entry["email"] = contact_email
+                if contact_phone and not entry.get("phone"):
+                    entry["phone"] = contact_phone
+                if contact_mobile and not entry.get("mobile"):
+                    entry["mobile"] = contact_mobile
+                if broad_scope:
+                    extra_attrs = related_attr_map.get(int(row[1])) if isinstance(row[1], int) else None
+                    if isinstance(extra_attrs, dict):
+                        for attr_key, attr_value in extra_attrs.items():
+                            key = str(attr_key or "").strip()
+                            if not key or key in entry:
+                                continue
+                            value_text = str(attr_value or "").strip()
+                            if not value_text:
+                                continue
+                            entry[key] = value_text
 
         related_entries = sorted(seen.values(), key=lambda x: str(x.get("name") or "").lower())
 
@@ -8817,7 +10457,7 @@ class QueryEngine:
             e.get("share_count") is not None or e.get("share_nominal_chf") is not None
             for e in related_entries
         )
-        if has_rich:
+        if has_rich or broad_scope:
             attribute_value: Any = related_entries
         else:
             attribute_value = [
@@ -9234,6 +10874,7 @@ class QueryEngine:
         attribute_name: str,
         entity_name: str | None,
         results: list[dict[str, Any]],
+        attribute_filters: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         for item in results:
             struct_data = item.get("struct_data") if isinstance(item.get("struct_data"), dict) else {}
@@ -9243,6 +10884,13 @@ class QueryEngine:
                 haystack = json.dumps(struct_data, ensure_ascii=False).lower() + " " + json.dumps(derived_struct_data, ensure_ascii=False).lower()
                 if entity_name.lower() not in haystack:
                     continue
+
+            if not self._structured_table_record_matches_attribute_filters(
+                struct_data,
+                {"struct_data": struct_data, "derived_struct_data": derived_struct_data},
+                list(attribute_filters or []),
+            ):
+                continue
 
             attr_value = self._extract_attr_value(struct_data, attribute_name)
             if attr_value is None:
@@ -9463,9 +11111,15 @@ class QueryEngine:
                 attribute_candidates = ["registered_address", "address_full", "address"]
             else:
                 attribute_candidates = ["address_full", "address", "registered_address"]
+        elif attribute_name in {"registration_no", "uid_che", "tr_number"}:
+            if attribute_name in {"registration_no", "uid_che"}:
+                attribute_candidates = ["uid_che", "registration_no", "tr_number"]
+            else:
+                attribute_candidates = ["tr_number", "uid_che", "registration_no"]
 
         prefer_identifier_quality = str(attribute_name or "").strip().lower() in {
             "eori_no", "eori_number", "eori", "eori_nr", "eori_nummer",
+            "registration_no", "uid_che", "tr_number",
         }
 
         with conn.cursor() as cur:
@@ -9532,7 +11186,14 @@ class QueryEngine:
                 ),
             )
             targeted = cur.fetchone()
-        if targeted and targeted[4] is not None:
+        if (
+            targeted
+            and targeted[4] is not None
+            and not (
+                prefer_identifier_quality
+                and self._is_placeholder_identifier_value(targeted[4])
+            )
+        ):
             return {
                 "object_id": targeted[0],
                 "entity_name": targeted[1],
@@ -9801,6 +11462,23 @@ class QueryEngine:
         }
         if normalized_term in travel_aliases or any(tok in travel_aliases for tok in pieces):
             variant_set.update(travel_aliases)
+
+        # Domain aliasing for telecom/billing intent so wording variants like
+        # telephone/mobile/telecom and bill/invoice/rechnung converge.
+        telecom_aliases = {
+            "telephone", "phone", "mobile", "telecom", "telecommunications", "cell", "cellular", "gsm",
+            "telefon", "telefonie", "mobil", "mobilfunk", "telekommunikation",
+            "service", "services", "provider", "carrier",
+        }
+        billing_aliases = {
+            "bill", "bills", "invoice", "invoices", "receipt", "receipts", "statement",
+            "rechnung", "rechnungen", "beleg", "belege", "quittung", "zahlungen", "payment", "payments",
+            "amount", "cost", "price", "due", "total", "betrag", "kosten", "preis", "gesamt",
+        }
+        if normalized_term in telecom_aliases or any(tok in telecom_aliases for tok in pieces):
+            variant_set.update(telecom_aliases)
+        if normalized_term in billing_aliases or any(tok in billing_aliases for tok in pieces):
+            variant_set.update(billing_aliases)
 
         if any(v in haystack for v in variant_set if v):
             return True
@@ -10338,6 +12016,360 @@ class QueryEngine:
             for row in rows
         ]
 
+    @staticmethod
+    def _normalize_source_row_key(value: Any) -> str:
+        text = re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower())
+        return re.sub(r"\s+", "_", text).strip("_")
+
+    def _relation_route_candidates(self, relation_name: str | None, attribute_name: str | None) -> list[str]:
+        """Return ordered relation concepts for route exploration and backtracking.
+
+        The engine first tries the explicit relation context, then a small set of
+        semantically related variants (for example contact_person -> contact), and
+        finally the requested attribute name as a last-resort concept. This lets a
+        broad-scope lookup recover from a near-match relation name without falling
+        back to a generic semantic lookup.
+        """
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _add(value: Any) -> None:
+            text = str(value or "").strip()
+            if not text:
+                return
+            normalized = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+            variants = []
+            if text:
+                variants.append(text)
+            if normalized:
+                variants.append(normalized)
+                if "_" not in normalized and "-" not in normalized:
+                    variants.append(normalized.replace("_", " "))
+            if normalized and normalized.endswith("s") and len(normalized) > 3:
+                variants.append(normalized[:-1])
+            for variant in variants:
+                if not variant:
+                    continue
+                key = str(variant).strip().lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(str(variant).strip())
+
+        def _add_route_variants(value: Any) -> None:
+            text = str(value or "").strip()
+            if not text:
+                return
+            _add(text)
+            normalized = self._normalize_source_row_key(text)
+            relation_key = normalized
+            if relation_key in {"contact_person", "contact_person_name", "contact_name", "person_name"}:
+                _add("contact_person")
+                _add("contact")
+            elif relation_key in {"shareholder", "shareholders", "owner", "owners"}:
+                _add("shareholder")
+                _add("owner")
+            elif relation_key in {"director", "directors", "board_member", "board_members"}:
+                _add("director")
+                _add("board_member")
+            elif relation_key in {"employee", "employees", "staff"}:
+                _add("employee")
+                _add("staff")
+
+        relation_hint = str(relation_name or "").strip()
+        attribute_hint = str(attribute_name or "").strip()
+
+        if relation_hint:
+            _add_route_variants(relation_hint)
+
+        if attribute_hint:
+            _add_route_variants(attribute_hint)
+
+        return candidates
+
+    def _score_relation_route_result(
+        self,
+        route_result: dict[str, Any] | None,
+        requested_attribute: str | None,
+        route_concept: str | None,
+        relation_context: str | None,
+    ) -> int:
+        if not isinstance(route_result, dict):
+            return -1000
+
+        score = 0
+        extracted = self._extract_attribute_value_from_related_payload(
+            route_result.get("attribute_value"),
+            requested_attribute,
+            relation_context,
+        )
+        if extracted not in (None, "", [], {}):
+            score += 120
+        elif route_result.get("attribute_value") not in (None, "", [], {}):
+            score += 30
+
+        if str(route_concept or "").strip().lower() == str(relation_context or "").strip().lower():
+            score += 20
+        if str(route_concept or "").strip().lower() == str(requested_attribute or "").strip().lower():
+            score += 10
+        if str(route_result.get("relationship_concept") or "").strip().lower() == str(route_concept or "").strip().lower():
+            score += 5
+        return score
+
+    def _explore_relation_lookup_paths(
+        self,
+        conn,
+        entity_name: str,
+        requested_attribute: str | None,
+        relation_context: str | None,
+        broad_scope: bool = False,
+        max_depth: int = 2,
+    ) -> tuple[dict[str, Any] | None, Any]:
+        """Try a small search tree of relation concepts and keep the highest-scoring branch.
+
+        This is a lightweight planner for chained relation phrasing such as
+        "Z of Y of X": it explores alternate relation concepts, avoids loops via a
+        visited set, and prefers branches that yield a non-empty extracted value.
+        """
+        if not entity_name:
+            return None, None
+
+        requested_attr = str(requested_attribute or "").strip()
+        relation_hint = str(relation_context or "").strip()
+        best_result: dict[str, Any] | None = None
+        best_extracted: Any = None
+        best_score = -10**9
+        visited: set[str] = set()
+
+        def _recurse(current_concept: str | None, depth: int, path: tuple[str, ...]) -> None:
+            nonlocal best_result, best_extracted, best_score
+            if depth > max_depth:
+                return
+            concept_text = str(current_concept or "").strip()
+            if not concept_text:
+                return
+            concept_key = self._normalize_source_row_key(concept_text)
+            if concept_key in visited:
+                return
+            visited.add(concept_key)
+
+            candidate_concepts = self._relation_route_candidates(concept_text, requested_attr)
+            for concept in candidate_concepts:
+                normalized = self._normalize_source_row_key(concept)
+                if normalized in visited and normalized != concept_key:
+                    continue
+                route_result = self._sql_generic_relationship_lookup(
+                    conn,
+                    entity_name,
+                    concept,
+                    broad_scope=broad_scope,
+                )
+                if not isinstance(route_result, dict):
+                    continue
+
+                extracted = self._extract_attribute_value_from_related_payload(
+                    route_result.get("attribute_value"),
+                    requested_attr,
+                    relation_hint or concept_text,
+                )
+                score = self._score_relation_route_result(route_result, requested_attr, concept, relation_hint or concept_text)
+                if score > best_score:
+                    best_score = score
+                    best_result = dict(route_result)
+                    best_extracted = extracted
+
+                if extracted in (None, "", [], {}) and depth < max_depth:
+                    next_path = path + (concept,)
+                    _recurse(concept, depth + 1, next_path)
+
+            if depth == 0:
+                for concept in [requested_attr, relation_hint]:
+                    if not concept:
+                        continue
+                    candidate_key = self._normalize_source_row_key(concept)
+                    if candidate_key in visited:
+                        continue
+                    route_result = self._sql_generic_relationship_lookup(
+                        conn,
+                        entity_name,
+                        concept,
+                        broad_scope=broad_scope,
+                    )
+                    if not isinstance(route_result, dict):
+                        continue
+                    extracted = self._extract_attribute_value_from_related_payload(
+                        route_result.get("attribute_value"),
+                        requested_attr,
+                        relation_hint or concept,
+                    )
+                    score = self._score_relation_route_result(route_result, requested_attr, concept, relation_hint)
+                    if score > best_score:
+                        best_score = score
+                        best_result = dict(route_result)
+                        best_extracted = extracted
+
+        _recurse(relation_hint or requested_attr or None, 0, ())
+        if best_result is None:
+            return None, None
+        return best_result, best_extracted
+
+    def _candidate_source_row_keys(self, attribute_name: str | None, relation_name: str | None = None) -> list[str]:
+        raw_candidates = [str(attribute_name or "").strip(), str(relation_name or "").strip()]
+        names: list[str] = []
+        for item in raw_candidates:
+            if not item:
+                continue
+            lower = item.lower()
+            names.append(lower)
+            names.extend(re.split(r"[^a-z0-9]+", lower))
+
+        alias_map = {
+            "telephone": ["telephone", "telephone_no", "telephone_number", "phone", "phone_number", "tel", "mobile", "mobile_no"],
+            "phone": ["telephone", "telephone_no", "telephone_number", "phone", "phone_number", "tel", "mobile", "mobile_no"],
+            "email": ["email", "email_address", "e_mail", "emailaddress"],
+            "contact_person": ["contact_person", "contact_person_name", "contact_name", "person_name", "name"],
+            "contact_person_name": ["contact_person", "contact_person_name", "contact_name", "person_name", "name"],
+            "name": ["name", "contact_name", "person_name", "contact_person_name"],
+            "company": ["company", "company_name", "organisation", "organization", "customer_name", "name"],
+        }
+        normalized_names = []
+        for item in names:
+            if not item:
+                continue
+            normalized_names.append(self._normalize_source_row_key(item))
+            aliases = alias_map.get(item, [])
+            for alias in aliases:
+                normalized_names.append(self._normalize_source_row_key(alias))
+
+        # Keep a stable, de-duplicated order while preserving likely human-readable aliases.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in normalized_names:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+        return ordered
+
+    def _lookup_attribute_from_synchronized_source(
+        self,
+        conn,
+        entity_name: str | None,
+        attribute_name: str | None,
+        relation_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        entity_hint = str(entity_name or "").strip()
+        attr_hint = str(attribute_name or "").strip()
+        if not entity_hint or not attr_hint:
+            return None
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT object_id
+                FROM object_instance
+                WHERE LOWER(COALESCE(object_name, '')) = LOWER(%s)
+                  AND COALESCE(status, 'active') = 'active'
+                  AND valid_from <= CURRENT_DATE
+                  AND (valid_until IS NULL OR valid_until > CURRENT_DATE)
+                ORDER BY entry_date DESC NULLS LAST, object_id DESC
+                LIMIT 1;
+                """,
+                (entity_hint,),
+            )
+            entity_row = None
+            if hasattr(cur, "fetchone"):
+                entity_row = cur.fetchone()
+            elif hasattr(cur, "fetchall"):
+                rows = cur.fetchall() or []
+                entity_row = rows[0] if rows else None
+
+        if not entity_row or not entity_row[0]:
+            return None
+
+        object_id = int(entity_row[0])
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    sem.source_id,
+                    sem.schema_name,
+                    sem.table_name,
+                    sem.source_pk_value,
+                    sem.target_class_name,
+                    sem.target_metadata,
+                    sdr.source_key,
+                    sdr.source_name
+                FROM source_entity_mapping sem
+                LEFT JOIN source_database_registry sdr
+                  ON sdr.source_id = sem.source_id
+                WHERE sem.target_object_id = %s
+                  AND COALESCE(sem.target_metadata, '{}'::jsonb) IS NOT NULL
+                ORDER BY sem.updated_at DESC NULLS LAST, sem.mapping_id DESC
+                LIMIT 20;
+                """,
+                (object_id,),
+            )
+            mappings = cur.fetchall() or []
+
+        if not mappings:
+            return None
+
+        raw_candidates = self._candidate_source_row_keys(attr_hint, relation_name)
+        if not raw_candidates:
+            return None
+
+        for row in mappings:
+            if not isinstance(row, (tuple, list)) or len(row) <= 5:
+                continue
+            target_metadata = row[5] if isinstance(row[5], dict) else {}
+            source_row = target_metadata.get("source_row") if isinstance(target_metadata.get("source_row"), dict) else {}
+            if not source_row:
+                continue
+
+            best_match = None
+            best_score = -1
+            for source_key, source_value in source_row.items():
+                if source_value in (None, ""):
+                    continue
+                source_norm = self._normalize_source_row_key(source_key)
+                for candidate in raw_candidates:
+                    score = 0
+                    if source_norm == candidate:
+                        score = 100
+                    elif candidate in source_norm or source_norm in candidate:
+                        score = 60
+                    else:
+                        candidate_tokens = set(re.findall(r"[a-z0-9]+", candidate))
+                        source_tokens = set(re.findall(r"[a-z0-9]+", source_norm))
+                        overlap = len(candidate_tokens & source_tokens)
+                        if overlap > 0:
+                            score = overlap * 20
+                    if score > best_score:
+                        best_score = score
+                        best_match = (source_key, source_value)
+
+            if best_match is None:
+                continue
+
+            source_key = str(row[6] or "").strip() or "synchronized_source"
+            source_name = str(row[7] or "").strip() or source_key
+            source_row_key, source_value = best_match
+            return {
+                "entity_name": entity_hint,
+                "attribute_name": attr_hint,
+                "attribute_value": self._repair_mojibake_text(source_value),
+                "source": "synchronized_source",
+                "source_key": source_key,
+                "source_name": source_name,
+                "source_table": str(row[2] or "").strip() or None,
+                "source_schema": str(row[1] or "").strip() or None,
+                "source_pk_value": str(row[3] or "").strip() or None,
+                "source_row_key": source_row_key,
+            }
+
+        return None
+
     def resolve_search_scope(self, question: str, limit: int = 12) -> dict[str, Any]:
         candidates = self.qdrant_candidates(question, limit=limit)
         discovery_results = self.discovery_candidates(question, limit=limit)
@@ -10386,6 +12418,8 @@ class QueryEngine:
                                "responsible_company", "applicant_company", "responsible_firm"}
         if raw_attr_key in process_actor_attrs:
             normalized_attr, schema_kind = raw_attr_key, "attribute"
+        elif raw_attr_key in {"registration_no", "uid", "uid_che", "che", "company_number", "company_registration_number"}:
+            normalized_attr, schema_kind = "uid_che", "attribute"
         elif raw_attr_key == "total_capital":
             normalized_attr, schema_kind = "total_capital", "attribute"
         else:
@@ -10408,6 +12442,7 @@ class QueryEngine:
             isinstance(criteria, dict)
             and criteria.get("strict_relation_lookup")
         )
+        attribute_filters = self._attribute_filters_from_criteria(criteria)
         if strict_relation_lookup and normalized_attr in {"statute_date", "tr_date"}:
             # Statute/trade-register dates are often represented as object attributes
             # even when the planner emits relation filters from textual context.
@@ -10603,9 +12638,10 @@ class QueryEngine:
                     if governance_roles:
                         return self._normalize_temporal_lookup_result(governance_roles, normalized_attr, temporal_scope)
 
-                # For strict relationship-driven queries, do not fall back to direct
-                # entity attribute lookup when relationship resolution produced no hit.
-                if strict_relation_lookup:
+                # For strict relationship-driven queries, keep the lookup relation-aware.
+                # If a relation context is present, allow synchronized-source and
+                # relationship-payload fallback to satisfy the requested attribute.
+                if strict_relation_lookup and not relation_name:
                     return None
 
                 if resolved_entity_name and normalized_attr in {
@@ -10628,25 +12664,96 @@ class QueryEngine:
                     if edu_result:
                         return edu_result
 
+                broad_scope = bool(isinstance(criteria, dict) and criteria.get("broad_scope"))
+                if resolved_entity_name and normalized_attr and normalized_attr not in address_semantic_attrs:
+                    if not attribute_filters:
+                        relation_context = str(relation_name or resolved_relationship or "").strip()
+                        if relation_context and (strict_relation_lookup or broad_scope or normalized_attr in {"email", "telephone", "phone", "mobile", "contact_person", "name"}):
+                            relation_like_attrs = {"contact_person", "contact_person_name", "person_name", "contact_name", "name"}
+
+                            if normalized_attr in relation_like_attrs:
+                                explored_route, extracted = self._explore_relation_lookup_paths(
+                                    conn,
+                                    resolved_entity_name,
+                                    normalized_attr,
+                                    relation_context,
+                                    broad_scope=broad_scope,
+                                )
+                                if explored_route is not None and extracted not in (None, "", [], {}):
+                                    result = dict(explored_route)
+                                    result["attribute_name"] = normalized_attr
+                                    result["attribute_value"] = extracted
+                                    return self._normalize_temporal_lookup_result(result, normalized_attr, temporal_scope)
+
+                            synchronized_result = self._lookup_attribute_from_synchronized_source(
+                                conn,
+                                resolved_entity_name,
+                                normalized_attr,
+                                relation_name=relation_context,
+                            )
+                            if synchronized_result:
+                                return self._normalize_temporal_lookup_result(synchronized_result, normalized_attr, temporal_scope)
+
+                            explored_route, extracted = self._explore_relation_lookup_paths(
+                                conn,
+                                resolved_entity_name,
+                                normalized_attr,
+                                relation_context,
+                                broad_scope=broad_scope,
+                            )
+                            if explored_route is not None and extracted not in (None, "", [], {}):
+                                result = dict(explored_route)
+                                result["attribute_name"] = normalized_attr
+                                result["attribute_value"] = extracted
+                                return self._normalize_temporal_lookup_result(result, normalized_attr, temporal_scope)
+
                 # Generic relationship-concept lookup: works for ANY relationship stored
                 # in object_relationship, not just hard-coded ones like shareholders.
                 if resolved_entity_name and normalized_attr and normalized_attr not in address_semantic_attrs:
-                    generic_rel = self._sql_generic_relationship_lookup(conn, resolved_entity_name, normalized_attr)
-                    if generic_rel:
-                        return self._normalize_temporal_lookup_result(generic_rel, normalized_attr, temporal_scope)
+                    if not attribute_filters:
+                        broad_scope = bool(isinstance(criteria, dict) and criteria.get("broad_scope"))
+                        relation_context = str(relation_name or resolved_relationship or "").strip()
+                        explored_route, extracted = self._explore_relation_lookup_paths(
+                            conn,
+                            resolved_entity_name,
+                            normalized_attr,
+                            relation_context,
+                            broad_scope=broad_scope,
+                        )
+                        if explored_route is not None:
+                            if extracted not in (None, "", [], {}):
+                                result = dict(explored_route)
+                                result["attribute_name"] = normalized_attr
+                                result["attribute_value"] = extracted
+                                return self._normalize_temporal_lookup_result(result, normalized_attr, temporal_scope)
+                            if str(normalized_attr or "").strip().lower() in {
+                                str(explored_route.get("attribute_name") or "").strip().lower(),
+                                str(explored_route.get("relationship_concept") or "").strip().lower(),
+                            }:
+                                return self._normalize_temporal_lookup_result(explored_route, normalized_attr, temporal_scope)
 
                 if resolved_entity_name:
-                    direct = self.sql_exact_attribute_lookup(
+                    synchronized_result = self._lookup_attribute_from_synchronized_source(
                         conn,
                         resolved_entity_name,
                         normalized_attr,
+                        relation_name=resolved_relationship or None,
                     )
-                    if direct:
-                        return self._normalize_temporal_lookup_result(direct, normalized_attr, temporal_scope)
+                    if synchronized_result:
+                        return self._normalize_temporal_lookup_result(synchronized_result, normalized_attr, temporal_scope)
+
+                    if not attribute_filters:
+                        direct = self.sql_exact_attribute_lookup(
+                            conn,
+                            resolved_entity_name,
+                            normalized_attr,
+                        )
+                        if direct:
+                            return self._normalize_temporal_lookup_result(direct, normalized_attr, temporal_scope)
 
                     # Attribute storage compatibility fallback: some datasets store
                     # statute-style dates under trade-register date (`tr_date`).
-                    if normalized_attr == "statute_date":
+                    if normalized_attr == "statute_date" and not attribute_filters:
                         fallback_direct = self.sql_exact_attribute_lookup(
                             conn,
                             resolved_entity_name,
@@ -10670,6 +12777,7 @@ class QueryEngine:
                         normalized_attr,
                         relation_name=resolved_relationship or None,
                         scope_doc_ids=doc_ids,
+                        attribute_filters=attribute_filters,
                     )
                     if structured:
                         return self._normalize_temporal_lookup_result(structured, normalized_attr, temporal_scope)
@@ -10681,6 +12789,7 @@ class QueryEngine:
                             "tr_date",
                             relation_name=resolved_relationship or None,
                             scope_doc_ids=doc_ids,
+                            attribute_filters=attribute_filters,
                         )
                         if structured_fallback:
                             structured_fallback = dict(structured_fallback)
@@ -10693,15 +12802,19 @@ class QueryEngine:
                     attribute_name=normalized_attr,
                     confidence=0.8,
                 )
-                return self.sql_fallback_from_ids(
-                    conn=conn,
-                    parsed=parsed,
-                    node_ids=node_ids,
-                    edge_ids=edge_ids,
-                    doc_ids=doc_ids,
-                )
-        except Exception:
-            pass
+                if not attribute_filters:
+                    return self.sql_fallback_from_ids(
+                        conn=conn,
+                        parsed=parsed,
+                        node_ids=node_ids,
+                        edge_ids=edge_ids,
+                        doc_ids=doc_ids,
+                    )
+        except Exception as exc:
+            import traceback
+            print('LOOKUP_EXCEPTION', repr(exc), flush=True)
+            print(traceback.format_exc(), flush=True)
+            raise
 
         discovery_match = self._lookup_attribute_in_discovery_results(
             attribute_name=normalized_attr,
@@ -10925,7 +13038,9 @@ class QueryEngine:
             " document ", " documents ", " note ", " notes ", " invoice ", " bill ", " receipt ",
             " registration ", " registered ", " contract ", " order ", " payment ", " statement ",
             " related to ", " connected to ", " linked to ", " about ", " regarding ",
+            " service ", " services ", " mobile ", " phone ", " telephone ", " telecom ", " telecommunication ",
             " dokument ", " dokumente ", " notiz ", " notizen ", " rechnung ", " registrierung ",
+            " dienst ", " dienste ", " mobil ", " telefon ", " telekom ",
             " bezogen auf ", " im zusammenhang mit ", " verbunden mit ",
         )
         table_only_markers = (
@@ -10939,11 +13054,121 @@ class QueryEngine:
         table_only = any(marker in wrapped for marker in table_only_markers)
         return bool(has_value and has_context and not table_only)
 
-    def _collect_criteria_doc_evidence(self, criteria_result: dict[str, Any], limit_docs: int = 8) -> list[dict[str, Any]]:
+    @staticmethod
+    def _has_multi_context_preposition_chain(question: str) -> bool:
+        """Detect chained contextual phrases like '<value> for <topic> for <entity>'."""
+        text = str(question or "").strip().lower()
+        if not text:
+            return False
+
+        parts = re.split(r"\b(?:for|of|in|von|fuer|für|about|regarding|concerning)\b", text, flags=re.IGNORECASE)
+        meaningful = [
+            re.sub(r"\s+", " ", str(part or "").strip())
+            for part in parts
+            if re.sub(r"\s+", " ", str(part or "").strip())
+        ]
+        if len(meaningful) < 3:
+            return False
+
+        # Require that at least two trailing contextual chunks contain noun-like content.
+        trailing = meaningful[1:]
+        content_chunks = 0
+        for chunk in trailing:
+            tokens = re.findall(r"[a-zA-ZäöüÄÖÜß0-9]{3,}", chunk)
+            if len(tokens) >= 1:
+                content_chunks += 1
+        return content_chunks >= 2
+
+    def _requires_contextual_value_resolution(
+        self,
+        question: str,
+        parsed: ParsedQuery,
+        criteria: dict[str, Any] | None,
+        direct_result: dict[str, Any] | None,
+    ) -> bool:
+        """Generic guard to avoid premature scalar answers for contextual value queries."""
+        if parsed.intent not in {"attribute_lookup", "criteria_lookup"}:
+            return False
+        if not isinstance(direct_result, dict):
+            return False
+
+        text = str(question or "").strip().lower()
+        if not text:
+            return False
+
+        # Keep explicit table/cell requests deterministic.
+        if re.search(r"\b(?:row|column|cell|table|line\s*item|zeile|spalte|tabelle)\b", text):
+            return False
+
+        value_markers = {
+            "amount", "total", "cost", "price", "value", "due", "sum", "charge", "fee",
+            "betrag", "gesamt", "kosten", "preis", "wert", "summe",
+        }
+        telecom_markers = {
+            "phone", "telephone", "mobile", "telecom", "telecommunication",
+            "telefon", "mobil", "telekommunikation",
+        }
+        billing_markers = {
+            "bill", "invoice", "receipt", "statement", "payment", "charge", "fee",
+            "rechnung", "beleg", "zahlung", "quittung",
+        }
+        attr_name = str(parsed.attribute_name or direct_result.get("attribute_name") or "").strip().lower()
+        asks_value = bool(any(marker in text for marker in value_markers))
+        attr_is_value = bool(
+            attr_name in {
+                "amount", "net_amount", "gross_amount", "tax_amount", "total_amount",
+                "amount_chf", "amount_total_due", "unit_price", "unit_price_cny", "unit_price_chf",
+                "cost", "price", "value",
+            }
+        )
+
+        asks_how_much = " how much " in f" {text} "
+        has_telecom_context = any(marker in text for marker in telecom_markers)
+        has_billing_context = any(marker in text for marker in billing_markers)
+        if asks_how_much and has_telecom_context and has_billing_context:
+            asks_value = True
+
+        if not asks_value and not attr_is_value:
+            return False
+
+        # If explicit filters exist, allow direct answers only when evidence satisfies them.
+        # Otherwise keep routing on contextual resolution to avoid premature scalar matches.
+        if self._attribute_filters_from_criteria(criteria):
+            try:
+                if self._result_satisfies_attribute_filters(direct_result, criteria):
+                    return False
+            except Exception:
+                pass
+
+        entity_hint = parsed.entity_name or self._best_entity_hint(question)
+        if not str(entity_hint or "").strip():
+            return False
+
+        # Strong signal: value question with explicit document/service context
+        # should avoid early scalar shortcuts and use contextual grounding.
+        if self._is_value_document_context_question(question):
+            return True
+
+        # Generic contextual chain signal: multiple context-bearing preposition phrases.
+        if not self._has_multi_context_preposition_chain(question):
+            return False
+
+        return True
+
+    def _collect_criteria_doc_evidence(
+        self,
+        criteria_result: dict[str, Any],
+        limit_docs: int = 8,
+        question: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Collect compact document evidence snippets from criteria matches."""
         matches = list(criteria_result.get("matches") or []) if isinstance(criteria_result, dict) else []
         if not matches:
             return []
+
+        q_norm = str(question or "").strip().lower()
+        wants_telecom = bool(re.search(r"\b(?:telephone|phone|mobile|telecom|telefon|mobil|telekommunikation)\b", q_norm, flags=re.IGNORECASE))
+        wants_billing = bool(re.search(r"\b(?:bill|invoice|receipt|payment|charge|fee|rechnung|beleg|zahlung|quittung)\b", q_norm, flags=re.IGNORECASE))
 
         finance_tokens = {
             "invoice", "bill", "receipt", "payment", "quotation", "quote", "offer",
@@ -10959,6 +13184,10 @@ class QueryEngine:
                     str(item.get("title") or ""),
                     str(item.get("doc_name") or ""),
                     str(item.get("doc_path") or ""),
+                    str(item.get("doc_theme") or ""),
+                    str(item.get("doc_cat") or ""),
+                    str(item.get("doc_type") or ""),
+                    str(item.get("keyword_text") or ""),
                     " ".join(str(t) for t in (item.get("matched_terms") or [])),
                 ]
             ).lower()
@@ -10966,7 +13195,23 @@ class QueryEngine:
             for tok in finance_tokens:
                 if tok in text_blob:
                     bonus += 0.75
-            return base + bonus
+
+            has_telecom = bool(re.search(r"\b(?:telephone|phone|mobile|telecom|telefon|mobil|yallo|sunrise)\b", text_blob, flags=re.IGNORECASE))
+            has_billing = bool(re.search(r"\b(?:bill|invoice|receipt|payment|charge|fee|rechnung|beleg|zahlung|quittung)\b", text_blob, flags=re.IGNORECASE))
+            has_transport = bool(re.search(r"\b(?:ticket|train|rail|sbb|booking|fahrt|journey)\b", text_blob, flags=re.IGNORECASE))
+            has_purchase_order = bool(re.search(r"\b(?:purchase\s*order|order\s*no\.|teyu|chiller)\b", text_blob, flags=re.IGNORECASE))
+
+            topical = 0.0
+            if wants_telecom:
+                topical += 2.0 if has_telecom else -1.4
+            if wants_billing:
+                topical += 2.0 if has_billing else -1.4
+            if wants_billing and has_transport:
+                topical -= 2.5
+            if wants_billing and has_purchase_order:
+                topical -= 2.0
+
+            return base + bonus + topical
 
         ranked_matches = sorted(
             [item for item in matches if isinstance(item, dict)],
@@ -11102,6 +13347,10 @@ class QueryEngine:
                     "doc_name": item.get("doc_name") or meta_info.get("doc_key"),
                     "doc_path": item.get("doc_path") or meta_info.get("doc_path"),
                     "title": item.get("title"),
+                    "doc_theme": item.get("doc_theme"),
+                    "doc_cat": item.get("doc_cat"),
+                    "doc_type": item.get("doc_type"),
+                    "keyword_text": item.get("keyword_text"),
                     "matched_terms": list(item.get("matched_terms") or []),
                     "evidence_snippet": snippet,
                     "financial_focus": financial_focus,
@@ -11122,12 +13371,11 @@ class QueryEngine:
         if not self.genai_client:
             return None
 
-        evidence_docs = self._collect_criteria_doc_evidence(criteria_result, limit_docs=5)
-        if not evidence_docs:
-            return None
+        evidence_docs = self._collect_criteria_doc_evidence(criteria_result, limit_docs=5, question=question)
 
-        def _extract_money_candidates(text: str) -> list[tuple[float, str, int, bool, bool, bool]]:
-            # Returns tuples: (amount, currency, index, is_total_like, is_fee_like, is_capital_like)
+        def _extract_money_candidates(text: str) -> list[tuple[float, str, int, bool, bool, bool, bool, bool, bool]]:
+            # Returns tuples:
+            # (amount, currency, index, is_total_like, is_fee_like, is_capital_like, is_strict_total_like, is_subtotal_like, is_tax_like)
             raw = str(text or "")
             if not raw:
                 return []
@@ -11138,18 +13386,30 @@ class QueryEngine:
             ]
             total_markers = (
                 "total amount due", "amount due", "payable", "total due", "grand total", "invoice total",
-                "zu bezahlen", "zahlbar", "gesamtbetrag", "gesamt", "summe",
+                "zu bezahlen", "zahlbar", "gesamtbetrag", "gesamt", "summe", "rechnungstotal",
+            )
+            strict_total_markers = (
+                "total amount due", "amount due", "payable", "total due", "grand total",
+                "zu bezahlen", "zahlbar", "gesamtbetrag", "rechnungstotal", "rechnung total",
+            )
+            subtotal_markers = (
+                "subtotal", "without vat", "ohne mwst", "mwst", "vat", "tax", "line item", "mobile services",
+                "rundungsdifferenz", "rounding", "anruf", "per call", "pro anruf", "call rate",
             )
             fee_markers = (
                 "basic fee", "fee", "grundgeb", "grundgebuhr", "grundgebühr", "eintrag", "entry",
-                "postage", "small letter", "e-mail fee", "line item", "funktion", "zeichnungsberechtigung",
+                "postage", "small letter", "e-mail fee", "line item", "funktion", "zeichnungsberechtigung", "mobile services",
+                "anruf", "per call", "pro anruf", "call rate", "chf 1.50 / anruf",
             )
             capital_markers = (
                 "stammkapital", "share capital", "capital", "stammanteile", "nominal capital", "kapital",
                 "gesellschafter", "shares", "shareholders",
             )
+            tax_markers = (
+                "mwst", "vat", "tax", "ust", "tva", "iva", "vat amount", "mwst.-betrag", "steuer",
+            )
 
-            out: list[tuple[float, str, int, bool, bool, bool]] = []
+            out: list[tuple[float, str, int, bool, bool, bool, bool, bool, bool]] = []
             for pattern in patterns:
                 for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
                     groups = match.groups()
@@ -11185,26 +13445,269 @@ class QueryEngine:
                     ctx_end = min(len(raw), match.end() + 90)
                     context = raw[ctx_start:ctx_end].lower()
                     is_total_like = any(marker in context for marker in total_markers)
+                    is_strict_total_like = any(marker in context for marker in strict_total_markers)
                     is_fee_like = any(marker in context for marker in fee_markers)
                     is_capital_like = any(marker in context for marker in capital_markers)
-                    out.append((amount, currency, match.start(), is_total_like, is_fee_like, is_capital_like))
+                    is_subtotal_like = any(marker in context for marker in subtotal_markers)
+                    is_tax_like = any(marker in context for marker in tax_markers)
+                    out.append((amount, currency, match.start(), is_total_like, is_fee_like, is_capital_like, is_strict_total_like, is_subtotal_like, is_tax_like))
             return out
 
         def _best_total_from_evidence(docs: list[dict[str, Any]]) -> tuple[float, str] | None:
-            totals: list[tuple[float, str]] = []
+            question_tokens = [
+                tok
+                for tok in re.findall(r"[a-zA-Z0-9äöüÄÖÜß]{4,}", str(question or "").lower())
+                if tok
+                not in {
+                    "what", "which", "where", "when", "with", "from", "into", "about", "much",
+                    "cost", "price", "value", "amount", "total", "tell", "find", "related", "documents",
+                    "show", "give", "query", "that", "this", "have", "does", "did", "were", "been",
+                    "was", "sind", "ist", "eine", "einer", "eines", "dieser", "mobile", "services",
+                }
+            ]
+            if not question_tokens:
+                question_tokens = [
+                    tok
+                    for tok in re.findall(r"[a-zA-Z0-9äöüÄÖÜß]{4,}", str(question or "").lower())
+                    if tok
+                    not in {
+                        "what", "which", "where", "when", "with", "from", "into", "about", "much",
+                        "cost", "price", "value", "amount", "total", "tell", "find", "related", "documents",
+                        "show", "give", "query", "that", "this", "have", "does", "did", "were", "been",
+                        "was", "sind", "ist", "eine", "einer", "eines", "dieser",
+                    }
+                ]
+
+            q_norm = self._normalize_semantic_text(question)
+            telecom_terms = {
+                "telecom", "telecommunication", "telecommunications", "telephone", "phone", "mobile", "cell", "cellular", "gsm",
+                "telefon", "telefonie", "mobil", "mobilfunk", "telekommunikation",
+            }
+            billing_terms = {
+                "bill", "bills", "invoice", "invoices", "receipt", "receipts", "statement",
+                "rechnung", "rechnungen", "beleg", "belege", "quittung", "payment", "payments", "charge", "charges",
+                "amount", "cost", "price", "due", "total", "betrag", "kosten", "preis", "gesamt", "sum",
+            }
+            q_wants_telecom = any(tok in q_norm for tok in telecom_terms)
+            q_wants_billing = any(tok in q_norm for tok in billing_terms)
+
+            def _extract_labeled_total(text: str) -> tuple[float, str] | None:
+                raw = str(text or "")
+                if not raw:
+                    return None
+
+                label_patterns = [
+                    r"rechnungstotal",
+                    r"total\s+amount\s+due",
+                    r"amount\s+due",
+                    r"total\s+due",
+                    r"grand\s+total",
+                    r"invoice\s+total",
+                    r"zu\s+bezahlen",
+                    r"zahlbar",
+                    r"gesamtbetrag",
+                ]
+                money_patterns = [
+                    r"\b(CHF|EUR|USD)\s*([0-9]{1,3}(?:[\'\s,.][0-9]{3})*(?:[.,][0-9]{1,2})?)",
+                    r"\b([0-9]{1,3}(?:[\'\s,.][0-9]{3})*(?:[.,][0-9]{1,2})?)\s*(CHF|EUR|USD)\b",
+                ]
+
+                def _parse_money(candidate: str) -> tuple[float, str] | None:
+                    for money_pattern in money_patterns:
+                        match = re.search(money_pattern, candidate, flags=re.IGNORECASE)
+                        if not match:
+                            continue
+                        left, right = match.groups()
+                        if re.fullmatch(r"[A-Za-z]{3}", str(left or ""), flags=re.IGNORECASE):
+                            currency = str(left).upper()
+                            amount_raw = str(right or "")
+                        else:
+                            amount_raw = str(left or "")
+                            currency = str(right).upper()
+
+                        normalized = amount_raw.replace("'", "").replace(" ", "")
+                        if "," in normalized and "." in normalized:
+                            if normalized.rfind(",") > normalized.rfind("."):
+                                normalized = normalized.replace(".", "").replace(",", ".")
+                            else:
+                                normalized = normalized.replace(",", "")
+                        else:
+                            if normalized.count(",") == 1 and normalized.count(".") == 0:
+                                normalized = normalized.replace(",", ".")
+                            elif normalized.count(",") > 1 and normalized.count(".") == 0:
+                                normalized = normalized.replace(",", "")
+                        try:
+                            value = float(normalized)
+                        except Exception:
+                            continue
+                        if value > 0:
+                            return (value, currency)
+                    return None
+
+                lowered = raw.lower()
+                for label_pattern in label_patterns:
+                    for marker in re.finditer(label_pattern, lowered, flags=re.IGNORECASE):
+                        window = raw[marker.start() : min(len(raw), marker.end() + 160)]
+                        parsed_money = _parse_money(window)
+                        if parsed_money is not None:
+                            return parsed_money
+                return None
+
+            # Prefer labeled totals from the most relevant semantically ranked docs.
+            for doc in docs[:5]:
+                if not isinstance(doc, dict):
+                    continue
+                doc_blob = " ".join(
+                    [
+                        str(doc.get("doc_name") or ""),
+                        str(doc.get("doc_path") or ""),
+                        str(doc.get("title") or ""),
+                        str(doc.get("doc_theme") or ""),
+                        str(doc.get("doc_cat") or ""),
+                        str(doc.get("doc_type") or ""),
+                        str(doc.get("keyword_text") or ""),
+                        " ".join(str(t) for t in (doc.get("matched_terms") or [])),
+                    ]
+                ).lower()
+                has_telecom = any(tok in doc_blob for tok in telecom_terms)
+                has_billing = any(tok in doc_blob for tok in billing_terms)
+                if q_wants_telecom and not has_telecom:
+                    continue
+                if q_wants_billing and not has_billing:
+                    continue
+
+                prioritized_text = "\n".join(
+                    [
+                        str(doc.get("financial_focus") or ""),
+                        str(doc.get("evidence_snippet") or ""),
+                    ]
+                )
+                labeled_total = _extract_labeled_total(prioritized_text)
+                if labeled_total is not None:
+                    return labeled_total
+
+            scored_totals: list[tuple[float, float, str, bool, bool, bool, bool]] = []
             for doc in docs:
                 if not isinstance(doc, dict):
                     continue
                 snippet = str(doc.get("evidence_snippet") or "")
                 focus = str(doc.get("financial_focus") or "")
                 joined = "\n".join(part for part in (focus, snippet) if part)
-                for amount, currency, _idx, is_total_like, _is_fee_like, is_capital_like in _extract_money_candidates(joined):
+                if not joined:
+                    continue
+
+                haystack = " ".join(
+                    [
+                        str(doc.get("doc_name") or ""),
+                        str(doc.get("doc_path") or ""),
+                        str(doc.get("title") or ""),
+                        str(doc.get("doc_theme") or ""),
+                        str(doc.get("doc_cat") or ""),
+                        str(doc.get("doc_type") or ""),
+                        str(doc.get("keyword_text") or ""),
+                        " ".join(str(t) for t in (doc.get("matched_terms") or [])),
+                        joined,
+                    ]
+                ).lower()
+                relevance = sum(1 for tok in question_tokens if tok and tok in haystack)
+
+                has_telecom = any(tok in haystack for tok in telecom_terms)
+                has_billing = any(tok in haystack for tok in billing_terms)
+                doc_affinity = 0.0
+                if q_wants_telecom and has_telecom:
+                    doc_affinity += 1.8
+                if q_wants_billing and has_billing:
+                    doc_affinity += 1.8
+                if q_wants_telecom and q_wants_billing and has_telecom and has_billing:
+                    doc_affinity += 1.2
+
+                money_candidates = _extract_money_candidates(joined)
+                amount_frequency: dict[tuple[str, float], int] = {}
+                for amount, currency, _idx, *_rest in money_candidates:
+                    key = (str(currency), round(float(amount), 2))
+                    amount_frequency[key] = int(amount_frequency.get(key, 0)) + 1
+
+                for amount, currency, _idx, is_total_like, is_fee_like, is_capital_like, is_strict_total_like, is_subtotal_like, is_tax_like in money_candidates:
                     if is_capital_like:
                         continue
+                    candidate_score = float(relevance) + doc_affinity
+                    if is_strict_total_like:
+                        candidate_score += 3.4
                     if is_total_like:
-                        totals.append((amount, currency))
-            if totals:
-                return max(totals, key=lambda x: x[0])
+                        candidate_score += 2.8
+                    if is_fee_like:
+                        candidate_score -= 1.9
+                    if is_subtotal_like:
+                        candidate_score -= 2.1
+                    if is_tax_like:
+                        candidate_score -= 3.2
+                    repeats = int(amount_frequency.get((str(currency), round(float(amount), 2)), 0))
+                    if repeats > 1:
+                        candidate_score += min(1.2, 0.5 * float(repeats - 1))
+                    if amount <= 0:
+                        continue
+                    scored_totals.append((candidate_score, amount, currency, is_fee_like, is_strict_total_like, is_subtotal_like, is_tax_like))
+
+            if not scored_totals:
+                return None
+
+            non_fee_non_tax = [item for item in scored_totals if (not item[3]) and (not item[6])]
+            non_fee = [item for item in scored_totals if not item[3]]
+            pool = non_fee_non_tax if non_fee_non_tax else (non_fee if non_fee else scored_totals)
+
+            best_score = max(item[0] for item in pool)
+            if best_score < 1.0:
+                return None
+
+            best_candidates = [item for item in pool if item[0] >= (best_score - 0.20)]
+            # Prefer strongest total cues first, then the highest score. As a final tie-break,
+            # avoid drifting to larger unrelated amounts from lower-affinity invoices.
+            chosen = max(
+                best_candidates,
+                key=lambda item: (
+                    1 if item[4] else 0,
+                    0 if item[5] else 1,
+                    0 if item[6] else 1,
+                    item[0],
+                    -abs(item[1]),
+                ),
+            )
+            return (chosen[1], chosen[2])
+
+        def _extract_first_money_from_text(text: str) -> tuple[float, str] | None:
+            raw = str(text or "")
+            if not raw:
+                return None
+            patterns = [
+                r"\b(CHF|EUR|USD)\s*([0-9]{1,3}(?:[\'\s,.][0-9]{3})*(?:[.,][0-9]{1,2})?)",
+                r"\b([0-9]{1,3}(?:[\'\s,.][0-9]{3})*(?:[.,][0-9]{1,2})?)\s*(CHF|EUR|USD)\b",
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, raw, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                left, right = match.groups()
+                if re.fullmatch(r"[A-Za-z]{3}", str(left or ""), flags=re.IGNORECASE):
+                    currency = str(left).upper()
+                    amount_raw = str(right or "")
+                else:
+                    amount_raw = str(left or "")
+                    currency = str(right).upper()
+                normalized = amount_raw.replace("'", "").replace(" ", "")
+                if "," in normalized and "." in normalized:
+                    if normalized.rfind(",") > normalized.rfind("."):
+                        normalized = normalized.replace(".", "").replace(",", ".")
+                    else:
+                        normalized = normalized.replace(",", "")
+                else:
+                    if normalized.count(",") == 1 and normalized.count(".") == 0:
+                        normalized = normalized.replace(",", ".")
+                    elif normalized.count(",") > 1 and normalized.count(".") == 0:
+                        normalized = normalized.replace(",", "")
+                try:
+                    return (float(normalized), currency)
+                except Exception:
+                    continue
             return None
 
         qdrant_context: list[dict[str, Any]] = []
@@ -11232,6 +13735,9 @@ class QueryEngine:
                 }
             )
 
+        if not evidence_docs and not qdrant_context and not discovery_context:
+            return None
+
         prompt = (
             "You are resolving a user question using grounded document evidence only. "
             "Use only the provided evidence snippets and contexts. "
@@ -11246,6 +13752,36 @@ class QueryEngine:
             f"Qdrant context: {json.dumps(qdrant_context, ensure_ascii=False)}\n"
             f"Discovery context: {json.dumps(discovery_context, ensure_ascii=False)}"
         )
+
+        asks_money = bool(
+            re.search(
+                r"\b(total|amount|cost|price|due|sum|wert|betrag|gesamt|kosten|preis|zahlbar)\b",
+                str(question or "").lower(),
+                flags=re.IGNORECASE,
+            )
+        )
+        deterministic_total = _best_total_from_evidence(evidence_docs)
+
+        def _deterministic_total_result(min_confidence: float = 0.82) -> dict[str, Any] | None:
+            if not asks_money or deterministic_total is None:
+                return None
+            total_amount, total_currency = deterministic_total
+            primary_doc_id = None
+            primary_evidence = None
+            if evidence_docs and isinstance(evidence_docs[0], dict):
+                raw_doc_id = evidence_docs[0].get("doc_id")
+                primary_doc_id = int(raw_doc_id) if isinstance(raw_doc_id, int) else None
+                primary_evidence = evidence_docs[0].get("financial_focus") or evidence_docs[0].get("evidence_snippet")
+
+            return {
+                "answer": f"The total amount due is {total_amount:,.2f} {total_currency}.".replace(",", ""),
+                "confidence": float(min_confidence),
+                "evidence": str(primary_evidence or "")[:280] if primary_evidence else None,
+                "doc_id": primary_doc_id,
+                "resolved_attribute": "amount_total_due",
+                "criteria_documents": evidence_docs,
+                "source": "criteria_contextual_llm",
+            }
 
         try:
             response = generate_content_with_openrouter_fallback(
@@ -11266,14 +13802,15 @@ class QueryEngine:
 
             answer = str(data.get("answer") or "").strip()
             if not answer:
-                return None
+                return _deterministic_total_result()
 
             try:
                 confidence = float(data.get("confidence", 0.0))
             except Exception:
                 confidence = 0.0
             if confidence < 0.70:
-                return None
+                deterministic = _deterministic_total_result(min_confidence=0.80)
+                return deterministic
 
             raw_doc_id = data.get("doc_id")
             resolved_doc_id = int(raw_doc_id) if isinstance(raw_doc_id, int) else None
@@ -11298,7 +13835,23 @@ class QueryEngine:
                         flags=re.IGNORECASE,
                     )
                 )
-                if asks_money and not mentions_total:
+                fee_like_answer = bool(
+                    re.search(
+                        r"\b(fee|basic fee|anruf|line item|rounding|rundungsdifferenz|mwst|vat|tax)\b",
+                        answer_blob,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                extracted_answer_money = _extract_first_money_from_text(answer)
+                mismatch_with_deterministic = False
+                if extracted_answer_money is not None:
+                    answer_amount, answer_currency = extracted_answer_money
+                    if answer_currency == total_currency:
+                        mismatch_with_deterministic = abs(answer_amount - total_amount) > max(0.05, 0.25 * max(total_amount, 1.0))
+                    elif answer_amount > 0:
+                        mismatch_with_deterministic = True
+
+                if asks_money and (not mentions_total or fee_like_answer or mismatch_with_deterministic):
                     answer = f"The total amount due is {total_amount:,.2f} {total_currency}.".replace(",", "")
                     resolved_attr = "amount_total_due"
                     return {
@@ -11321,7 +13874,7 @@ class QueryEngine:
                 "source": "criteria_contextual_llm",
             }
         except Exception:
-            return None
+            return _deterministic_total_result(min_confidence=0.80)
 
     @staticmethod
     def _is_naturally_multi_value_attribute(attribute_name: str | None) -> bool:
@@ -11531,6 +14084,7 @@ class QueryEngine:
         parsed: ParsedQuery,
         candidates: list[dict[str, Any]],
         discovery_results: list[dict[str, Any]],
+        attribute_filters: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """Use semantic context + structured DB entity facts as evidence when SQL tiers fail."""
         if not self.genai_client:
@@ -11539,6 +14093,17 @@ class QueryEngine:
             return None
 
         evidence_chunks: list[dict[str, Any]] = []
+        active_attribute_filters = list(attribute_filters or [])
+
+        def _text_matches_filters(text: str) -> bool:
+            if not active_attribute_filters:
+                return True
+            haystack = self._normalize_semantic_text(text)
+            for item in active_attribute_filters:
+                expected_forms = self._structured_table_term_forms(item.get("value"))
+                if not any(form and form in haystack for form in expected_forms):
+                    return False
+            return True
 
         # Gather structured entity context from DB (attributes, relationships, linked documents)
         entity_context: dict[str, Any] | None = None
@@ -11555,6 +14120,8 @@ class QueryEngine:
             chunk_text = str(item.get("text") or item.get("chunk_text") or "").strip()
             if not chunk_text:
                 continue
+            if not _text_matches_filters(chunk_text):
+                continue
             evidence_chunks.append(
                 {
                     "source": "qdrant",
@@ -11570,6 +14137,12 @@ class QueryEngine:
                 continue
             struct_data = item.get("struct_data") if isinstance(item.get("struct_data"), dict) else {}
             derived_struct_data = item.get("derived_struct_data") if isinstance(item.get("derived_struct_data"), dict) else {}
+            if not self._structured_table_record_matches_attribute_filters(
+                struct_data,
+                {"struct_data": struct_data, "derived_struct_data": derived_struct_data},
+                active_attribute_filters,
+            ):
+                continue
             packed = json.dumps(
                 {
                     "struct_data": struct_data,
@@ -11609,6 +14182,11 @@ class QueryEngine:
             f"Entity: {json.dumps(parsed.entity_name, ensure_ascii=False)}\n",
             f"Requested attribute: {json.dumps(parsed.attribute_name, ensure_ascii=False)}\n",
         ]
+        if active_attribute_filters:
+            prompt_parts.append(
+                "Required filters that MUST be satisfied by the evidence for any answer:\n"
+                f"{json.dumps(active_attribute_filters, ensure_ascii=False)}\n"
+            )
         if entity_context:
             # Summarise attributes and relationships concisely to keep token count reasonable
             ec_summary: dict[str, Any] = {
@@ -12275,6 +14853,13 @@ class QueryEngine:
                     "source": "not_found",
                 }
 
+        federated_result = self._try_federated_sql_read(question)
+        if isinstance(federated_result, dict) and str(federated_result.get("source") or "").strip().lower() in {
+            "federated_sql",
+            "federated_sql_error",
+        }:
+            return federated_result
+
         fuel_station_answer = self._try_fuel_station_invoice_answer(question)
         if fuel_station_answer:
             return fuel_station_answer
@@ -12351,11 +14936,23 @@ class QueryEngine:
             if isinstance(flows, list) and name not in flows:
                 flows.append(name)
 
-        candidates = self.qdrant_candidates(question)
-        discovery_results = self.discovery_candidates(question)
-        node_ids = self._unique_ints([c.get("node_id") for c in candidates])
-        edge_ids = self._unique_ints([c.get("edge_id") for c in candidates])
-        doc_ids = self._unique_ints([c.get("doc_id") for c in candidates])
+        candidates: list[dict[str, Any]] = []
+        discovery_results: list[dict[str, Any]] = []
+        node_ids: list[int] = []
+        edge_ids: list[int] = []
+        doc_ids: list[int] = []
+        semantic_context_loaded = False
+
+        def _ensure_semantic_context() -> None:
+            nonlocal semantic_context_loaded, candidates, discovery_results, node_ids, edge_ids, doc_ids
+            if semantic_context_loaded:
+                return
+            candidates = self.qdrant_candidates(question)
+            discovery_results = self.discovery_candidates(question)
+            node_ids = self._unique_ints([c.get("node_id") for c in candidates])
+            edge_ids = self._unique_ints([c.get("edge_id") for c in candidates])
+            doc_ids = self._unique_ints([c.get("doc_id") for c in candidates])
+            semantic_context_loaded = True
 
         if parsed.intent == "criteria_lookup":
             criteria_result = self.search_by_criteria(
@@ -12372,6 +14969,7 @@ class QueryEngine:
                 # Generic bridge: for value-style questions, use top criteria documents
                 # as grounded evidence for contextual LLM extraction.
                 if not self._criteria_question_prefers_listing(question, response_format):
+                    _ensure_semantic_context()
                     _diag_flow("criteria_contextual_llm_resolution")
                     criteria_contextual = self._criteria_contextual_llm_resolution_fallback(
                         question=question,
@@ -12520,6 +15118,7 @@ class QueryEngine:
             _diag_flow("sql_exact_lookup")
             with self._get_connection() as conn:
                 if strict_table_request:
+                    _ensure_semantic_context()
                     _diag_flow("table_cell_grounding")
                     grounded_cell = self._lookup_grounded_table_cell(
                         conn,
@@ -12626,6 +15225,7 @@ class QueryEngine:
                 criteria_for_lookup: dict[str, Any] = (
                     dict(parsed.criteria) if isinstance(parsed.criteria, dict) else {}
                 )
+                answer_attribute_filters = self._attribute_filters_from_criteria(criteria_for_lookup)
                 criteria_for_lookup["temporal_scope"] = self._infer_temporal_scope_from_question(question)
                 if strict_relation_lookup:
                     criteria_for_lookup["strict_relation_lookup"] = True
@@ -12690,13 +15290,17 @@ class QueryEngine:
                     requested_attrs: list[str] = []
                     broad_scope = self._has_broad_attribute_scope_cue(question)
                     file_scope = self._has_file_info_cue(question)
+                    if broad_scope:
+                        criteria_for_lookup["broad_scope"] = True
                     file_info_attrs = {"document_file_info", "document_filename", "document_full_path"}
                     criteria_dict = parsed.criteria if isinstance(parsed.criteria, dict) else {}
                     parse_method = str(criteria_dict.get("parse_method") or "").strip().lower()
+                    explicit_multi_attribute_request = bool(parsed.attribute_names and len(parsed.attribute_names) > 1)
                     is_process_contact_email_focus = (
                         parse_method == "process_contact_gate"
                         and str(parsed.attribute_name or "").strip().lower() == "process_contact_email"
                         and self._has_email_intent(question)
+                        and not explicit_multi_attribute_request
                     )
                     if parsed.attribute_names:
                         for item in parsed.attribute_names:
@@ -12725,6 +15329,12 @@ class QueryEngine:
                             if hint == "email" and has_email_seed:
                                 continue
                             if hint not in requested_attrs:
+                                requested_attrs.append(hint)
+
+                    if explicit_multi_attribute_request and parsed.relation_name and parsed.attribute_name == "contact_person":
+                        for item in parsed.attribute_names:
+                            hint = str(item or "").strip()
+                            if hint and hint not in requested_attrs:
                                 requested_attrs.append(hint)
 
                     has_multi_attr_cue = bool(
@@ -12802,6 +15412,8 @@ class QueryEngine:
                     if len(requested_attrs) > 1:
                         if strict_table_request:
                             requested_attrs = requested_attrs[:1]
+                        if explicit_multi_attribute_request and parsed.relation_name and parsed.attribute_name in parsed.attribute_names:
+                            requested_attrs = [str(item).strip() for item in parsed.attribute_names if str(item).strip()]
                         multi_matches: list[dict[str, Any]] = []
                         for attr in requested_attrs[:12]:
                             match = self.lookup_attribute(
@@ -12818,6 +15430,17 @@ class QueryEngine:
                                     ambiguity_data=match,
                                 )
                             if match:
+                                if answer_attribute_filters and not self._result_satisfies_attribute_filters(conn, match, answer_attribute_filters):
+                                    fallback_diagnostics.setdefault("filtered_out_matches", [])
+                                    if isinstance(fallback_diagnostics.get("filtered_out_matches"), list):
+                                        fallback_diagnostics["filtered_out_matches"].append(
+                                            {
+                                                "attribute_name": str(match.get("attribute_name") or attr),
+                                                "entity_name": str(match.get("entity_name") or lookup_entity_name or ""),
+                                                "reason": "attribute_filters_not_satisfied",
+                                            }
+                                        )
+                                    continue
                                 multi_matches.append(match)
 
                         if multi_matches:
@@ -12943,12 +15566,9 @@ class QueryEngine:
                             for match in multi_matches:
                                 attr_name = str(match.get("attribute_name") or "attribute").strip() or "attribute"
                                 display_attr = self._get_attribute_display_name(attr_name, parsed.language)
-                                value = match.get("attribute_value")
-                                if isinstance(value, list):
-                                    joined = ", ".join(str(item).strip() for item in value if str(item).strip())
-                                    parts.append(f"{display_attr}: {joined}")
-                                else:
-                                    parts.append(f"{display_attr}: {value}")
+                                value = self._repair_mojibake_value(match.get("attribute_value"))
+                                rendered_value = self._format_attribute_value_for_answer(value)
+                                parts.append(f"{display_attr}: {rendered_value}")
 
                             # Try to learn pattern if available
                             attr_names_learned = [str(item.get("attribute_name") or "") for item in multi_matches if item.get("attribute_name")]
@@ -12972,6 +15592,8 @@ class QueryEngine:
                             }
 
                     direct_lookup_name = parsed.attribute_name or parsed.relation_name
+                    if parsed.attribute_names and len(parsed.attribute_names) > 1 and parsed.attribute_name in parsed.attribute_names:
+                        direct_lookup_name = None
                     if (
                         broad_scope
                         and not file_scope
@@ -13023,11 +15645,33 @@ class QueryEngine:
                             language=parsed.language,
                             ambiguity_data=direct,
                         )
+                    if direct and answer_attribute_filters and not self._result_satisfies_attribute_filters(conn, direct, answer_attribute_filters):
+                        fallback_diagnostics.setdefault("filtered_out_matches", [])
+                        if isinstance(fallback_diagnostics.get("filtered_out_matches"), list):
+                            fallback_diagnostics["filtered_out_matches"].append(
+                                {
+                                    "attribute_name": str(direct.get("attribute_name") or direct_lookup_name or ""),
+                                    "entity_name": str(direct.get("entity_name") or lookup_entity_name or ""),
+                                    "reason": "attribute_filters_not_satisfied",
+                                }
+                            )
+                        direct = None
+                    if direct and self._requires_contextual_value_resolution(
+                        question=question,
+                        parsed=parsed,
+                        criteria=criteria_for_lookup,
+                        direct_result=direct,
+                    ):
+                        fallback_diagnostics["contextual_value_guard"] = {
+                            "applied": True,
+                            "reason": "contextual_value_query_requires_grounded_resolution",
+                        }
+                        direct = None
                     if direct:
                         source = "sql_exact"
                         attr_name = str(direct.get("attribute_name") or parsed.attribute_name or parsed.relation_name or "attribute").strip() or "attribute"
                         display_attr = self._get_attribute_display_name(attr_name, parsed.language) if attr_name != "attribute" else "attribute"
-                        value = direct.get("attribute_value")
+                        value = self._repair_mojibake_value(direct.get("attribute_value"))
                         if (
                             isinstance(value, list)
                             and len(value) > 1
@@ -13216,24 +15860,24 @@ class QueryEngine:
                             }
 
                         if relationship_name and related_entity_name and related_entity_name != source_entity_name:
-                            if isinstance(value, list):
-                                joined = ", ".join(str(item).strip() for item in value if str(item).strip())
+                            rendered_value = self._format_attribute_value_for_answer(value)
+                            if isinstance(value, (list, dict)):
                                 if str(parsed.language or "en").lower() == "de":
-                                    answer_text = f"{display_attr} für {related_entity_name} über {relationship_name} von {source_entity_name} sind {joined}."
+                                    answer_text = f"{display_attr} für {related_entity_name} über {relationship_name} von {source_entity_name} sind {rendered_value}."
                                 else:
-                                    answer_text = f"{display_attr} for {related_entity_name} via {relationship_name} of {source_entity_name} are {joined}."
+                                    answer_text = f"{display_attr} for {related_entity_name} via {relationship_name} of {source_entity_name} are {rendered_value}."
                             else:
                                 if str(parsed.language or "en").lower() == "de":
                                     answer_text = f"{display_attr} für {related_entity_name} über {relationship_name} von {source_entity_name} ist {value}."
                                 else:
                                     answer_text = f"{display_attr} for {related_entity_name} via {relationship_name} of {source_entity_name} is {value}."
                         else:
-                            if isinstance(value, list):
-                                joined = ", ".join(str(item).strip() for item in value if str(item).strip())
+                            rendered_value = self._format_attribute_value_for_answer(value)
+                            if isinstance(value, (list, dict)):
                                 if str(parsed.language or "en").lower() == "de":
-                                    answer_text = f"{display_attr} für {parsed.entity_name} sind {joined}."
+                                    answer_text = f"{display_attr} für {parsed.entity_name} sind {rendered_value}."
                                 else:
-                                    answer_text = f"{display_attr} for {parsed.entity_name} are {joined}."
+                                    answer_text = f"{display_attr} for {parsed.entity_name} are {rendered_value}."
                             else:
                                 if str(parsed.language or "en").lower() == "de":
                                     answer_text = f"{display_attr} für {parsed.entity_name} ist {value}."
@@ -13294,6 +15938,7 @@ class QueryEngine:
                             "candidate_count": len(candidates),
                         }
 
+                _ensure_semantic_context()
                 fallback = self.sql_fallback_from_ids(conn, parsed, node_ids, edge_ids, doc_ids)
                 if fallback:
                     _diag_flow("qdrant_sql_fallback")
@@ -13324,6 +15969,7 @@ class QueryEngine:
             pass
 
         if strict_table_request:
+            _ensure_semantic_context()
             source = "table_grounding_required"
             row_hint = table_row_label or "(row label missing)"
             column_hint = table_column or "(column missing)"
@@ -13343,30 +15989,33 @@ class QueryEngine:
                 "candidate_count": len(candidates),
             }
 
-        if parsed.intent == "attribute_lookup" and parsed.attribute_name and discovery_results:
-            _diag_flow("discovery_fallback")
-            discovery_match = self._lookup_attribute_in_discovery_results(
-                attribute_name=parsed.attribute_name,
-                entity_name=parsed.entity_name,
-                results=discovery_results,
-            )
-            if discovery_match:
-                source = "discovery_fallback"
-                entity_label = parsed.entity_name or "the entity"
-                return {
-                    "question": question,
-                    "intent": parsed.intent,
-                    "answer": self._prefix_source(
-                        (
-                            f"{parsed.attribute_name} for {entity_label} is "
-                            f"{discovery_match['attribute_value']}."
+        if parsed.intent == "attribute_lookup" and parsed.attribute_name:
+            _ensure_semantic_context()
+            if discovery_results:
+                _diag_flow("discovery_fallback")
+                discovery_match = self._lookup_attribute_in_discovery_results(
+                    attribute_name=parsed.attribute_name,
+                    entity_name=parsed.entity_name,
+                    results=discovery_results,
+                    attribute_filters=self._attribute_filters_from_criteria(parsed.criteria),
+                )
+                if discovery_match:
+                    source = "discovery_fallback"
+                    entity_label = parsed.entity_name or "the entity"
+                    return {
+                        "question": question,
+                        "intent": parsed.intent,
+                        "answer": self._prefix_source(
+                            (
+                                f"{parsed.attribute_name} for {entity_label} is "
+                                f"{discovery_match['attribute_value']}."
+                            ),
+                            source,
                         ),
-                        source,
-                    ),
-                    "data": self._attach_match_telemetry(discovery_match, match_telemetry),
-                    "source": source,
-                    "candidate_count": len(discovery_results),
-                }
+                        "data": self._attach_match_telemetry(discovery_match, match_telemetry),
+                        "source": source,
+                        "candidate_count": len(discovery_results),
+                    }
 
         if (
             ENABLE_SEMANTIC_LLM_FALLBACK
@@ -13375,12 +16024,14 @@ class QueryEngine:
             and parsed.attribute_name
             and not self._looks_like_identifier_request(question)
         ):
+            _ensure_semantic_context()
             _diag_flow("semantic_llm_fallback")
             semantic_llm = self._semantic_llm_attribute_fallback(
                 question=question,
                 parsed=parsed,
                 candidates=candidates,
                 discovery_results=discovery_results,
+                attribute_filters=self._attribute_filters_from_criteria(parsed.criteria),
             )
             if semantic_llm:
                 source = "semantic_llm_fallback"
@@ -13415,7 +16066,12 @@ class QueryEngine:
 
         # Multi-flow safety net: if primary parse path misses, try alternate explicit
         # attribute candidates and recovered entity hints before reporting not_found.
-        if parsed.intent == "attribute_lookup" and parsed.entity_name and not self._looks_like_identifier_request(question):
+        if (
+            parsed.intent == "attribute_lookup"
+            and parsed.entity_name
+            and not self._looks_like_identifier_request(question)
+            and not self._attribute_filters_from_criteria(parsed.criteria)
+        ):
             rescue_candidates = self._attribute_rescue_candidates_from_text(question)
             _diag_flow("sql_rescue_fallback")
             tried_attrs = {
@@ -13442,9 +16098,19 @@ class QueryEngine:
                     if term_name and term_kind == "attribute" and term_name not in rescue_candidates:
                         rescue_candidates.append(term_name)
 
+            rescue_stopwords = {
+                "for", "of", "in", "on", "at", "to", "from", "by", "with",
+                "the", "a", "an", "and", "or", "how", "much", "was", "is",
+                "are", "were", "mobile", "services", "gmbh", "aphotonix",
+            }
+
             rescue_candidates = [
                 name for name in rescue_candidates
-                if str(name or "").strip() and str(name).strip() not in tried_attrs
+                if (
+                    str(name or "").strip()
+                    and str(name).strip() not in tried_attrs
+                    and str(name).strip().lower() not in rescue_stopwords
+                )
             ]
             fallback_diagnostics["candidate_attributes"] = rescue_candidates[:12]
 
@@ -13507,6 +16173,7 @@ class QueryEngine:
                     pass
 
         if parsed.intent == "semantic_lookup":
+            _ensure_semantic_context()
             contextual_resolution = self._contextual_llm_resolution_fallback(
                 question=question,
                 parsed=parsed,
@@ -13557,10 +16224,24 @@ class QueryEngine:
                 }
 
         # Last resort: LLM-based structured extraction (only fires when all other tiers failed)
+        parsed_attribute_filters = self._attribute_filters_from_criteria(parsed.criteria)
         llm_parsed = None if self._looks_like_identifier_request(question) else self._llm_extract_intent(question)
+        if llm_parsed and parsed_attribute_filters:
+            llm_criteria = dict(llm_parsed.criteria) if isinstance(llm_parsed.criteria, dict) else {}
+            inherited_plan = llm_criteria.get("llm_query_plan") if isinstance(llm_criteria.get("llm_query_plan"), dict) else {}
+            inherited_filters = inherited_plan.get("filters") if isinstance(inherited_plan.get("filters"), dict) else {}
+            if not inherited_filters.get("attribute_filters"):
+                inherited_filters["attribute_filters"] = list(parsed_attribute_filters)
+            inherited_plan["filters"] = inherited_filters
+            llm_criteria["llm_query_plan"] = inherited_plan
+            llm_criteria.setdefault("inherited_filter_context", True)
+            llm_parsed.criteria = llm_criteria
         if llm_parsed and llm_parsed.entity_name and (llm_parsed.attribute_name or llm_parsed.relation_name):
             try:
                 with self._get_connection() as conn:
+                    llm_attribute_filters = self._attribute_filters_from_criteria(
+                        llm_parsed.criteria if isinstance(llm_parsed.criteria, dict) else None
+                    )
                     if llm_parsed.attribute_names:
                         multi_matches: list[dict[str, Any]] = []
                         for attr in llm_parsed.attribute_names[:4]:
@@ -13578,6 +16259,8 @@ class QueryEngine:
                                     ambiguity_data=match,
                                 )
                             if match:
+                                if llm_attribute_filters and not self._result_satisfies_attribute_filters(conn, match, llm_attribute_filters):
+                                    continue
                                 multi_matches.append(match)
 
                         if multi_matches:
@@ -13650,6 +16333,8 @@ class QueryEngine:
                             language=llm_parsed.language,
                             ambiguity_data=direct,
                         )
+                    if direct and llm_attribute_filters and not self._result_satisfies_attribute_filters(conn, direct, llm_attribute_filters):
+                        direct = None
                     if direct:
                         direct_attr_name = str(direct.get("attribute_name") or llm_parsed.attribute_name or llm_parsed.relation_name or "attribute").strip() or "attribute"
                         display_attr = self._get_attribute_display_name(direct_attr_name, llm_parsed.language)
@@ -13688,6 +16373,7 @@ class QueryEngine:
             except Exception:
                 pass
 
+        _ensure_semantic_context()
         contextual_resolution = self._contextual_llm_resolution_fallback(
             question=question,
             parsed=parsed,

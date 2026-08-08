@@ -1049,13 +1049,90 @@ def _build_search_boost_text(metadata: dict[str, Any] | None) -> str:
     return " ".join(piece for piece in pieces if piece).strip()
 
 
+def _build_document_semantic_profile(
+    doc_cat: Any,
+    doc_type: Any,
+    doc_theme: Any,
+) -> dict[str, Any]:
+    """Build normalized document-semantic terms for retrieval and filtering."""
+    cat_norm = _normalize_term_text(doc_cat)
+    type_norm = _normalize_term_text(doc_type)
+    theme_norm = _normalize_term_text(doc_theme)
+
+    field_values = [cat_norm, type_norm, theme_norm]
+
+    terms: set[str] = set()
+    for value in field_values:
+        if not value:
+            continue
+        terms.add(value)
+        for fragment in re.split(r"[,;/|]+", value):
+            frag = _normalize_term_text(fragment)
+            if not frag:
+                continue
+            terms.add(frag)
+            for token in frag.split():
+                if len(token) >= 3:
+                    terms.add(token)
+
+    concept_rules: list[tuple[str, set[str], set[str]]] = [
+        (
+            "billing_document",
+            {"invoice", "bill", "billing", "receipt", "statement", "rechnung", "beleg", "quittung"},
+            {"invoice", "bill", "billing", "receipt", "payment", "charge", "rechnung", "beleg"},
+        ),
+        (
+            "telecom_service",
+            {"telecom", "telecommunication", "telephone", "telefon", "mobile", "mobil", "cell", "cellular"},
+            {"telecom", "telephone", "phone", "mobile", "telefon", "mobil", "communications"},
+        ),
+        (
+            "quotation_offer",
+            {"quotation", "quote", "offer", "offerte", "angebot"},
+            {"quotation", "quote", "offer", "offerte", "proposal"},
+        ),
+        (
+            "contract_document",
+            {"contract", "agreement", "policy", "vertrag", "vereinbarung"},
+            {"contract", "agreement", "policy", "terms"},
+        ),
+        (
+            "logistics_document",
+            {"shipment", "delivery", "transport", "logistics", "cargo", "fracht", "lieferung"},
+            {"shipment", "delivery", "transport", "logistics", "cargo"},
+        ),
+    ]
+
+    concepts: list[str] = []
+    haystack = " ".join(v for v in field_values if v)
+    for concept, triggers, expansions in concept_rules:
+        if any(trigger in haystack for trigger in triggers):
+            concepts.append(concept)
+            terms.update(expansions)
+
+    ordered_terms = sorted(terms)
+    ordered_concepts = sorted(set(concepts))
+    return {
+        "doc_cat": cat_norm,
+        "doc_type": type_norm,
+        "doc_theme": theme_norm,
+        "terms": ordered_terms,
+        "concepts": ordered_concepts,
+    }
+
+
 def _build_retrieval_hints(routed: dict[str, Any], ingested: dict[str, Any]) -> dict[str, Any]:
     document = ingested.get("document") if isinstance(ingested.get("document"), dict) else {}
     metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
     doc_key = str(document.get("doc_key") or "").strip()
     doc_type = str(document.get("doc_type") or routed.get("document_type") or "").strip()
+    doc_cat = str(document.get("doc_cat") or "").strip()
+    doc_theme = str(document.get("doc_theme") or "").strip()
     description = str(metadata.get("user_description") or "").strip()
     tags = [str(tag).strip() for tag in (metadata.get("user_tags") or []) if str(tag).strip()]
+    semantic_profile = _build_document_semantic_profile(doc_cat, doc_type, doc_theme)
+    semantic_terms = [str(item).strip() for item in (semantic_profile.get("terms") or []) if str(item).strip()]
+    semantic_concepts = [str(item).strip() for item in (semantic_profile.get("concepts") or []) if str(item).strip()]
 
     entity_names = sorted({
         str(entity.get("name") or "").strip()
@@ -1081,9 +1158,12 @@ def _build_retrieval_hints(routed: dict[str, Any], ingested: dict[str, Any]) -> 
         token
         for token in [
             doc_key,
+            doc_cat,
             doc_type,
+            doc_theme,
             description,
             " ".join(tags),
+            " ".join(semantic_terms),
             entity_name_text,
             entity_class_text,
             relationship_text,
@@ -1100,6 +1180,7 @@ def _build_retrieval_hints(routed: dict[str, Any], ingested: dict[str, Any]) -> 
             "entity_names": 2.0,
             "entity_classes": 1.6,
             "relationship_types": 1.6,
+            "doc_semantic_terms": 1.7,
             "keyword_text": 1.2,
         },
         "boosted_query_templates": [
@@ -1114,7 +1195,11 @@ def _build_retrieval_hints(routed: dict[str, Any], ingested: dict[str, Any]) -> 
         ],
         "boosted_filter_terms": {
             "doc_key": doc_key,
+            "doc_cat": doc_cat,
             "doc_type": doc_type,
+            "doc_theme": doc_theme,
+            "doc_semantic_terms": semantic_terms,
+            "doc_semantic_concepts": semantic_concepts,
             "user_description": description,
             "user_tags": tags,
             "entity_names": entity_names,
@@ -1141,6 +1226,13 @@ def build_discovery_struct_data(
 ) -> dict[str, Any]:
     document = ingested.get("document") if isinstance(ingested.get("document"), dict) else {}
     metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    semantic_profile = _build_document_semantic_profile(
+        document.get("doc_cat"),
+        document.get("doc_type") or routed.get("document_type"),
+        document.get("doc_theme"),
+    )
+    semantic_terms = [str(item).strip() for item in (semantic_profile.get("terms") or []) if str(item).strip()]
+    semantic_concepts = [str(item).strip() for item in (semantic_profile.get("concepts") or []) if str(item).strip()]
     entity_types = sorted({
         str(entity.get("class_name") or "").strip().lower()
         for entity in (ingested.get("solf_entities") or [])
@@ -1166,6 +1258,8 @@ def build_discovery_struct_data(
         "user_tags": metadata.get("user_tags") if isinstance(metadata.get("user_tags"), list) else [],
         "user_metadata": metadata.get("user_metadata") if isinstance(metadata.get("user_metadata"), dict) else {},
         "search_boost_text": _build_search_boost_text(metadata),
+        "doc_semantic_terms": semantic_terms,
+        "doc_semantic_concepts": semantic_concepts,
     }
 
 
@@ -1475,6 +1569,61 @@ def embed_text_chunks(client: Any, chunks: list[str]) -> list[list[float]]:
     return embeddings
 
 
+def _extract_dense_vector_size(vectors_cfg: Any, preferred_name: str = "dense") -> int | None:
+    """Best-effort extraction of dense vector size from Qdrant vectors config."""
+    if vectors_cfg is None:
+        return None
+
+    direct_size = getattr(vectors_cfg, "size", None)
+    if direct_size is not None:
+        try:
+            return int(direct_size)
+        except Exception:
+            return None
+
+    cfg_dict: dict[str, Any] | None = None
+    if isinstance(vectors_cfg, dict):
+        cfg_dict = vectors_cfg
+    else:
+        model_dump = getattr(vectors_cfg, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+                if isinstance(dumped, dict):
+                    cfg_dict = dumped
+            except Exception:
+                cfg_dict = None
+
+    if not cfg_dict:
+        return None
+
+    preferred = cfg_dict.get(preferred_name)
+    if isinstance(preferred, dict) and preferred.get("size") is not None:
+        try:
+            return int(preferred.get("size"))
+        except Exception:
+            return None
+
+    if hasattr(preferred, "size"):
+        try:
+            return int(getattr(preferred, "size"))
+        except Exception:
+            return None
+
+    for value in cfg_dict.values():
+        if isinstance(value, dict) and value.get("size") is not None:
+            try:
+                return int(value.get("size"))
+            except Exception:
+                continue
+        if hasattr(value, "size"):
+            try:
+                return int(getattr(value, "size"))
+            except Exception:
+                continue
+    return None
+
+
 def encode_chunks_sparse(chunks: list[str]) -> list[tuple[list[int], list[float]]]:
     """Generate sparse vectors for text chunks using token frequency (BM25-style)."""
     if encode_sparse_vector is None:
@@ -1487,13 +1636,48 @@ def encode_chunks_sparse(chunks: list[str]) -> list[tuple[list[int], list[float]
     return sparse_vectors
 
 
-def _ensure_qdrant_collection(qdrant: Any, collection_name: str) -> None:
+def _ensure_qdrant_collection(
+    qdrant: Any,
+    collection_name: str,
+    expected_vector_size: int | None = None,
+) -> None:
     """Ensure Qdrant collection exists with both dense and sparse vector support."""
+    recreate_on_mismatch = str(
+        os.getenv("IDMS_QDRANT_AUTO_RECREATE_ON_DIM_MISMATCH", "false")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    expected_size = int(expected_vector_size or QDRANT_VECTOR_SIZE)
+
     existing = {c.name for c in qdrant.get_collections().collections}
+    if collection_name in existing:
+        info = qdrant.get_collection(collection_name)
+        vectors_cfg = getattr(getattr(info, "config", None), "params", None)
+        vectors_cfg = getattr(vectors_cfg, "vectors", None)
+        current_size = _extract_dense_vector_size(vectors_cfg)
+
+        if current_size is None:
+            raise RuntimeError(
+                f"Qdrant collection '{collection_name}' has no readable dense vector size; "
+                "cannot validate ingestion embeddings."
+            )
+
+        if int(current_size) != int(expected_size):
+            message = (
+                f"Qdrant collection '{collection_name}' dense vector size mismatch: "
+                f"collection={current_size}, expected={expected_size}. "
+                "Set IDMS_QDRANT_EMBEDDING_DIMENSION/model consistently or rebuild the collection."
+            )
+            if not recreate_on_mismatch:
+                raise RuntimeError(message)
+
+            LOGGER.warning("%s Auto-recreating collection because IDMS_QDRANT_AUTO_RECREATE_ON_DIM_MISMATCH=true", message)
+            qdrant.delete_collection(collection_name)
+            existing.discard(collection_name)
+
     if collection_name not in existing:
         # Configure collection with named dense vectors and optional sparse config.
         vectors_config = {
-            "dense": VectorParams(size=QDRANT_VECTOR_SIZE, distance=Distance.COSINE),
+            "dense": VectorParams(size=expected_size, distance=Distance.COSINE),
         }
 
         if SparseVectorParams is not None:
@@ -1517,11 +1701,19 @@ def index_chunks_in_qdrant(
     doc_key: str,
     doc_type: str,
     gcs_uri: str,
+    doc_cat: str | None = None,
+    doc_theme: str | None = None,
     doc_keywords: list[str] | None = None,
+    semantic_doc_terms: list[str] | None = None,
     entity_names: list[str] | None = None,
     chunk_feature_types: list[str] | None = None,
 ) -> dict[str, Any]:
-    _ensure_qdrant_collection(qdrant, QDRANT_COLLECTION)
+    expected_vector_size = len(embeddings[0]) if embeddings else QDRANT_VECTOR_SIZE
+    _ensure_qdrant_collection(
+        qdrant,
+        QDRANT_COLLECTION,
+        expected_vector_size=expected_vector_size,
+    )
 
     replaced_existing_chunks = 0
     if Filter is not None and FieldCondition is not None and MatchValue is not None and doc_key:
@@ -1573,9 +1765,12 @@ def index_chunks_in_qdrant(
                 payload={
                     "doc_id": doc_id,
                     "doc_key": doc_key,
+                    "doc_cat": str(doc_cat or "").strip(),
                     "doc_type": doc_type,
+                    "doc_theme": str(doc_theme or "").strip(),
                     "gcs_uri": gcs_uri,
                     "doc_keywords": [str(item).strip() for item in (doc_keywords or []) if str(item).strip()],
+                    "doc_semantic_terms": [str(item).strip() for item in (semantic_doc_terms or []) if str(item).strip()],
                     "entity_names": [str(item).strip() for item in (entity_names or []) if str(item).strip()],
                     "feature_type": feature_type,
                     "chunk_index": idx,
@@ -4910,6 +5105,12 @@ def insert_document_record(
     client_file_name = str(user_metadata.get("client_file_name") or "").strip()
     client_file_path = str(user_metadata.get("client_file_path") or "").strip()
     keyword_parts = [str(k) for k in keywords]
+    semantic_profile = _build_document_semantic_profile(
+        document.get("doc_cat"),
+        document.get("doc_type"),
+        document.get("doc_theme"),
+    )
+    semantic_terms = [str(item).strip() for item in (semantic_profile.get("terms") or []) if str(item).strip()]
     if user_description:
         keyword_parts.append(user_description)
     keyword_parts.extend(str(tag) for tag in user_tags if str(tag).strip())
@@ -4919,6 +5120,8 @@ def insert_document_record(
         keyword_parts.append(str(document.get("doc_theme")))
     if str(document.get("doc_type") or "").strip():
         keyword_parts.append(str(document.get("doc_type")))
+    if semantic_terms:
+        keyword_parts.append(" ".join(semantic_terms))
     metadata_description_raw = str(metadata.get("description") or "").strip()
     metadata_description = _strip_ingestion_directive_text(metadata_description_raw)
     semantic_markdown_excerpt = ""
@@ -4961,6 +5164,15 @@ def insert_document_record(
         metadata["ingestion_directive_text"] = user_description_raw
     if metadata_description_raw and _is_directive_only_text(metadata_description_raw):
         metadata["ingestion_directive_description"] = metadata_description_raw
+    if semantic_terms or semantic_profile.get("concepts"):
+        metadata["semantic_doc_profile"] = {
+            "terms": semantic_terms,
+            "concepts": [
+                str(item).strip()
+                for item in (semantic_profile.get("concepts") or [])
+                if str(item).strip()
+            ],
+        }
 
     fallback_user_desc = user_description_raw if user_description_raw and not _is_directive_only_text(user_description_raw) else ""
     fallback_metadata_desc = (
@@ -6337,6 +6549,30 @@ def persist_solf_objects(
                     "transactions_deleted": deleted_count,
                 }
 
+            attrs = entity_payload.get("attributes") if isinstance(entity_payload.get("attributes"), dict) else {}
+            source_type = str(attrs.get("source_type") or attrs.get("document_type") or "").strip().lower()
+            review_mode = str(attrs.get("booking_review_mode") or "required").strip().lower()
+            requires_review = source_type in {"invoice", "bill", "receipt"} and review_mode not in {"skip", "bypass", "disabled"}
+
+            if requires_review and hasattr(domain_db, "enqueue_accounting_booking_review"):
+                queued = domain_db.enqueue_accounting_booking_review(
+                    connection=connection,
+                    payload=entity_payload,
+                    object_row=object_row,
+                )
+                return {
+                    "attempted": True,
+                    "class_name": class_name,
+                    "ok": True,
+                    "mode": "queued_for_review",
+                    "accounting_review_required": True,
+                    "accounting_review_status": "pending",
+                    "accounting_review_id": queued.get("review_id"),
+                    "validation": queued.get("validation") or {},
+                    "transaction_id": None,
+                    "ledger_lines_written": 0,
+                }
+
             domain_result = domain_db.upsert_transaction_and_lines(
                 connection=connection,
                 payload=entity_payload,
@@ -6402,7 +6638,7 @@ def persist_solf_objects(
                 "doc_id": doc_id,
             }
 
-            entity_payload["attributes"] = business_rules.apply_business_rules_to_attributes(
+            attrs_after_rules = business_rules.apply_business_rules_to_attributes(
                 dict(entity_payload.get("attributes") or {}),
                 context={
                     "country": (entity_payload.get("attributes") or {}).get("country"),
@@ -6411,6 +6647,7 @@ def persist_solf_objects(
                     "operation": entity_payload.get("operation"),
                 },
             )
+            entity_payload["attributes"] = attrs_after_rules if isinstance(attrs_after_rules, dict) else {}
 
             validation_result, validation_clause = invoke_solf_entity_validation(
                 interpreter=interpreter,
@@ -7905,9 +8142,23 @@ def run_ingest(
                         embeddings=embeddings,
                         doc_id=db_summary["doc_id"],
                         doc_key=str(qdrant_doc.get("doc_key") or Path(source_path_or_uri).name),
+                        doc_cat=str(qdrant_doc.get("doc_cat") or ""),
                         doc_type=str(qdrant_doc.get("doc_type") or routed.get("document_type") or "general_information"),
+                        doc_theme=str(qdrant_doc.get("doc_theme") or ""),
                         gcs_uri=gcs_uri,
                         doc_keywords=[str(item).strip() for item in qdrant_keywords if str(item).strip()],
+                        semantic_doc_terms=[
+                            str(item).strip()
+                            for item in (
+                                _build_document_semantic_profile(
+                                    qdrant_doc.get("doc_cat"),
+                                    qdrant_doc.get("doc_type") or routed.get("document_type"),
+                                    qdrant_doc.get("doc_theme"),
+                                ).get("terms")
+                                or []
+                            )
+                            if str(item).strip()
+                        ],
                         entity_names=qdrant_entity_names,
                         chunk_feature_types=chunk_feature_types,
                     )

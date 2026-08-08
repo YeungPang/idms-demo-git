@@ -146,6 +146,37 @@
       color: var(--muted);
     }
 
+    .flow-steps {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 2px 0 10px;
+    }
+    .flow-step {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      color: var(--muted);
+      font-size: .8rem;
+      font-weight: 600;
+      padding: 4px 10px;
+    }
+    .flow-step.active {
+      color: #0f5132;
+      border-color: #86efac;
+      background: #f0fdf4;
+    }
+    .flow-step.done {
+      color: #0f5132;
+      border-color: #86efac;
+      background: #dcfce7;
+    }
+    .flow-state {
+      margin: 0 0 8px;
+      font-size: .84rem;
+      color: var(--muted);
+    }
+
     pre {
       margin: 10px 0 0;
       padding: 10px;
@@ -865,6 +896,63 @@
         </div>
         <div id="actionStatus" class="status"></div>
         <pre id="actionOut"></pre>
+      </section>
+
+      <section class="panel half">
+        <h2>Accounting Booking Review</h2>
+        <div class="flow-steps" id="accountingFlowSteps">
+          <span class="flow-step active" id="flowStep1">1. Ingest</span>
+          <span class="flow-step" id="flowStep2">2. Review & Edit</span>
+          <span class="flow-step" id="flowStep3">3. Confirm or Cancel</span>
+        </div>
+        <p class="flow-state" id="accountingFlowState">Start with ingestion. The new pending booking review opens automatically.</p>
+        <div class="row two">
+          <div>
+            <label>List status</label>
+            <select id="accountingReviewStatusFilter">
+              <option value="pending">pending</option>
+              <option value="approved">approved</option>
+              <option value="cancelled">cancelled</option>
+              <option value="">all</option>
+            </select>
+          </div>
+          <div>
+            <label>List limit</label>
+            <input id="accountingReviewLimit" type="number" min="1" max="1000" value="100" />
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>List offset</label>
+            <input id="accountingReviewOffset" type="number" min="0" value="0" />
+          </div>
+          <div>
+            <label>Review ID</label>
+            <input id="accountingReviewId" type="number" min="1" placeholder="review id" />
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Reviewed by</label>
+            <input id="accountingReviewBy" type="text" value="web:user" />
+          </div>
+          <div>
+            <label>Review note</label>
+            <input id="accountingReviewNote" type="text" placeholder="optional comment" />
+          </div>
+        </div>
+        <div>
+          <label>Booking updates JSON (optional on approve)</label>
+          <textarea id="accountingReviewUpdates" placeholder='{"description":"Updated memo","ledger_lines":[{"account_number":6500,"direction":"debit","amount_source_currency":"100.00","source_currency":"CHF","exchange_rate_to_chf":"1","amount_chf":"100.00","swiss_vat_code":"NONE"},{"account_number":2000,"direction":"credit","amount_source_currency":"100.00","source_currency":"CHF","exchange_rate_to_chf":"1","amount_chf":"100.00","swiss_vat_code":"NONE"}]}'></textarea>
+        </div>
+        <div class="btns">
+          <button id="btnAccountingReviewList">List Reviews</button>
+          <button id="btnAccountingReviewGet" class="alt">Get Review</button>
+          <button id="btnAccountingReviewApprove" class="alt">Approve / Post</button>
+          <button id="btnAccountingReviewCancel" class="alt">Cancel Booking</button>
+        </div>
+        <div id="accountingReviewStatus" class="status"></div>
+        <pre id="accountingReviewOut"></pre>
       </section>
 
       <section class="panel">
@@ -1911,6 +1999,203 @@
         .split(",")
         .map((item) => Number(item.trim()))
         .filter((n) => Number.isInteger(n) && n > 0);
+    }
+
+    function buildAccountingReviewListPath() {
+      const status = String(document.getElementById("accountingReviewStatusFilter").value || "").trim();
+      const limit = Number(document.getElementById("accountingReviewLimit").value || 100);
+      const offset = Number(document.getElementById("accountingReviewOffset").value || 0);
+      const qs = new URLSearchParams();
+      if (status) qs.set("status", status);
+      qs.set("limit", String(Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 100));
+      qs.set("offset", String(Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0));
+      return "/api/accounting/reviews?" + qs.toString();
+    }
+
+    function readAccountingReviewActionBody() {
+      return {
+        reviewed_by: String(document.getElementById("accountingReviewBy").value || "web:user").trim() || "web:user",
+        review_note: String(document.getElementById("accountingReviewNote").value || "").trim(),
+        booking_updates: parseJsonMaybe(document.getElementById("accountingReviewUpdates").value, {}),
+      };
+    }
+
+    function setAccountingReviewFlowStep(step, message = "") {
+      const stepNumber = Math.max(1, Math.min(3, Number(step) || 1));
+      const ids = ["flowStep1", "flowStep2", "flowStep3"];
+      ids.forEach((id, index) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const pos = index + 1;
+        el.classList.remove("active", "done");
+        if (pos < stepNumber) el.classList.add("done");
+        if (pos === stepNumber) el.classList.add("active");
+      });
+      const stateEl = document.getElementById("accountingFlowState");
+      if (stateEl && message) stateEl.textContent = String(message);
+    }
+
+    function parsePositiveInt(value) {
+      const numeric = Number.parseInt(String(value ?? "").trim(), 10);
+      return Number.isInteger(numeric) && numeric > 0 ? numeric : 0;
+    }
+
+    async function fetchPendingAccountingReviews(limit = 200) {
+      const qs = new URLSearchParams();
+      qs.set("status", "pending");
+      qs.set("limit", String(parsePositiveInt(limit) || 200));
+      qs.set("offset", "0");
+      const data = await getJson(`/api/accounting/reviews?${qs.toString()}`);
+      return Array.isArray(data?.result) ? data.result : [];
+    }
+
+    function findNewPendingReviewId(beforeRows, afterRows) {
+      const beforeSet = new Set(
+        (Array.isArray(beforeRows) ? beforeRows : [])
+          .map((row) => parsePositiveInt(row?.review_id))
+          .filter((id) => id > 0)
+      );
+
+      let newestNewId = 0;
+      for (const row of Array.isArray(afterRows) ? afterRows : []) {
+        const reviewId = parsePositiveInt(row?.review_id);
+        if (!reviewId || beforeSet.has(reviewId)) continue;
+        if (reviewId > newestNewId) newestNewId = reviewId;
+      }
+      if (newestNewId > 0) return newestNewId;
+
+      let newestAnyId = 0;
+      for (const row of Array.isArray(afterRows) ? afterRows : []) {
+        const reviewId = parsePositiveInt(row?.review_id);
+        if (reviewId > newestAnyId) newestAnyId = reviewId;
+      }
+      return newestAnyId > 0 ? newestAnyId : 0;
+    }
+
+    function extractAccountingReviewIdFromIngestPayload(payload) {
+      const stack = [payload];
+      const seen = new Set();
+      const candidates = [];
+      let iterations = 0;
+
+      while (stack.length && iterations < 10000) {
+        const node = stack.pop();
+        iterations += 1;
+        if (!node || typeof node !== "object") continue;
+        if (seen.has(node)) continue;
+        seen.add(node);
+
+        const reviewId = parsePositiveInt(node.review_id ?? node.booking_review_id ?? node.accounting_review_id);
+        if (reviewId > 0) {
+          const sourceType = String(
+            node.source_type
+              || node.document_type
+              || node?.payload?.attributes?.source_type
+              || node?.attributes?.source_type
+              || ""
+          ).trim().toLowerCase();
+          const messageText = [
+            String(node.message || ""),
+            String(node.reason || ""),
+            String(node.note || ""),
+          ].join(" ").toLowerCase();
+          const looksAccountingReview = (
+            sourceType === "invoice"
+            || sourceType === "bill"
+            || sourceType === "receipt"
+            || Boolean(node.queued_for_review)
+            || Boolean(node.requires_review)
+            || messageText.includes("accounting")
+            || messageText.includes("booking review")
+          );
+          if (looksAccountingReview) {
+            candidates.push(reviewId);
+          }
+        }
+
+        const values = Object.values(node);
+        for (const value of values) {
+          if (value && typeof value === "object") stack.push(value);
+        }
+      }
+
+      if (!candidates.length) return 0;
+      candidates.sort((a, b) => b - a);
+      return candidates[0] || 0;
+    }
+
+    async function loadAccountingReviewById(reviewId, options = {}) {
+      const status = options.statusEl || document.getElementById("accountingReviewStatus");
+      const out = options.outEl || document.getElementById("accountingReviewOut");
+      const id = parsePositiveInt(reviewId);
+      if (!id) {
+        showStatus(status, false, "Please provide a valid review ID.");
+        return { ok: false, reviewId: 0 };
+      }
+
+      const data = await getJson(`/api/accounting/reviews/${id}`);
+      const result = data?.result || {};
+      const attrs = result?.payload?.attributes || null;
+      if (attrs && typeof attrs === "object") {
+        document.getElementById("accountingReviewUpdates").value = JSON.stringify(
+          {
+            transaction_id: attrs.transaction_id,
+            transaction_date: attrs.transaction_date,
+            description: attrs.description,
+            source_type: attrs.source_type,
+            legal_entity_ref: attrs.legal_entity_ref,
+            ledger_lines: attrs.ledger_lines,
+          },
+          null,
+          2
+        );
+      }
+
+      document.getElementById("accountingReviewId").value = String(id);
+      out.textContent = JSON.stringify(data, null, 2);
+      setAccountingReviewFlowStep(2, `Review #${id} is loaded. Edit booking_updates, then approve to post or cancel.`);
+      showStatus(status, true, String(options.successMessage || "Accounting booking review loaded."));
+      return { ok: true, reviewId: id, data };
+    }
+
+    async function autoOpenAccountingReviewAfterIngest(data, beforePendingRows, ingestStatusEl, similarityReview) {
+      let reviewId = extractAccountingReviewIdFromIngestPayload(data);
+
+      if (!reviewId) {
+        try {
+          const afterPendingRows = await fetchPendingAccountingReviews(200);
+          reviewId = findNewPendingReviewId(beforePendingRows, afterPendingRows);
+        } catch (_err) {
+          reviewId = 0;
+        }
+      }
+
+      if (!reviewId) {
+        return { opened: false, reviewId: 0 };
+      }
+
+      document.getElementById("accountingReviewStatusFilter").value = "pending";
+      document.getElementById("accountingReviewOffset").value = "0";
+
+      try {
+        await loadAccountingReviewById(reviewId, {
+          successMessage: `Loaded review #${reviewId}. Edit booking_updates and click Approve / Post or Cancel Booking.`,
+        });
+      } catch (err) {
+        showStatus(ingestStatusEl, false, `Ingestion completed, but failed to auto-open review #${reviewId}: ${err}`);
+        return { opened: false, reviewId, openFailed: true };
+      }
+
+      const target = document.getElementById("accountingReviewId");
+      if (target && typeof target.scrollIntoView === "function") {
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+
+      const statusMessage = similarityReview
+        ? `${similarityReview.headline} Opened pending booking review #${reviewId} for confirmation.`
+        : `Ingestion completed. Opened pending booking review #${reviewId} for edit and confirmation.`;
+      showStatus(ingestStatusEl, !similarityReview, statusMessage);
+      return { opened: true, reviewId };
     }
 
     function parseCsvStrings(text) {
@@ -3636,6 +3921,12 @@
       if (uploadMarkdownRule) {
         metadata.ingestion_markdown_rule = uploadMarkdownRule;
       }
+      setAccountingReviewFlowStep(1, "Ingestion in progress. Preparing a pending booking review...");
+
+      let pendingBeforePromise = Promise.resolve([]);
+      if (!isTemplate) {
+        pendingBeforePromise = fetchPendingAccountingReviews(200).catch(() => []);
+      }
 
       try {
         let resp;
@@ -3703,7 +3994,12 @@
         if (!resp.ok) throw makeApiError(resp.status, data, isTemplate ? "/api/documents/template-references/ingest" : "/api/ingest/upload");
         out.textContent = JSON.stringify(data, null, 2);
         if (!isTemplate) {
+          const pendingBeforeRows = await pendingBeforePromise;
           const review = prependIngestionAttention(out, data);
+          const guided = await autoOpenAccountingReviewAfterIngest(data, pendingBeforeRows, status, review);
+          if (guided.opened || guided.openFailed) {
+            return;
+          }
           if (review) {
             showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
             return;
@@ -3781,6 +4077,10 @@
       const status = document.getElementById("pathStatus");
       const out = document.getElementById("pathOut");
       try {
+        setAccountingReviewFlowStep(1, "Ingestion in progress. Preparing a pending booking review...");
+        showStatus(status, true, "Running ingestion from path...");
+        const pendingBeforePromise = fetchPendingAccountingReviews(200).catch(() => []);
+
         const metadata = parseJsonMaybe(document.getElementById("pathMetadata").value, {});
         const pathMarkdownRule = String(document.getElementById("pathMarkdownRule")?.value || "").trim();
         if (pathMarkdownRule) {
@@ -3793,10 +4093,14 @@
           tags: parseJsonMaybe(document.getElementById("pathTags").value, []),
           metadata
         };
-        showStatus(status, true, "Running ingestion from path...");
         const data = await postJson("/api/ingest/path", body);
         out.textContent = JSON.stringify(data, null, 2);
+        const pendingBeforeRows = await pendingBeforePromise;
         const review = prependIngestionAttention(out, data);
+        const guided = await autoOpenAccountingReviewAfterIngest(data, pendingBeforeRows, status, review);
+        if (guided.opened || guided.openFailed) {
+          return;
+        }
         if (review) {
           showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
           return;
@@ -4121,9 +4425,20 @@
       const status = document.getElementById("actionStatus");
       const out = document.getElementById("actionOut");
       try {
+        const actionName = String(document.getElementById("actionName").value || "").trim();
+        const sentence = String(document.getElementById("actionSentence").value || "").trim();
+        const payload = parseJsonMaybe(document.getElementById("actionPayload").value, {});
+        const payloadObject = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+
+        if (!actionName && sentence) {
+          // Forward NL text explicitly so backend action inference can resolve intent.
+          payloadObject.message = String(payloadObject.message || sentence);
+        }
+
         const data = await postJson("/api/action", {
-          action_name: document.getElementById("actionName").value,
-          payload: parseJsonMaybe(document.getElementById("actionPayload").value, {})
+          action_name: actionName,
+          payload: payloadObject,
+          message: sentence,
         });
         out.textContent = JSON.stringify(data, null, 2);
         showStatus(status, true, "Action completed.");
@@ -4133,10 +4448,89 @@
       }
     });
 
+    document.getElementById("btnAccountingReviewList").addEventListener("click", async () => {
+      const status = document.getElementById("accountingReviewStatus");
+      const out = document.getElementById("accountingReviewOut");
+      try {
+        const path = buildAccountingReviewListPath();
+        const data = await getJson(path);
+        out.textContent = JSON.stringify(data, null, 2);
+        showStatus(status, true, "Accounting booking reviews loaded.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnAccountingReviewGet").addEventListener("click", async () => {
+      const status = document.getElementById("accountingReviewStatus");
+      const out = document.getElementById("accountingReviewOut");
+      try {
+        const reviewId = Number(document.getElementById("accountingReviewId").value || 0);
+        await loadAccountingReviewById(reviewId, { statusEl: status, outEl: out, successMessage: "Accounting booking review loaded." });
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnAccountingReviewApprove").addEventListener("click", async () => {
+      const status = document.getElementById("accountingReviewStatus");
+      const out = document.getElementById("accountingReviewOut");
+      try {
+        const reviewId = Number(document.getElementById("accountingReviewId").value || 0);
+        if (!reviewId || reviewId < 1) {
+          showStatus(status, false, "Please provide a valid review ID.");
+          return;
+        }
+        const body = readAccountingReviewActionBody();
+        const data = await postJson(`/api/accounting/reviews/${reviewId}/approve`, body);
+        out.textContent = JSON.stringify(data, null, 2);
+        setAccountingReviewFlowStep(3, `Review #${reviewId} approved. Booking is now posted.`);
+        showStatus(status, true, "Booking approved and posted.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnAccountingReviewCancel").addEventListener("click", async () => {
+      const status = document.getElementById("accountingReviewStatus");
+      const out = document.getElementById("accountingReviewOut");
+      try {
+        const reviewId = Number(document.getElementById("accountingReviewId").value || 0);
+        if (!reviewId || reviewId < 1) {
+          showStatus(status, false, "Please provide a valid review ID.");
+          return;
+        }
+        const base = readAccountingReviewActionBody();
+        const data = await postJson(`/api/accounting/reviews/${reviewId}/cancel`, {
+          reviewed_by: base.reviewed_by,
+          review_note: base.review_note,
+        });
+        out.textContent = JSON.stringify(data, null, 2);
+        setAccountingReviewFlowStep(3, `Review #${reviewId} cancelled. No booking was posted.`);
+        showStatus(status, true, "Booking review cancelled.");
+      } catch (err) {
+        out.textContent = "";
+        showStatus(status, false, String(err));
+      }
+    });
+
+    let actionSentenceQueryInFlight = false;
+    let directQueryInFlight = false;
+
     document.getElementById("btnActionSentenceQuery").addEventListener("click", async () => {
       const status = document.getElementById("actionStatus");
       const out = document.getElementById("actionOut");
+      const button = document.getElementById("btnActionSentenceQuery");
+      if (actionSentenceQueryInFlight) {
+        showStatus(status, false, "A sentence query is already running. Please wait.");
+        return;
+      }
       try {
+        actionSentenceQueryInFlight = true;
+        if (button) button.disabled = true;
         const sentence = String(document.getElementById("actionSentence").value || "").trim();
         if (!sentence) {
           showStatus(status, false, "Please enter a natural-language request.");
@@ -4163,13 +4557,23 @@
       } catch (err) {
         out.textContent = "";
         showStatus(status, false, String(err));
+      } finally {
+        actionSentenceQueryInFlight = false;
+        if (button) button.disabled = false;
       }
     });
 
     document.getElementById("btnQuery").addEventListener("click", async () => {
       const status = document.getElementById("queryStatus");
       const out = document.getElementById("queryOut");
+      const button = document.getElementById("btnQuery");
+      if (directQueryInFlight) {
+        showStatus(status, false, "A query is already running. Please wait.");
+        return;
+      }
       try {
+        directQueryInFlight = true;
+        if (button) button.disabled = true;
         const data = await postJson("/api/query", {
           question: document.getElementById("queryQuestion").value,
           max_steps: Number(document.getElementById("querySteps").value || 3)
@@ -4192,6 +4596,9 @@
       } catch (err) {
         out.textContent = "";
         showStatus(status, false, String(err));
+      } finally {
+        directQueryInFlight = false;
+        if (button) button.disabled = false;
       }
     });
 

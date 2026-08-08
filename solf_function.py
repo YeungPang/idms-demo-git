@@ -251,6 +251,13 @@ def _build_metadata(payload: dict[str, Any]) -> dict[str, Any]:
             "recorded_on": payload.get("recorded_on"),
         }
     )
+
+    resolution_result = payload.get("resolution_result") if isinstance(payload.get("resolution_result"), dict) else {}
+    if resolution_result.get("decision") == "create_new":
+        metadata["created_by_resolution"] = True
+        metadata["resolution_stage"] = resolution_result.get("stage")
+        metadata["resolution_reason"] = resolution_result.get("reason")
+
     return metadata
 
 
@@ -773,6 +780,39 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+def _flatten_scalar_mapping(value: Any, *, prefix: str = "") -> dict[str, Any]:
+    """Flatten nested mapping data into scalar key/value pairs for matching.
+
+    This allows resolver policies to match keys like customer_code that may live
+    in nested metadata payloads such as metadata.source_row.customer_code.
+    """
+
+    flattened: dict[str, Any] = {}
+    if not isinstance(value, dict):
+        return flattened
+
+    for raw_key, raw_val in value.items():
+        key = str(raw_key or "").strip().lower()
+        if not key:
+            continue
+
+        compound_key = f"{prefix}_{key}" if prefix else key
+        if isinstance(raw_val, dict):
+            flattened.update(_flatten_scalar_mapping(raw_val, prefix=compound_key))
+            continue
+
+        if isinstance(raw_val, (list, tuple, set)):
+            continue
+
+        flattened[compound_key] = raw_val
+
+        # Promote common source-row fields to top-level for resolver key matching.
+        if prefix == "source_row" and key not in flattened:
+            flattened[key] = raw_val
+
+    return flattened
+
+
 def _build_resolution_policy(payload: dict[str, Any]) -> dict[str, Any]:
     policy = payload.get("resolution_policy") if isinstance(payload.get("resolution_policy"), dict) else {}
     threshold = _to_float(policy.get("threshold"), 0.72)
@@ -789,7 +829,69 @@ def _build_resolution_policy(payload: dict[str, Any]) -> dict[str, Any]:
         "medium_match_score": _to_float(policy.get("medium_match_score"), 0.20),
         "strong_keys": _to_key_list(policy.get("strong_keys")),
         "medium_keys": _to_key_list(policy.get("medium_keys")),
+        "mandatory_existing_keys": _to_key_list(policy.get("mandatory_existing_keys")),
+        "auto_mandatory_existing_keys": _to_bool(policy.get("auto_mandatory_existing_keys", True)),
     }
+
+
+def _auto_mandatory_key_candidates(entity_attrs: dict[str, Any]) -> list[str]:
+    """Infer identifier-like keys that should require exact existing matches.
+
+    This keeps resolution generic for synchronized source tables by preventing
+    fuzzy name-only merges when stable identity keys are present in payloads.
+    """
+
+    if not isinstance(entity_attrs, dict):
+        return []
+
+    suffixes = (
+        "_pk",
+        "_id",
+        "_code",
+        "_no",
+        "_number",
+        "_ref",
+        "_uid",
+        "_key",
+    )
+    explicit = {
+        "registration_no",
+        "vat_no",
+        "uid_che",
+        "mwst_no",
+        "tax_no",
+        "eori_no",
+    }
+    excluded = {
+        "doc_id",
+        "entity_id",
+        "object_id",
+        "class_id",
+        "source_id",
+    }
+
+    out: list[str] = []
+    for raw_key in entity_attrs.keys():
+        key = str(raw_key or "").strip().lower()
+        if not key or key in excluded:
+            continue
+        if key in explicit or key.endswith(suffixes):
+            out.append(key)
+    return out
+
+
+def _effective_mandatory_existing_keys(entity_attrs: dict[str, Any], policy: dict[str, Any]) -> list[str]:
+    explicit = [
+        key for key in policy.get("mandatory_existing_keys", []) if str(key or "").strip()
+    ]
+    if not _to_bool(policy.get("auto_mandatory_existing_keys", True)):
+        return explicit
+
+    merged = list(explicit)
+    for key in _auto_mandatory_key_candidates(entity_attrs):
+        if key not in merged:
+            merged.append(key)
+    return merged
 
 
 def _resolve_candidate_attributes(connection: Any, candidate: dict[str, Any]) -> dict[str, Any]:
@@ -800,6 +902,9 @@ def _resolve_candidate_attributes(connection: Any, candidate: dict[str, Any]) ->
     )
     merged = dict(candidate.get("metadata") or {})
     merged.update(attrs)
+    flattened = _flatten_scalar_mapping(candidate.get("metadata"), prefix="")
+    for key, value in flattened.items():
+        merged.setdefault(key, value)
     return merged
 
 
@@ -973,6 +1078,10 @@ def db_resolve_entity(payload: Any) -> dict[str, Any] | bool:
     object_name = str(entity.get("object_name") or entity.get("name") or "").strip()
     class_name = str(entity.get("class_name") or "entity").strip().lower()
     attributes = entity.get("attributes") if isinstance(entity.get("attributes"), dict) else {}
+    if attributes:
+        flattened_attrs = _flatten_scalar_mapping(attributes, prefix="")
+        for key, value in flattened_attrs.items():
+            attributes.setdefault(key, value)
     if not object_name:
         raise ValueError("object_name is required for db_resolve_entity")
 
@@ -1183,10 +1292,28 @@ def db_resolve_entity(payload: Any) -> dict[str, Any] | bool:
 
         scored: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
         strong_matches: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+        mandatory_existing_keys = _effective_mandatory_existing_keys(attributes, policy)
+        present_mandatory_keys: list[str] = []
+        for key in mandatory_existing_keys:
+            entity_value = attributes.get(key)
+            if _normalize_value(key, entity_value):
+                present_mandatory_keys.append(key)
+        has_mandatory_key_match = False
+
         for candidate in candidates:
             candidate_attrs = _resolve_candidate_attributes(connection, candidate)
             score, explanation = _score_candidate(object_name, attributes, candidate, candidate_attrs, policy)
             scored.append((score, candidate, explanation))
+
+            if present_mandatory_keys:
+                matched_mandatory, _ = _extract_key_matches(
+                    entity_attrs=attributes,
+                    candidate_attrs=candidate_attrs,
+                    strong_keys=present_mandatory_keys,
+                    medium_keys=[],
+                )
+                if matched_mandatory:
+                    has_mandatory_key_match = True
 
             matched_strong, _ = _extract_key_matches(
                 entity_attrs=attributes,
@@ -1196,6 +1323,22 @@ def db_resolve_entity(payload: Any) -> dict[str, Any] | bool:
             )
             if matched_strong:
                 strong_matches.append((len(matched_strong), candidate, explanation))
+
+        # If a policy declares mandatory existing keys (e.g. customer_code),
+        # never bind to fuzzy/name-only candidates when these keys are present
+        # but do not match any existing entity.
+        if present_mandatory_keys and not has_mandatory_key_match:
+            return {
+                "resolved": False,
+                "decision": "create_new",
+                "stage": "mandatory_keys",
+                "reason": "no_mandatory_key_match",
+                "evidence": {
+                    "name": object_name,
+                    "mandatory_existing_keys": present_mandatory_keys,
+                },
+                "policy": policy,
+            }
 
         # Stage 1: deterministic resolution from strong identifiers.
         if len(strong_matches) == 1:

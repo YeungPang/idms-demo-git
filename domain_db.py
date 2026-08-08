@@ -208,6 +208,37 @@ CREATE INDEX IF NOT EXISTS idx_ledger_metadata_gin ON ledger_lines USING GIN(met
 """
 
 
+create_accounting_booking_review_table = """
+CREATE TABLE IF NOT EXISTS accounting_booking_review (
+    review_id BIGSERIAL PRIMARY KEY,
+    object_id BIGINT REFERENCES object_instance(object_id) ON DELETE CASCADE,
+    object_name VARCHAR(256),
+    class_name VARCHAR(128),
+    source_type VARCHAR(50),
+    source_document_id BIGINT REFERENCES document(doc_id) ON DELETE SET NULL,
+    legal_entity_ref VARCHAR(128),
+    transaction_id VARCHAR(64),
+    transaction_date DATE,
+    description TEXT,
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    preview_lines_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    validation_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','cancelled')),
+    posted_transaction_id VARCHAR(64),
+    review_note TEXT,
+    reviewed_by VARCHAR(128),
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_status ON accounting_booking_review(status);
+CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_object_id ON accounting_booking_review(object_id);
+CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_created_at ON accounting_booking_review(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_source_type ON accounting_booking_review(source_type);
+"""
+
+
 create_hr_employee_table = """
 CREATE TABLE IF NOT EXISTS hr_employee (
     hr_employee_id BIGSERIAL PRIMARY KEY,
@@ -452,6 +483,7 @@ def create_tables(connection: Any, recreate: bool = False) -> None:
         create_chart_of_accounts_table,
         create_transactions_table,
         create_ledger_lines_table,
+        create_accounting_booking_review_table,
         create_solf_attribute_proposals_table,
         create_solf_schema_promotion_batches_table,
         create_source_database_registry_table,
@@ -472,6 +504,7 @@ def create_tables(connection: Any, recreate: bool = False) -> None:
         "DROP TABLE IF EXISTS hr_department_master CASCADE;",
         "DROP TABLE IF EXISTS solf_attribute_proposals CASCADE;",
         "DROP TABLE IF EXISTS solf_schema_promotion_batches CASCADE;",
+        "DROP TABLE IF EXISTS accounting_booking_review CASCADE;",
         "DROP TABLE IF EXISTS ledger_lines CASCADE;",
         "DROP TABLE IF EXISTS transactions CASCADE;",
         "DROP TABLE IF EXISTS chart_of_accounts CASCADE;",
@@ -497,6 +530,12 @@ def create_tables(connection: Any, recreate: bool = False) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_tx_legal_entity_ref ON transactions(legal_entity_ref);",
                 "ALTER TABLE IF EXISTS ledger_lines ADD COLUMN IF NOT EXISTS legal_entity_ref VARCHAR(128);",
                 "CREATE INDEX IF NOT EXISTS idx_ledger_entity_ref ON ledger_lines(legal_entity_ref);",
+                "ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS posted_transaction_id VARCHAR(64);",
+                "ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS review_note TEXT;",
+                "ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR(128);",
+                "ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;",
+                "CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_status ON accounting_booking_review(status);",
+                "CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_object_id ON accounting_booking_review(object_id);",
             ]
             for sql in migration_statements:
                 cursor.execute(sql)
@@ -2534,7 +2573,7 @@ def _build_transaction_id(attributes: dict[str, Any], payload: dict[str, Any]) -
     return f"tx-{uuid.uuid4().hex[:20]}"
 
 
-def upsert_transaction_and_lines(
+def _prepare_accounting_transaction_context(
     connection: Any,
     payload: dict[str, Any],
     object_row: dict[str, Any],
@@ -2555,14 +2594,6 @@ def upsert_transaction_and_lines(
         connection=connection,
         legal_entity_ref=legal_entity_ref,
     )
-    if not validation["valid"]:
-        return {
-            "ok": False,
-            "validation": validation,
-            "transaction_id": None,
-            "ledger_lines_written": 0,
-        }
-
     transaction_id = _build_transaction_id(attributes, payload)
     transaction_date = (
         attributes.get("transaction_date")
@@ -2574,6 +2605,51 @@ def upsert_transaction_and_lines(
     description = str(attributes.get("description") or payload.get("object_name") or "Accounting transaction")
     receipt_archive_url = attributes.get("receipt_archive_url")
     object_id = object_row.get("object_id")
+
+    return {
+        "doc_id": doc_id,
+        "attributes": attributes,
+        "ledger_lines": ledger_lines,
+        "validation": validation,
+        "legal_entity_ref": legal_entity_ref,
+        "transaction_id": transaction_id,
+        "transaction_date": transaction_date,
+        "source_type": source_type,
+        "description": description,
+        "receipt_archive_url": receipt_archive_url,
+        "object_id": object_id,
+    }
+
+
+def upsert_transaction_and_lines(
+    connection: Any,
+    payload: dict[str, Any],
+    object_row: dict[str, Any],
+) -> dict[str, Any]:
+    context = _prepare_accounting_transaction_context(
+        connection=connection,
+        payload=payload,
+        object_row=object_row,
+    )
+    attributes = context["attributes"]
+    doc_id = context["doc_id"]
+    ledger_lines = context["ledger_lines"]
+    legal_entity_ref = context["legal_entity_ref"]
+    validation = context["validation"]
+    if not validation["valid"]:
+        return {
+            "ok": False,
+            "validation": validation,
+            "transaction_id": None,
+            "ledger_lines_written": 0,
+        }
+
+    transaction_id = context["transaction_id"]
+    transaction_date = context["transaction_date"]
+    source_type = context["source_type"]
+    description = context["description"]
+    receipt_archive_url = context["receipt_archive_url"]
+    object_id = context["object_id"]
 
     tx_sql = """
     INSERT INTO transactions (
@@ -2691,6 +2767,340 @@ def upsert_transaction_and_lines(
         "transaction_id": transaction_id,
         "ledger_lines_written": len(ledger_lines),
     }
+
+
+def enqueue_accounting_booking_review(
+    connection: Any,
+    payload: dict[str, Any],
+    object_row: dict[str, Any],
+) -> dict[str, Any]:
+    _ensure_accounting_booking_review_table(connection)
+    context = _prepare_accounting_transaction_context(
+        connection=connection,
+        payload=payload,
+        object_row=object_row,
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO accounting_booking_review (
+                object_id,
+                object_name,
+                class_name,
+                source_type,
+                source_document_id,
+                legal_entity_ref,
+                transaction_id,
+                transaction_date,
+                description,
+                payload_json,
+                preview_lines_json,
+                validation_json,
+                status,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, 'pending', NOW())
+            RETURNING review_id
+            """,
+            (
+                context.get("object_id"),
+                object_row.get("object_name"),
+                object_row.get("class_name"),
+                context.get("source_type"),
+                context.get("doc_id"),
+                context.get("legal_entity_ref"),
+                context.get("transaction_id"),
+                context.get("transaction_date"),
+                context.get("description"),
+                json.dumps(payload, ensure_ascii=False, default=str),
+                json.dumps(context.get("ledger_lines") or [], ensure_ascii=False, default=str),
+                json.dumps(context.get("validation") or {}, ensure_ascii=False, default=str),
+            ),
+        )
+        row = cursor.fetchone()
+    connection.commit()
+    review_id = int(row[0]) if row else 0
+    return {
+        "review_id": review_id,
+        "status": "pending",
+        "validation": context.get("validation") or {},
+        "transaction_id": context.get("transaction_id"),
+        "transaction_date": context.get("transaction_date"),
+        "source_type": context.get("source_type"),
+        "legal_entity_ref": context.get("legal_entity_ref"),
+        "description": context.get("description"),
+        "preview_lines": context.get("ledger_lines") or [],
+    }
+
+
+def list_accounting_booking_reviews(
+    connection: Any,
+    status: str | None = "pending",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    _ensure_accounting_booking_review_table(connection)
+    limit = max(1, min(int(limit or 100), 1000))
+    offset = max(0, int(offset or 0))
+    status_norm = str(status or "").strip().lower()
+    params: list[Any] = []
+    where_sql = ""
+    if status_norm:
+        where_sql = "WHERE status = %s"
+        params.append(status_norm)
+    sql = f"""
+    SELECT
+        review_id,
+        object_id,
+        object_name,
+        class_name,
+        source_type,
+        source_document_id,
+        legal_entity_ref,
+        transaction_id,
+        transaction_date,
+        description,
+        status,
+        validation_json,
+        reviewed_by,
+        reviewed_at,
+        created_at,
+        updated_at
+    FROM accounting_booking_review
+    {where_sql}
+    ORDER BY review_id DESC
+    LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+    with connection.cursor() as cursor:
+        cursor.execute(sql, tuple(params))
+        rows = cursor.fetchall() or []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "review_id": int(row[0]),
+                "object_id": int(row[1]) if row[1] is not None else None,
+                "object_name": row[2],
+                "class_name": row[3],
+                "source_type": row[4],
+                "source_document_id": int(row[5]) if row[5] is not None else None,
+                "legal_entity_ref": row[6],
+                "transaction_id": row[7],
+                "transaction_date": str(row[8]) if row[8] is not None else None,
+                "description": row[9],
+                "status": row[10],
+                "validation": row[11] if isinstance(row[11], dict) else {},
+                "reviewed_by": row[12],
+                "reviewed_at": str(row[13]) if row[13] is not None else None,
+                "created_at": str(row[14]) if row[14] is not None else None,
+                "updated_at": str(row[15]) if row[15] is not None else None,
+            }
+        )
+    return out
+
+
+def get_accounting_booking_review(connection: Any, review_id: int) -> dict[str, Any] | None:
+    _ensure_accounting_booking_review_table(connection)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                review_id,
+                object_id,
+                object_name,
+                class_name,
+                source_type,
+                source_document_id,
+                legal_entity_ref,
+                transaction_id,
+                transaction_date,
+                description,
+                payload_json,
+                preview_lines_json,
+                validation_json,
+                status,
+                posted_transaction_id,
+                review_note,
+                reviewed_by,
+                reviewed_at,
+                created_at,
+                updated_at
+            FROM accounting_booking_review
+            WHERE review_id = %s
+            LIMIT 1
+            """,
+            (int(review_id),),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "review_id": int(row[0]),
+        "object_id": int(row[1]) if row[1] is not None else None,
+        "object_name": row[2],
+        "class_name": row[3],
+        "source_type": row[4],
+        "source_document_id": int(row[5]) if row[5] is not None else None,
+        "legal_entity_ref": row[6],
+        "transaction_id": row[7],
+        "transaction_date": str(row[8]) if row[8] is not None else None,
+        "description": row[9],
+        "payload": row[10] if isinstance(row[10], dict) else {},
+        "preview_lines": row[11] if isinstance(row[11], list) else [],
+        "validation": row[12] if isinstance(row[12], dict) else {},
+        "status": row[13],
+        "posted_transaction_id": row[14],
+        "review_note": row[15],
+        "reviewed_by": row[16],
+        "reviewed_at": str(row[17]) if row[17] is not None else None,
+        "created_at": str(row[18]) if row[18] is not None else None,
+        "updated_at": str(row[19]) if row[19] is not None else None,
+    }
+
+
+def approve_accounting_booking_review(
+    connection: Any,
+    review_id: int,
+    booking_updates: dict[str, Any] | None = None,
+    reviewed_by: str | None = None,
+    review_note: str | None = None,
+) -> dict[str, Any]:
+    review = get_accounting_booking_review(connection, review_id)
+    if review is None:
+        return {"ok": False, "reason": "not_found"}
+    if str(review.get("status") or "").lower() != "pending":
+        return {"ok": False, "reason": "not_pending", "status": review.get("status")}
+
+    payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+    payload = dict(payload)
+    attributes = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
+    attributes = dict(attributes)
+    updates = booking_updates if isinstance(booking_updates, dict) else {}
+
+    for field in ("transaction_id", "transaction_date", "description", "source_type", "legal_entity_ref", "receipt_archive_url"):
+        if field in updates:
+            attributes[field] = updates.get(field)
+    if "ledger_lines" in updates and isinstance(updates.get("ledger_lines"), list):
+        attributes["ledger_lines"] = updates.get("ledger_lines")
+
+    payload["attributes"] = attributes
+
+    object_row = {
+        "object_id": review.get("object_id"),
+        "object_name": review.get("object_name"),
+        "class_name": review.get("class_name") or "accounting_transaction",
+    }
+    post_result = upsert_transaction_and_lines(connection=connection, payload=payload, object_row=object_row)
+    if not bool(post_result.get("ok")):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE accounting_booking_review
+                SET payload_json = %s::jsonb,
+                    preview_lines_json = %s::jsonb,
+                    validation_json = %s::jsonb,
+                    reviewed_by = %s,
+                    review_note = %s,
+                    reviewed_at = NOW(),
+                    updated_at = NOW()
+                WHERE review_id = %s
+                """,
+                (
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    json.dumps(attributes.get("ledger_lines") or [], ensure_ascii=False, default=str),
+                    json.dumps(post_result.get("validation") or {}, ensure_ascii=False, default=str),
+                    str(reviewed_by or "api:user").strip() or "api:user",
+                    str(review_note or "").strip() or None,
+                    int(review_id),
+                ),
+            )
+        connection.commit()
+        return {
+            "ok": False,
+            "reason": "validation_failed",
+            "validation": post_result.get("validation") or {},
+            "status": "pending",
+        }
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE accounting_booking_review
+            SET status = 'approved',
+                posted_transaction_id = %s,
+                payload_json = %s::jsonb,
+                preview_lines_json = %s::jsonb,
+                validation_json = %s::jsonb,
+                reviewed_by = %s,
+                review_note = %s,
+                reviewed_at = NOW(),
+                updated_at = NOW()
+            WHERE review_id = %s
+            """,
+            (
+                post_result.get("transaction_id"),
+                json.dumps(payload, ensure_ascii=False, default=str),
+                json.dumps(attributes.get("ledger_lines") or [], ensure_ascii=False, default=str),
+                json.dumps(post_result.get("validation") or {}, ensure_ascii=False, default=str),
+                str(reviewed_by or "api:user").strip() or "api:user",
+                str(review_note or "").strip() or None,
+                int(review_id),
+            ),
+        )
+    connection.commit()
+    return {
+        "ok": True,
+        "status": "approved",
+        "transaction_id": post_result.get("transaction_id"),
+        "ledger_lines_written": int(post_result.get("ledger_lines_written") or 0),
+        "validation": post_result.get("validation") or {},
+    }
+
+
+def cancel_accounting_booking_review(
+    connection: Any,
+    review_id: int,
+    reviewed_by: str | None = None,
+    review_note: str | None = None,
+) -> dict[str, Any]:
+    review = get_accounting_booking_review(connection, review_id)
+    if review is None:
+        return {"ok": False, "reason": "not_found"}
+    if str(review.get("status") or "").lower() != "pending":
+        return {"ok": False, "reason": "not_pending", "status": review.get("status")}
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE accounting_booking_review
+            SET status = 'cancelled',
+                reviewed_by = %s,
+                review_note = %s,
+                reviewed_at = NOW(),
+                updated_at = NOW()
+            WHERE review_id = %s
+            """,
+            (
+                str(reviewed_by or "api:user").strip() or "api:user",
+                str(review_note or "").strip() or None,
+                int(review_id),
+            ),
+        )
+    connection.commit()
+    return {"ok": True, "status": "cancelled"}
+
+
+def _ensure_accounting_booking_review_table(connection: Any) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(create_accounting_booking_review_table)
+        cursor.execute("ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS posted_transaction_id VARCHAR(64);")
+        cursor.execute("ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS review_note TEXT;")
+        cursor.execute("ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR(128);")
+        cursor.execute("ALTER TABLE IF EXISTS accounting_booking_review ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_status ON accounting_booking_review(status);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounting_booking_review_object_id ON accounting_booking_review(object_id);")
+    connection.commit()
 
 
 def delete_transaction_by_object_id(connection: Any, object_id: int) -> int:
