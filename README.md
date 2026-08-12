@@ -204,7 +204,14 @@ The repository now includes a FastAPI service for IDMS ingestion, chat, interact
 Start the API server:
 
 ```bash
-uvicorn idms_api:app --host 0.0.0.0 --port 8000 --reload
+python idms_api.py --host 0.0.0.0 --port 8000 --reload
+```
+
+For immediate stop behavior during long ingestion runs, keep `--graceful-timeout 0` (default in `idms_api.py`).
+If needed, you can set it explicitly:
+
+```bash
+python idms_api.py --host 0.0.0.0 --port 8000 --reload --graceful-timeout 0
 ```
 
 Open the test web app:

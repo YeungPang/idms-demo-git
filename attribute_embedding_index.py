@@ -217,10 +217,51 @@ class AttributeEmbeddingIndex:
         self._vector_search_disable_reason: str = ""
         self._vector_search_disable_logged: bool = False
         self._embedding_dimension: int | None = None
+        self._last_ingest_upsert_signature: str = ""
         if self._seed_aliases_enabled():
             self._register_terms_for_lexical_match(self.KIND_ATTRIBUTE, self.CANONICAL_ATTRIBUTES)
         self._index_built = False
         self.refresh_ready_state()
+
+    def build_ingest_upsert_signature(
+        self,
+        *,
+        dynamic_attribute_names: list[str] | None = None,
+        relationship_names: list[str] | None = None,
+    ) -> str:
+        dynamic_terms = sorted(
+            {
+                str(name or "").strip().lower()
+                for name in (dynamic_attribute_names or [])
+                if str(name or "").strip()
+            }
+        )
+        relationship_terms = sorted(
+            {
+                str(name or "").strip().lower()
+                for name in (relationship_names or [])
+                if str(name or "").strip()
+            }
+        )
+        semantic_terms = self._fetch_semantic_attribute_terms()
+        semantic_rows = [
+            (canonical, tuple(sorted(str(variant).strip() for variant in variants if str(variant).strip())))
+            for canonical, variants in sorted(semantic_terms.items())
+        ]
+        payload = {
+            "embedding_model": self.embedding_model,
+            "canonical_attribute_count": len(self.CANONICAL_ATTRIBUTES),
+            "dynamic_attribute_names": dynamic_terms,
+            "relationship_names": relationship_terms,
+            "semantic_terms": semantic_rows,
+        }
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def should_skip_ingest_upsert(self, signature: str) -> bool:
+        return bool(signature) and self._index_built and signature == self._last_ingest_upsert_signature
+
+    def mark_ingest_upsert_signature(self, signature: str) -> None:
+        self._last_ingest_upsert_signature = str(signature or "").strip()
 
     def _disable_vector_search(self, reason: str) -> None:
         self._vector_search_disabled = True

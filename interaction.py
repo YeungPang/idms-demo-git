@@ -3479,62 +3479,126 @@ class IDMSInteractionTools:
 
         signal = self._extract_clarification_signal(refined_question, query_result)
         if signal and selected_candidate and str(signal.get("reason_code") or "") == "ambiguous_entity":
-            forced_question = (
-                f"{original_query}\n"
-                f"Entity disambiguation decision: '{selected_candidate}'. "
-                f"Restrict answer to this exact entity only."
-            ).strip()
-            forced_result = self.autonomous_query(forced_question, max_steps=3, record_history=False)
-            forced_signal = self._extract_clarification_signal(forced_question, forced_result)
-            if not forced_signal:
-                query_result = forced_result
-                signal = None
-
-        if signal:
-            question = self._build_generic_clarification_question(
-                str(signal.get("reason_code") or "ambiguous_value"),
-                list(signal.get("candidates") or []),
+            # Consolidate after one clarification pass: avoid issuing a second
+            # autonomous query that can create repeated-question loops.
+            merged_candidates = self._normalize_candidate_snapshot(
+                list(signal.get("candidates") or []) + list(candidate_snapshot or []),
+                limit=8,
             )
-            if selected_candidate and str(signal.get("reason_code") or "") == "ambiguous_entity":
-                question = (
-                    f"I received your selection '{selected_candidate}', but I still found ambiguity. "
-                    "Please choose one exact candidate from the latest list and, if available, include a document/file hint."
+            resolved_answer = str(query_result.get("answer") or "").strip()
+            if not resolved_answer:
+                resolved_answer = (
+                    "[source: clarification_consolidated] "
+                    "I applied your selected candidate, but remaining ambiguity still exists in retrieval evidence. "
+                    "Returning the best consolidated result from this clarification turn."
                 )
-            self._update_clarification_prompt(
-                int(thread_id),
-                reason_code=str(signal.get("reason_code") or "ambiguous_value"),
-                clarification_question=question,
-                expected_input_type=str(signal.get("expected_input_type") or "free_text"),
-                ambiguity_summary=signal.get("ambiguity_summary") if isinstance(signal.get("ambiguity_summary"), dict) else {},
-                candidate_snapshot=list(signal.get("candidates") or []),
-                provenance_snapshot=list(signal.get("provenance_snapshot") or []),
-                metadata={
-                    "last_query_answer_source": str(query_result.get("answer_source") or ""),
-                    "last_question": refined_question,
-                    "selected_candidate": selected_candidate,
-                },
-            )
+            else:
+                resolved_answer = f"[source: clarification_consolidated] {resolved_answer}".strip()
+
+            if merged_candidates:
+                preview = ", ".join(
+                    str(item.get("name") or item.get("value") or item.get("entity_name") or "").strip()
+                    for item in merged_candidates
+                    if isinstance(item, dict)
+                )
+                if preview:
+                    resolved_answer = (
+                        f"{resolved_answer}\n\n"
+                        f"Consolidated candidates considered: {preview}."
+                    )
+
+            self._set_clarification_thread_status(int(thread_id), "resolved")
             self._append_clarification_turn(
                 thread_id=int(thread_id),
                 role="assistant",
-                message_text=question,
-                source_type="clarification_prompt",
-                answer_source="pending_clarification",
-                confidence=float(signal.get("confidence") or 0.0) if signal.get("confidence") is not None else None,
-                ambiguity_flag=True,
-                ambiguity_payload=signal.get("ambiguity_summary") if isinstance(signal.get("ambiguity_summary"), dict) else {},
-                candidate_snapshot=list(signal.get("candidates") or []),
+                message_text=resolved_answer,
+                source_type="clarification_resolution",
+                answer_source="clarification_consolidated",
+                confidence=None,
+                ambiguity_flag=False,
+                ambiguity_payload={
+                    "reason_code": str(signal.get("reason_code") or "ambiguous_entity"),
+                    "selected_candidate": selected_candidate,
+                },
+                candidate_snapshot=merged_candidates,
+            )
+
+            return {
+                "status": "resolved",
+                "thread_id": int(thread_id),
+                "answer": resolved_answer,
+                "answer_source": "clarification_consolidated",
+                "grounding": {
+                    "query_result": query_result,
+                    "ambiguity_summary": signal.get("ambiguity_summary") if isinstance(signal.get("ambiguity_summary"), dict) else {},
+                    "selected_candidate": selected_candidate,
+                    "candidates": merged_candidates,
+                },
+            }
+
+        if signal:
+            merged_candidates = self._normalize_candidate_snapshot(
+                list(signal.get("candidates") or []) + list(candidate_snapshot or []),
+                limit=8,
+            )
+            resolved_answer = str(query_result.get("answer") or "").strip()
+
+            if not resolved_answer:
+                if selected_candidate:
+                    resolved_answer = (
+                        "[source: clarification_consolidated] "
+                        "I applied your selected candidate and completed this request with the best consolidated result available."
+                    )
+                else:
+                    resolved_answer = (
+                        "[source: clarification_consolidated] "
+                        "No explicit candidate selection was detected, so I consolidated the current clarification response "
+                        "and completed this request to avoid repeated question loops."
+                    )
+            else:
+                resolved_answer = f"[source: clarification_consolidated] {resolved_answer}".strip()
+
+            if merged_candidates:
+                preview = ", ".join(
+                    str(item.get("name") or item.get("value") or item.get("entity_name") or "").strip()
+                    for item in merged_candidates
+                    if isinstance(item, dict)
+                )
+                if preview:
+                    resolved_answer = (
+                        f"{resolved_answer}\n\n"
+                        f"Consolidated candidates considered: {preview}."
+                    )
+
+            self._set_clarification_thread_status(int(thread_id), "resolved")
+            self._append_clarification_turn(
+                thread_id=int(thread_id),
+                role="assistant",
+                message_text=resolved_answer,
+                source_type="clarification_resolution",
+                answer_source="clarification_consolidated",
+                confidence=None,
+                ambiguity_flag=False,
+                ambiguity_payload={
+                    "reason_code": str(signal.get("reason_code") or "ambiguous_value"),
+                    "selected_candidate": selected_candidate,
+                    "auto_consolidated": True,
+                },
+                candidate_snapshot=merged_candidates,
                 provenance_snapshot=list(signal.get("provenance_snapshot") or []),
             )
             return {
-                "status": "pending_clarification",
+                "status": "resolved",
                 "thread_id": int(thread_id),
-                "clarification_question": question,
-                "reason_code": str(signal.get("reason_code") or "ambiguous_value"),
-                "expected_input_type": str(signal.get("expected_input_type") or "free_text"),
-                "candidates": list(signal.get("candidates") or []),
-                "provenance_snapshot": list(signal.get("provenance_snapshot") or []),
-                "grounding": query_result,
+                "answer": resolved_answer,
+                "answer_source": "clarification_consolidated",
+                "grounding": {
+                    "query_result": query_result,
+                    "ambiguity_summary": signal.get("ambiguity_summary") if isinstance(signal.get("ambiguity_summary"), dict) else {},
+                    "selected_candidate": selected_candidate,
+                    "candidates": merged_candidates,
+                    "auto_consolidated": True,
+                },
             }
 
         final_answer = str(query_result.get("answer") or "").strip()

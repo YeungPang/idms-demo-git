@@ -211,23 +211,49 @@ def _build_attribute_embedding_index_if_available(skip_upsert: bool = False) -> 
     if AttributeEmbeddingIndex is None:
         return {"built": False, "skipped": True, "reason": "attribute_embedding_index_unavailable"}
     try:
-        idx = AttributeEmbeddingIndex()
-        upserted_attributes = int(idx.upsert_default_attributes(recreate_collection=False))
-        upserted_dynamic_attributes = int(idx.upsert_dynamic_attribute_terms())
-
         relationship_names: list[str] = []
+        dynamic_attribute_names: list[str] = []
+        idx = AttributeEmbeddingIndex.get_shared_instance()
+
         try:
             connection = object_db.get_connection()
             try:
+                dynamic_attribute_names = [
+                    str(name or "").strip()
+                    for name in (idx._fetch_distinct_attribute_types() or [])
+                    if str(name or "").strip()
+                ]
                 relationship_rows = object_db.get_relationships(connection, limit=5000)
                 relationship_names = sorted({str(row.get("relationship_name") or "").strip() for row in relationship_rows if str(row.get("relationship_name") or "").strip()})
             finally:
                 connection.close()
         except Exception:
+            dynamic_attribute_names = []
             relationship_names = []
+
+        signature = idx.build_ingest_upsert_signature(
+            dynamic_attribute_names=dynamic_attribute_names,
+            relationship_names=relationship_names,
+        )
+        if idx.should_skip_ingest_upsert(signature):
+            return {
+                "built": False,
+                "skipped": True,
+                "reason": "attribute_embedding_upsert_unchanged",
+                "mode": "incremental",
+                "upserted": 0,
+                "upserted_attributes": 0,
+                "upserted_dynamic_attributes": 0,
+                "upserted_relationships": 0,
+            }
+
+        upserted_attributes = int(idx.upsert_default_attributes(recreate_collection=False))
+        upserted_dynamic_attributes = int(idx.upsert_dynamic_attribute_terms(dynamic_attribute_names))
 
         upserted_relationships = int(idx.upsert_relationship_terms(relationship_names)) if relationship_names else 0
         upserted = upserted_attributes + upserted_dynamic_attributes + upserted_relationships
+        if upserted > 0 or idx.refresh_ready_state():
+            idx.mark_ingest_upsert_signature(signature)
         return {
             "built": upserted > 0,
             "skipped": False,
@@ -1559,13 +1585,36 @@ def chunk_markdown(text: str, chunk_size: int = 800, overlap: int = 100) -> list
 
 def embed_text_chunks(client: Any, chunks: list[str]) -> list[list[float]]:
     """Generate dense embeddings for text chunks using small embedding model."""
+    if not chunks:
+        return []
+
+    batch_size = max(1, int(os.getenv("IDMS_INGEST_EMBEDDING_BATCH_SIZE", "32")))
     embeddings: list[list[float]] = []
-    for chunk in chunks:
-        response = client.models.embed_content(
-            model=QDRANT_EMBEDDING_MODEL,
-            contents=chunk,
-        )
-        embeddings.append(list(response.embeddings[0].values))
+    for start in range(0, len(chunks), batch_size):
+        batch = [str(chunk or "") for chunk in chunks[start : start + batch_size] if str(chunk or "").strip()]
+        if not batch:
+            continue
+        try:
+            response = client.models.embed_content(
+                model=QDRANT_EMBEDDING_MODEL,
+                contents=batch,
+            )
+            batch_embeddings = list(getattr(response, "embeddings", []) or [])
+            if len(batch_embeddings) != len(batch):
+                raise RuntimeError(
+                    f"Embedding batch size mismatch: expected {len(batch)}, got {len(batch_embeddings)}"
+                )
+            for embedding_obj in batch_embeddings:
+                embeddings.append(list(getattr(embedding_obj, "values", []) or []))
+        except Exception:
+            # Fall back to single-text calls for this batch so one malformed response
+            # does not lose the rest of the document's embeddings.
+            for chunk in batch:
+                response = client.models.embed_content(
+                    model=QDRANT_EMBEDDING_MODEL,
+                    contents=chunk,
+                )
+                embeddings.append(list(response.embeddings[0].values))
     return embeddings
 
 
@@ -7216,6 +7265,8 @@ def run_ingest(
     # column-to-attribute alignment than reading the raw PDF via GCS Part.
     extraction_source = source_path_or_uri
     extraction_source_generated_markdown = False
+    preextract_generated_markdown_text: str | None = None
+    preextract_generated_markdown_path: Path | None = None
     if prefer_markdown_input:
         existing_markdown_file = Path(existing_markdown_path) if existing_markdown_path else None
         if existing_markdown_file and existing_markdown_file.exists():
@@ -7259,6 +7310,8 @@ def run_ingest(
                         generated_md_path.write_text(generated_md, encoding="utf-8")
                         extraction_source = str(generated_md_path)
                         extraction_source_generated_markdown = True
+                        preextract_generated_markdown_text = generated_md
+                        preextract_generated_markdown_path = generated_md_path
                         LOGGER.info(
                             "prefer_markdown_input: generated markdown for extraction run_id=%s path=%s",
                             run_id,
@@ -7709,6 +7762,17 @@ def run_ingest(
             _record_step("markdown_cache_reuse", cache_path=str(markdown_cache_path), skipped_generation=True)
         else:
             _record_step("markdown_generation", status="skipped", reason="skip_markdown_generation_enabled")
+    elif preextract_generated_markdown_text is not None:
+        markdown_text = preextract_generated_markdown_text
+        markdown_cache_path = _markdown_cache_path_from_content(markdown_text, ingested)
+        markdown_reused = True
+        _record_step(
+            "markdown_generation",
+            status="skipped",
+            reason="reuse_preextract_markdown",
+            cache_path=str(preextract_generated_markdown_path) if preextract_generated_markdown_path else None,
+            canonical_cache_path=str(markdown_cache_path),
+        )
     elif str(extraction_source).lower().endswith(".md") and not extraction_source_generated_markdown:
         extraction_md_path = Path(str(extraction_source))
         if extraction_md_path.exists():
@@ -8339,18 +8403,48 @@ def run_ingest(
         discovery_index=discovery_result,
     )
 
-    person_similarity_review = _build_person_similarity_review(
-        ingested=ingested,
-        db_summary=db_summary if isinstance(db_summary, dict) else {},
+    persistence_action = str((db_summary or {}).get("document_persistence_action") or "").strip().lower()
+    persistence_match = (db_summary or {}).get("document_persistence_match") if isinstance((db_summary or {}).get("document_persistence_match"), dict) else {}
+    persistence_matched_by = str((persistence_match or {}).get("matched_by") or "").strip().lower()
+    skip_person_similarity_review = bool(
+        persistence_action == "update_existing"
+        and persistence_matched_by in {"source_identity", "doc_path"}
     )
-    if bool(person_similarity_review.get("attention_required")):
+
+    if skip_person_similarity_review:
+        person_similarity_review = {
+            "attention_required": False,
+            "has_potential_duplicates": False,
+            "alert_count": 0,
+            "headline": "",
+            "alerts": [],
+            "recommended_actions": [],
+            "skipped": True,
+            "skip_reason": "update_existing_same_source_identity_or_path",
+            "persistence_action": persistence_action,
+            "matched_by": persistence_matched_by,
+        }
         _record_step(
             "person_similarity_review",
-            status="attention_required",
-            alert_count=int(person_similarity_review.get("alert_count") or 0),
+            status="skipped",
+            reason="update_existing_same_source_identity_or_path",
+            persistence_action=persistence_action,
+            matched_by=persistence_matched_by,
+            alert_count=0,
         )
     else:
-        _record_step("person_similarity_review", status="ok", alert_count=0)
+        person_similarity_review = _build_person_similarity_review(
+            ingested=ingested,
+            db_summary=db_summary if isinstance(db_summary, dict) else {},
+        )
+        if bool(person_similarity_review.get("attention_required")):
+            _record_step(
+                "person_similarity_review",
+                status="attention_required",
+                alert_count=int(person_similarity_review.get("alert_count") or 0),
+            )
+        else:
+            _record_step("person_similarity_review", status="ok", alert_count=0)
 
     metadata_for_upsert = ingested_document.get("metadata") if isinstance(ingested_document.get("metadata"), dict) else {}
     note_source = str(metadata_for_upsert.get("note_source") or "").strip().lower()

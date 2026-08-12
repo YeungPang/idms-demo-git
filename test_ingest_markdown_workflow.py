@@ -288,6 +288,7 @@ auf:
         persist_markdown: bool,
         skip_markdown_generation: bool,
         direct_markdown_text: str | None = None,
+        document_persistence_mode_override: dict | None = None,
     ) -> tuple[dict, MagicMock]:
         with ExitStack() as stack:
             original_path_exists = ingest.Path.exists
@@ -341,6 +342,14 @@ auf:
                 patch.object(ingest, "insert_document_record", return_value=db_summary["doc_id"])
             )
             stack.enter_context(patch.object(ingest, "persist_solf_objects", return_value=db_summary))
+            if document_persistence_mode_override is not None:
+                stack.enter_context(
+                    patch.object(
+                        ingest,
+                        "detect_document_persistence_mode",
+                        return_value=document_persistence_mode_override,
+                    )
+                )
             stack.enter_context(patch.object(ingest, "infer_source_mime_type", return_value="application/pdf"))
             stack.enter_context(patch.object(ingest, "should_use_discovery_for_source", return_value=False))
             stack.enter_context(
@@ -416,13 +425,10 @@ auf:
                 skip_markdown_generation=False,
             )
 
-        self.assertFalse(result["markdown_reused"])
-        self.assertEqual(result["markdown"], "# markdown")
+        self.assertTrue(result["markdown_reused"])
+        self.assertEqual(result["markdown"], "# generated markdown")
 
-        markdown_loader.assert_called_once()
-        loader_kwargs = markdown_loader.call_args.kwargs
-        self.assertFalse(loader_kwargs["reuse_markdown"])
-        self.assertFalse(loader_kwargs["persist_markdown"])
+        markdown_loader.assert_not_called()
 
         insert_document_mock.assert_called_once_with(
             unittest.mock.ANY,
@@ -440,6 +446,70 @@ auf:
         self.assertIn("apply_domain_action_policy", trace_steps)
         self.assertIn("markdown_generation", trace_steps)
         self.assertIn("persist_objects", trace_steps)
+
+        markdown_steps = [
+            entry for entry in result.get("workflow_trace", []) if entry.get("step") == "markdown_generation"
+        ]
+        self.assertTrue(markdown_steps)
+        self.assertEqual(markdown_steps[-1].get("reason"), "reuse_preextract_markdown")
+
+    def test_run_ingest_skips_person_similarity_review_for_update_existing(self):
+        routed = {
+            "document_type": "receipt",
+            "language": "en",
+            "entity_type_hints": [],
+            "semantic_notes": [],
+        }
+        extracted = {"document": {"doc_type": "receipt"}, "entities": [], "relationships": []}
+        ingested = {
+            "document": {"doc_key": "r-3", "doc_type": "receipt", "metadata": {}, "keywords": []},
+            "document_effective_date": "2026-05-01",
+            "document_recorded_date": "2026-05-02",
+            "solf_entities": [],
+            "solf_relationships": [],
+        }
+        db_summary = {
+            "doc_id": 5,
+            "objects_upserted": 0,
+            "relationships_upserted": 0,
+            "ambiguities_queued": 0,
+            "document_persistence_action": "update_existing",
+            "document_persistence_match": {"matched_by": "source_identity"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_cache_path = Path(temp_dir) / "receipt-update-existing.md"
+            with patch.object(ingest, "_build_person_similarity_review") as review_builder:
+                result, _markdown_loader, _insert_document_mock = self._run_ingest_with_common_patches(
+                    fake_cache_path=fake_cache_path,
+                    source_path_or_uri="receipt.pdf",
+                    routed=routed,
+                    extracted=extracted,
+                    ingested=ingested,
+                    db_summary=db_summary,
+                    reuse_markdown=False,
+                    persist_markdown=False,
+                    skip_markdown_generation=False,
+                    document_persistence_mode_override={
+                        "persistence_action": "update_existing",
+                        "matched_by": "source_identity",
+                        "doc_id": 5,
+                        "doc_key": "r-3",
+                        "doc_name": "receipt.pdf",
+                        "match_value": "receipt.pdf",
+                    },
+                )
+
+        review_builder.assert_not_called()
+        review = result.get("person_similarity_review") if isinstance(result.get("person_similarity_review"), dict) else {}
+        self.assertTrue(review.get("skipped"))
+        self.assertEqual(review.get("skip_reason"), "update_existing_same_source_identity_or_path")
+
+        similarity_steps = [
+            entry for entry in result.get("workflow_trace", []) if entry.get("step") == "person_similarity_review"
+        ]
+        self.assertTrue(similarity_steps)
+        self.assertEqual(similarity_steps[-1].get("status"), "skipped")
 
     def test_run_ingest_skip_markdown_generation_records_skipped_step(self):
         routed = {

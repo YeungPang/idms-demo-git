@@ -2278,6 +2278,41 @@
       return review;
     }
 
+    function requestSelectionFromIngestionReview(review) {
+      const safeReview = review && typeof review === "object" ? review : null;
+      if (!safeReview) return false;
+
+      const alerts = Array.isArray(safeReview.alerts) ? safeReview.alerts : [];
+      const actionable = alerts.find((alert) => Array.isArray(alert?.candidates) && alert.candidates.length > 1);
+      if (!actionable) return false;
+
+      const entityHint = String(actionable?.entity_name || "").trim();
+      const candidates = Array.isArray(actionable?.candidates) ? actionable.candidates : [];
+      const context = {
+        source: "ingestion_person_similarity_review",
+        entity_hint: entityHint,
+        candidates,
+      };
+
+      syncEntityWorkbenchFromAmbiguity(context);
+      renderEntityCandidateTable(candidates);
+
+      const entityStatus = document.getElementById("entityResolveStatus");
+      const entityOut = document.getElementById("entityResolveOut");
+      if (entityOut) {
+        entityOut.textContent = JSON.stringify(context, null, 2);
+      }
+      if (entityStatus) {
+        showStatus(entityStatus, false, "Selection required: ingestion detected multiple same-person candidates. Choose candidate IDs in Entity Resolution before continuing.");
+      }
+
+      const target = document.getElementById("entityResolveName") || document.getElementById("entityResolveTableWrap");
+      if (target && typeof target.scrollIntoView === "function") {
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+      return true;
+    }
+
     function buildPathFromTemplate(pathTemplate, pathParams) {
       let resolved = String(pathTemplate || "");
       const params = pathParams && typeof pathParams === "object" ? pathParams : {};
@@ -4001,7 +4036,14 @@
             return;
           }
           if (review) {
-            showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
+            const selectionRequested = requestSelectionFromIngestionReview(review);
+            showStatus(
+              status,
+              false,
+              selectionRequested
+                ? `${review.headline} Selection required in Entity Resolution before completion.`
+                : `${review.headline} Please review the warnings in the result.`
+            );
             return;
           }
         }
@@ -4102,7 +4144,14 @@
           return;
         }
         if (review) {
-          showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
+          const selectionRequested = requestSelectionFromIngestionReview(review);
+          showStatus(
+            status,
+            false,
+            selectionRequested
+              ? `${review.headline} Selection required in Entity Resolution before completion.`
+              : `${review.headline} Please review the warnings in the result.`
+          );
           return;
         }
         showStatus(status, true, "Ingestion completed.");
@@ -4137,7 +4186,14 @@
         out.textContent = JSON.stringify(data, null, 2);
         const review = prependIngestionAttention(out, data);
         if (review) {
-          showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
+          const selectionRequested = requestSelectionFromIngestionReview(review);
+          showStatus(
+            status,
+            false,
+            selectionRequested
+              ? `${review.headline} Selection required in Entity Resolution before completion.`
+              : `${review.headline} Please review the warnings in the result.`
+          );
           return;
         }
         showStatus(status, true, "Reprocessing completed.");
@@ -4411,7 +4467,14 @@
         out.textContent = JSON.stringify(data, null, 2);
         const review = prependIngestionAttention(out, data);
         if (review) {
-          showStatus(status, false, `${review.headline} Please review the warnings in the result.`);
+          const selectionRequested = requestSelectionFromIngestionReview(review);
+          showStatus(
+            status,
+            false,
+            selectionRequested
+              ? `${review.headline} Selection required in Entity Resolution before completion.`
+              : `${review.headline} Please review the warnings in the result.`
+          );
           return;
         }
         showStatus(status, true, "Note ingestion completed.");
@@ -4548,7 +4611,9 @@
           return;
         }
         if (isLikelyUnthreadedClarification(result)) {
-          showStatus(status, false, "The query asked for clarification but no thread was opened. Re-run this in Chat so you can submit a clarification response.");
+          out.textContent = buildPendingClarificationPreview(result);
+          showStatus(status, false, "Query is not completed: clarification is still required but no thread was opened. Use Chat to continue clarification flow.");
+          return;
         }
         const queryQuestionEl = document.getElementById("queryQuestion");
         if (queryQuestionEl) queryQuestionEl.value = sentence;
@@ -4585,7 +4650,9 @@
           return;
         }
         if (isLikelyUnthreadedClarification(result)) {
-          showStatus(status, false, "The query asked for clarification but no thread was opened. Re-run this in Chat so you can submit a clarification response.");
+          out.textContent = buildPendingClarificationPreview(result);
+          showStatus(status, false, "Query is not completed: clarification is still required but no thread was opened. Use Chat to continue clarification flow.");
+          return;
         }
         const ambiguityContext = extractAmbiguityContext(data);
         if (ambiguityContext) {
