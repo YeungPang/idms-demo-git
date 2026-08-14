@@ -127,7 +127,7 @@ class TestQueryEngineStyleRegression(unittest.TestCase):
         self.assertIn(parsed.attribute_name, {"august", "aug"})
         self.assertIsInstance(parsed.criteria, dict)
         self.assertTrue(parsed.criteria.get("table_request"))
-        self.assertEqual(parsed.criteria.get("table_column"), "August")
+        self.assertEqual(parsed.criteria.get("table_column"), "august")
 
     def test_entity_directory_query_parsing(self):
         engine = self._new_engine()
@@ -1174,6 +1174,25 @@ class TestTemporalParsing(unittest.TestCase):
         engine = self._new_engine()
         tw = engine._extract_time_window("What is the EORI number of Aphotonix GmbH?")
         self.assertIsNone(tw)
+
+    def test_last_entity_hint_is_temporal_not_entity_name(self):
+        engine = self._new_engine()
+        self.assertEqual(engine._normalize_entity_name_hint("last invoices"), "invoices")
+        self.assertFalse(engine._contains_singular_resolution_intent("What are the last invoices?"))
+        self.assertTrue(engine._is_suspicious_entity_hint("last"))
+        self.assertIsNone(engine._resolve_entity_name_for_lookup_details(object(), "last"))
+        self.assertEqual(
+            engine._resolve_entity_object_scope(object(), "last"),
+            {"entity_hint": "", "resolved_name": None, "object_ids": [], "object_names": []},
+        )
+
+    def test_last_invoices_routes_to_criteria_lookup(self):
+        engine = self._new_engine()
+        parsed = engine.parse_query("What are the last invoices?")
+        self.assertEqual(parsed.intent, "criteria_lookup")
+        self.assertEqual(parsed.criteria.get("entity_type"), "invoice")
+        self.assertIn("invoices", parsed.criteria.get("must_contain", []))
+        self.assertEqual(parsed.criteria.get("document_hint"), "document")
 
     # --- _extract_criteria_query with entity-of-person + time window ---
 

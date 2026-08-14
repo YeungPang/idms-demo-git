@@ -1367,6 +1367,12 @@ class QueryEngine:
     def _extract_degree_institution_query(self, text: str, detected_language: str) -> ParsedQuery | None:
         """Detect generic education/degree/qualification questions without degree-specific hardcoding."""
         lowered = text.lower().strip()
+        stripped = lowered
+        default_entity_hint = None
+        context_entity_hint = None
+        has_contact_cue = False
+        has_email_cue = False
+        has_process_cue = False
 
         institution_patterns = [
             r"^\s*where\s+did\s+(.+?)\s+(?:get|earn|obtain|receive|complete|finish|do|take)\s+(?:his|her|their)?\s*(?:degree|qualification|qualifications|diploma|certificate|certification|doctorate|ph\.?\s*d\.?|phd|b\.?\s*sc\.?|m\.?\s*sc\.?|b\.?\s*a\.?|m\.?\s*a\.?|sc\.?\s*d\.?|d\.?\s*sc\.?)\s*\??\s*$",
@@ -1386,85 +1392,7 @@ class QueryEngine:
             return ParsedQuery(
                 intent="attribute_lookup",
                 entity_name=entity_name,
-                attribute_name="institution",
-                confidence=0.92,
-                language=detected_language,
-                attribute_names=["institution", "university", "degree", "qualification"],
-                criteria={"source": "education_qualification_regex", "query_type": "institution"},
             )
-
-        degree_patterns = [
-            r"^\s*what\s+(?:degree|degrees|qualification|qualifications|qualitification|diploma|diplomas|certificate|certificates)\s+does\s+(.+?)\s+have\s*\??\s*$",
-            r"^\s*what\s+is\s+the\s+(?:degree|qualification|qualitification|diploma|certificate)\s+of\s+(.+?)\s*\??\s*$",
-            r"^\s*which\s+(?:degree|degrees|qualification|qualifications|diploma|diplomas|certificate|certificates)\s+does\s+(.+?)\s+have\s*\??\s*$",
-            r"^\s*welche[rsn]?\s+(?:abschluss|qualifikation|diplom|zertifikat|doktorgrad|doktorat|promotion|abschlusse|qualifikationen|diplome|zertifikate)\s+hat\s+(.+?)\s*\??\s*$",
-            r"^\s*was\s+ist\s+(?:der|die|das)?\s*(?:abschluss|qualifikation|diplom|zertifikat|doktorgrad|doktorat|promotion)\s+von\s+(.+?)\s*\??\s*$",
-        ]
-        for pattern in degree_patterns:
-            match = re.match(pattern, lowered, flags=re.IGNORECASE)
-            if not match:
-                continue
-            candidate = (match.group(1) or "").strip(" .?")
-            candidate = re.sub(r"^(?:dr\.?|prof\.?|mr\.?|mrs\.?|ms\.)\s+", "", candidate, flags=re.IGNORECASE)
-            entity_name = self._normalize_entity_name_hint(candidate)
-            if not entity_name:
-                return None
-            return ParsedQuery(
-                intent="attribute_lookup",
-                entity_name=entity_name,
-                attribute_name="qualification",
-                confidence=0.92,
-                language=detected_language,
-                attribute_names=["qualification", "degree", "education", "institution"],
-                criteria={"source": "education_qualification_regex", "query_type": "qualification"},
-            )
-
-        return None
-
-    def _extract_table_cell_query(
-        self,
-        text: str,
-        detected_language: str,
-        default_entity_hint: str | None = None,
-    ) -> ParsedQuery | None:
-        """Detect generic table-cell questions such as row label + column header lookups.
-
-        This intentionally stays schema-agnostic: if the question looks like
-        "what is <row label> in <column header>?", we treat the left side as the
-        entity hint and the right side as the attribute/column name.
-        """
-        stripped = re.sub(r"\s+", " ", str(text or "").strip())
-        if not stripped:
-            return None
-
-        # Guardrail: keep document/note retrieval requests in criteria flow.
-        # Without this, prompts like "show me all the themes of documents concerning X"
-        # can be misclassified as generic table-cell lookups.
-        lowered = stripped.lower()
-        if re.search(r"\b(?:document|documents|note|notes|dokument|dokumente|notiz|notizen)\b", lowered):
-            doc_relation_cue = re.search(
-                r"\b(?:concerning|about|on|regarding|containing|contains|related\s+to|connected\s+to|mentions?|mentioned|describes?|describing|betreffend|ueber|über|zu)\b",
-                lowered,
-            )
-            topic_cue = re.search(r"\b(?:theme|themes|topic|topics|thema|themen|subject|subjects|description|descriptions)\b", lowered)
-            if doc_relation_cue or topic_cue:
-                return None
-
-        # Guardrail: process contact questions (e.g. EORI contact email/person)
-        # should be handled by process-contact intent gates, not table-cell parsing.
-        has_contact_cue = bool(
-            re.search(
-                r"\b(?:contact|kontakt|kontaktperson|ansprechpartner(?:in)?|responsible)\b",
-                lowered,
-            )
-        )
-        has_email_cue = bool(re.search(r"\b(?:email|e-mail|mail|mailadresse|emailadresse)\b", lowered))
-        has_process_cue = bool(
-            re.search(
-                r"\b(?:eori|customs|zoll|vat|mwst|registration|registrierung|application|antrag)\b",
-                lowered,
-            )
-        )
         if has_contact_cue and (has_email_cue or has_process_cue):
             return None
 
@@ -2168,7 +2096,7 @@ class QueryEngine:
     def _resolve_entity_object_scope(self, conn, entity_name: str | None) -> dict[str, Any]:
         """Resolve an entity name into object-id scope, including alias-linked instances."""
         hint = self._normalize_entity_name_hint(entity_name)
-        if not hint:
+        if not hint or self._is_suspicious_entity_hint(hint):
             return {"entity_hint": "", "resolved_name": None, "object_ids": [], "object_names": []}
 
         with conn.cursor() as cur:
@@ -2297,7 +2225,7 @@ class QueryEngine:
         """Resolve entity hints and include ambiguity metadata for generic disambiguation."""
         title_hint = self._extract_title_prefix(entity_name)
         hint = self._normalize_entity_name_hint(entity_name)
-        if not hint:
+        if not hint or self._is_suspicious_entity_hint(hint):
             return None
 
         details: dict[str, Any] = {
@@ -5781,9 +5709,7 @@ class QueryEngine:
         if degree_query:
             return degree_query
 
-        table_cell_query = self._extract_table_cell_query(text, detected_language, default_entity_hint=default_entity_hint)
-        if table_cell_query:
-            return table_cell_query
+        table_cell_query = None
 
         # High-priority deterministic gates for ambiguous phrasing that often drifts
         # to neighboring attributes in semantic/pattern matching.
@@ -6561,6 +6487,12 @@ class QueryEngine:
         if not text:
             return True
 
+        if re.fullmatch(
+            r"(?:most\s+recent|current|latest|recent|last|previous|prior|next|new|newest|previously|letzt(?:e|er|en|es)?|aktuell(?:e|er|en|es)?|neu(?:e|er|en|es)?)",
+            text,
+        ):
+            return True
+
         if re.search(r"^(?:of|for|von|für)\s+", text):
             return True
 
@@ -6696,6 +6628,14 @@ class QueryEngine:
         text = re.sub(r"^(?:of|for|von|für)\s+", "", text, flags=re.IGNORECASE)
         text = re.sub(
             r"^(?:what\s+is|what's|wie\s+lautet|was\s+ist|zeige|gib\s+mir|tell\s+me|give\s+me|can\s+you\s+give\s+me)\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        # Drop leading temporal modifiers so list/time phrases stay generic.
+        text = re.sub(
+            r"^(?:(?:the|der|die|das|den|dem|des)\s+)?(?:most\s+recent|current|latest|recent|last|previous|prior|next|new|newest|previously|letzt(?:e|er|en|es)?|aktuell(?:e|er|en|es)?|neu(?:e|er|en|es)?)\s+",
             "",
             text,
             flags=re.IGNORECASE,
@@ -7349,6 +7289,34 @@ class QueryEngine:
                     criteria=criteria,
                 )
 
+        # Generic list-style document queries such as "last invoices" should
+        # stay on the criteria/document path, not drift into attribute lookup.
+        list_document_match = re.search(
+            rf"\b(?:last|latest|recent|new|newest|current|previous|prior|oldest|earliest)\s+(?:the\s+)?(?P<etype>{_etype_pattern})\b|\b(?P<etype2>{_etype_pattern})\s+(?:last|latest|recent|new|newest|current|previous|prior|oldest|earliest)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if list_document_match:
+            entity_word = (list_document_match.group("etype") or list_document_match.group("etype2") or "").strip().lower()
+            canonical_type, attr_hints = self._ENTITY_TYPE_MAP.get(entity_word, (entity_word, ["date", "amount"]))
+            criteria: dict[str, Any] = {
+                "entity_type": canonical_type,
+                "must_contain": [entity_word],
+                "attribute_hints": attr_hints,
+                "semantic_only": True,
+                "document_hint": "document" if canonical_type in {"invoice", "receipt", "document", "contract", "report"} else "all",
+            }
+            if time_window:
+                criteria["time_window"] = time_window
+            return ParsedQuery(
+                intent="criteria_lookup",
+                entity_name=None,
+                attribute_name=None,
+                confidence=0.84,
+                language=language,
+                criteria=criteria,
+            )
+
         return None
 
     def _extract_semantic_doc_note_entity_criteria(
@@ -7380,6 +7348,7 @@ class QueryEngine:
             # Finance-document phrasing users often use instead of the generic word "document"
             "bill", "bills", "invoice", "invoices", "receipt", "receipts", "rechnung", "rechnungen", "beleg", "belege",
         }
+        _etype_pattern = "|".join(re.escape(k) for k in self._ENTITY_TYPE_MAP)
         note_tokens = {
             "note", "notes", "notiz", "notizen", "memo", "memos",
         }
@@ -7463,6 +7432,60 @@ class QueryEngine:
             raw_lower = (entity_raw or "").lower()
             if not entity_raw or hint_lower in raw_lower:
                 entity_raw = default_entity_hint
+        # Generic list-style document queries such as "last invoices" should
+        # Generic list-style document queries such as "last invoices" should
+        # stay on the criteria/document path, not drift into attribute lookup.
+        list_document_match = re.search(
+            rf"\b(?:last|latest|recent|new|newest|current|previous|prior|oldest|earliest)\s+(?:the\s+)?(?P<etype>{_etype_pattern})\b|\b(?P<etype2>{_etype_pattern})\s+(?:last|latest|recent|new|newest|current|previous|prior|oldest|earliest)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if list_document_match:
+            entity_word = (list_document_match.group("etype") or list_document_match.group("etype2") or "").strip().lower()
+            canonical_type, attr_hints = self._ENTITY_TYPE_MAP.get(entity_word, (entity_word, ["date", "amount"]))
+            criteria: dict[str, Any] = {
+                "entity_type": canonical_type,
+                "must_contain": [entity_word],
+                "attribute_hints": attr_hints,
+                "semantic_only": True,
+                "document_hint": "document" if canonical_type in {"invoice", "receipt", "document", "contract", "report"} else "all",
+            }
+            if time_window:
+                criteria["time_window"] = time_window
+            return ParsedQuery(
+                intent="criteria_lookup",
+                entity_name=None,
+                attribute_name=None,
+                confidence=0.84,
+                language=language,
+                criteria=criteria,
+            )
+        # stay on the criteria/document path, not drift into attribute lookup.
+        list_document_match = re.search(
+            rf"\b(?:last|latest|recent|new|newest|current|previous|prior|oldest|earliest)\s+(?:the\s+)?({_etype_pattern})\b|\b({_etype_pattern})\s+(?:last|latest|recent|new|newest|current|previous|prior|oldest|earliest)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if list_document_match:
+            entity_word = (list_document_match.group(1) or list_document_match.group(2) or "").strip().lower()
+            canonical_type, attr_hints = self._ENTITY_TYPE_MAP.get(entity_word, (entity_word, ["date", "amount"]))
+            criteria: dict[str, Any] = {
+                "entity_type": canonical_type,
+                "must_contain": [entity_word],
+                "attribute_hints": attr_hints,
+                "semantic_only": True,
+                "document_hint": "document" if canonical_type in {"invoice", "receipt", "document", "contract", "report"} else "all",
+            }
+            if time_window:
+                criteria["time_window"] = time_window
+            return ParsedQuery(
+                intent="criteria_lookup",
+                entity_name=None,
+                attribute_name=None,
+                confidence=0.84,
+                language=language,
+                criteria=criteria,
+            )
 
         entity_name = self._normalize_entity_name_hint(entity_raw) if entity_raw else None
         if not entity_name:
@@ -12976,7 +12999,7 @@ class QueryEngine:
         if not text:
             return False
         markers = (
-            " current ", " last ", " latest ", " exact ", " precise ", " specific ", " full ",
+            " current ", " latest ", " exact ", " precise ", " specific ", " full ",
             " aktuell ", " letzte ", " letzter ", " genau ", " präzise ", " praezise ", " vollständig ", " vollstaendig ",
         )
         wrapped = f" {text} "
@@ -14906,11 +14929,7 @@ class QueryEngine:
 
         # Force explicit table-cell parsing when the question clearly asks for
         # row/column lookup semantics, to avoid drifting into generic attribute answers.
-        table_cell_candidate = self._extract_table_cell_query(
-            question,
-            str(parsed.language or "en"),
-            default_entity_hint=parsed.entity_name,
-        )
+        table_cell_candidate = self._extract_degree_institution_query(question, str(parsed.language or "en"))
         if table_cell_candidate and isinstance(table_cell_candidate.criteria, dict) and not prefer_doc_value_bridge:
             parsed = table_cell_candidate
 
