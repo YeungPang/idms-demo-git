@@ -223,6 +223,14 @@
       margin-right: 6px;
       margin-bottom: 4px;
     }
+    .queue-table tr.selected {
+      background: #e7f7f4;
+    }
+    .queue-item-meta {
+      margin-top: 8px;
+      font-size: .84rem;
+      color: var(--muted);
+    }
 
     .coverage-summary {
       display: flex;
@@ -770,6 +778,78 @@
         </div>
         <div id="clarStatus" class="status"></div>
         <pre id="clarOut"></pre>
+      </section>
+
+      <section class="panel half">
+        <h2>Operations Queue Workbench</h2>
+        <div class="row two">
+          <div>
+            <label>Queue view</label>
+            <select id="opsQueueView">
+              <option value="prioritized_items">Prioritized (all queues)</option>
+              <option value="booking_reviews">Booking reviews</option>
+              <option value="clarification_threads">Clarification threads</option>
+              <option value="workflow_runs">Workflow runs</option>
+              <option value="unfinished_workflows">Unfinished workflows</option>
+              <option value="workflow_steps">Workflow steps</option>
+              <option value="tx_match_pending">TX-match pending</option>
+            </select>
+          </div>
+          <div>
+            <label>Limit</label>
+            <input id="opsQueueLimit" type="number" min="1" max="200" value="30" />
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Doc ID filter (optional)</label>
+            <input id="opsQueueDocId" type="number" min="1" placeholder="26" />
+          </div>
+          <div>
+            <label>Workflow key filter (optional)</label>
+            <input id="opsQueueWorkflowKey" type="text" placeholder="template::accounting_reconciliation_full" />
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Per-queue cap (optional)</label>
+            <input id="opsQueuePerQueueCap" type="number" min="1" max="200" placeholder="3" />
+          </div>
+          <div>
+            <label>Maintenance token (optional)</label>
+            <input id="opsQueueAdminToken" type="password" placeholder="IDMS_MAINTENANCE_TOKEN" />
+          </div>
+        </div>
+        <div class="row two">
+          <div>
+            <label>Booking review dedupe</label>
+            <select id="opsQueueLatestBookingOnly">
+              <option value="false">Show all pending reviews</option>
+              <option value="true">Show latest per transaction_id</option>
+            </select>
+          </div>
+          <div>
+            <label>Note</label>
+            <input type="text" value="UI filter only; raw API count remains unchanged." readonly />
+          </div>
+        </div>
+        <div class="btns">
+          <button id="btnOpsQueueLoad" type="button">Load Queue</button>
+          <button id="btnOpsQueueContinue" class="alt" type="button">Continue Selected Item</button>
+          <button id="btnOpsQueueRunner" class="alt" type="button">Open Selected In API Runner</button>
+        </div>
+        <div>
+          <label>Quick response (used for selected clarification thread)</label>
+          <textarea id="opsQueueQuickResponse" placeholder="Type clarification answer here for one-click submit."></textarea>
+        </div>
+        <div class="btns">
+          <button id="btnOpsQueueExecuteSafe" class="alt" type="button">Execute Safe Action</button>
+        </div>
+        <div id="opsQueueStatus" class="status"></div>
+        <div id="opsQueueSummary" class="queue-item-meta"></div>
+        <div id="opsQueueTableWrap" class="candidate-table-wrap" style="display:none"></div>
+        <div id="opsQueueSelectedMeta" class="queue-item-meta">No item selected.</div>
+        <pre id="opsQueueOut"></pre>
       </section>
 
       <section class="panel half">
@@ -2343,6 +2423,486 @@
 
     let lastAmbiguityContext = null;
     let lastEntityCandidates = [];
+    let lastOpsDashboard = null;
+    let lastOpsQueueItems = [];
+    let selectedOpsQueueItemIndex = -1;
+
+    function readOpsQueueFilters() {
+      const limit = parseIntInRange(document.getElementById("opsQueueLimit")?.value, 30, 1, 200);
+      const docId = parsePositiveInt(document.getElementById("opsQueueDocId")?.value || "");
+      const perQueueCap = parsePositiveInt(document.getElementById("opsQueuePerQueueCap")?.value || "");
+      const workflowKey = String(document.getElementById("opsQueueWorkflowKey")?.value || "").trim();
+      const adminToken = String(document.getElementById("opsQueueAdminToken")?.value || "").trim();
+      const latestBookingOnly = String(document.getElementById("opsQueueLatestBookingOnly")?.value || "false") === "true";
+      return {
+        limit,
+        doc_id: docId > 0 ? docId : null,
+        per_queue_cap: perQueueCap > 0 ? perQueueCap : null,
+        workflow_key: workflowKey || null,
+        admin_token: adminToken || null,
+        latest_booking_only: latestBookingOnly,
+      };
+    }
+
+    function dedupeLatestBookingReviews(items, queueView, dashboard) {
+      const list = Array.isArray(items) ? items : [];
+      const view = String(queueView || "").trim();
+      if (!list.length) return list;
+      if (view !== "booking_reviews" && view !== "prioritized_items") return list;
+
+      const bookingRows = Array.isArray(dashboard?.queues?.booking_reviews) ? dashboard.queues.booking_reviews : [];
+      const txByReviewId = new Map();
+      for (const row of bookingRows) {
+        const rid = parsePositiveInt(row?.review_id);
+        if (rid < 1) continue;
+        const tx = String(row?.transaction_id || "").trim();
+        txByReviewId.set(rid, tx || `review:${rid}`);
+      }
+
+      const seenTx = new Set();
+      const filtered = [];
+      for (const item of list) {
+        const queueName = String(item?.queue || view);
+        if (view === "prioritized_items" && queueName !== "booking_reviews") {
+          filtered.push(item);
+          continue;
+        }
+
+        const rid = parsePositiveInt(item?.review_id ?? item?.id);
+        const txKey = txByReviewId.get(rid) || String(item?.transaction_id || `review:${rid || 0}`);
+        if (seenTx.has(txKey)) continue;
+        seenTx.add(txKey);
+        filtered.push(item);
+      }
+      return filtered;
+    }
+
+    function resolveOpsQueueItems(dashboard, queueView) {
+      const payload = dashboard && typeof dashboard === "object" ? dashboard : {};
+      if (queueView === "unfinished_workflows") {
+        return Array.isArray(payload.runs)
+          ? payload.runs.map((item) => ({ ...(item || {}), queue: queueView, id: item?.run_id }))
+          : [];
+      }
+      if (queueView === "prioritized_items") {
+        return Array.isArray(payload?.prioritized_items)
+          ? payload.prioritized_items.map((item) => ({ ...(item || {}) }))
+          : [];
+      }
+      if (!Array.isArray(payload?.queues?.[queueView])) return [];
+      return payload.queues[queueView].map((item) => ({ ...(item || {}), queue: queueView }));
+    }
+
+    function renderOpsQueueSummary(dashboard, queueView, itemCount) {
+      const summaryEl = document.getElementById("opsQueueSummary");
+      const summary = dashboard && typeof dashboard === "object" ? dashboard.summary || {} : {};
+      if (!summaryEl) return;
+      summaryEl.textContent = [
+        `View: ${queueView}`,
+        `Items shown: ${itemCount}`,
+        `Total actionable: ${summary.total_actionable_items || 0}`,
+        `High: ${summary.high_severity_items || 0}`,
+        `Medium: ${summary.medium_severity_items || 0}`,
+        `Low: ${summary.low_severity_items || 0}`,
+      ].join(" | ");
+    }
+
+    function renderOpsQueueTable(items, queueView) {
+      const wrap = document.getElementById("opsQueueTableWrap");
+      if (!wrap) return;
+      const list = Array.isArray(items) ? items : [];
+      lastOpsQueueItems = list;
+      selectedOpsQueueItemIndex = -1;
+      document.getElementById("opsQueueSelectedMeta").textContent = "No item selected.";
+
+      if (!list.length) {
+        wrap.style.display = "none";
+        wrap.innerHTML = "";
+        return;
+      }
+
+      const rows = list.map((item, idx) => {
+        const queueName = escapeHtml(item?.queue || queueView);
+        const itemId = escapeHtml(item?.id ?? item?.review_id ?? item?.thread_id ?? item?.run_id ?? item?.pending_id ?? "");
+        const status = escapeHtml(item?.status ?? item?.run_status ?? item?.step_status ?? "");
+        const severity = escapeHtml(item?.severity_level || "");
+        const score = escapeHtml(item?.severity_score ?? "");
+        const ageHours = item?.age_hours !== undefined && item?.age_hours !== null ? Number(item.age_hours).toFixed(2) : "";
+        const ageText = escapeHtml(ageHours);
+        return `
+          <tr data-idx="${idx}">
+            <td><button class="mini-btn" type="button" data-role="ops-select" data-idx="${idx}">Select</button></td>
+            <td>${queueName}</td>
+            <td>${itemId}</td>
+            <td>${status}</td>
+            <td>${severity}</td>
+            <td>${score}</td>
+            <td>${ageText}</td>
+          </tr>
+        `;
+      }).join("");
+
+      wrap.innerHTML = `
+        <table class="candidate-table queue-table">
+          <thead>
+            <tr>
+              <th>action</th>
+              <th>queue</th>
+              <th>item_id</th>
+              <th>status</th>
+              <th>severity</th>
+              <th>score</th>
+              <th>age_h</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+      wrap.style.display = "block";
+
+      wrap.querySelectorAll("button[data-role='ops-select']").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const idx = Number(btn.getAttribute("data-idx") || "-1");
+          selectOpsQueueItem(idx);
+
+          const selected = getSelectedOpsQueueItem();
+          const queueName = String(selected?.queue || document.getElementById("opsQueueView")?.value || "").trim();
+          if (queueName === "booking_reviews") {
+            try {
+              await continueSelectedOpsQueueItem();
+            } catch (_err) {
+              // Keep row selected even if auto-open fails; explicit Continue can be retried.
+            }
+          }
+        });
+      });
+    }
+
+    function selectOpsQueueItem(index) {
+      const idx = Number(index);
+      const item = Number.isInteger(idx) && idx >= 0 && idx < lastOpsQueueItems.length ? lastOpsQueueItems[idx] : null;
+      const meta = document.getElementById("opsQueueSelectedMeta");
+      const out = document.getElementById("opsQueueOut");
+      const wrap = document.getElementById("opsQueueTableWrap");
+
+      if (!item) {
+        selectedOpsQueueItemIndex = -1;
+        if (meta) meta.textContent = "No item selected.";
+        return;
+      }
+
+      selectedOpsQueueItemIndex = idx;
+      const queueName = String(item?.queue || document.getElementById("opsQueueView")?.value || "unknown");
+      const itemId = item?.id ?? item?.review_id ?? item?.thread_id ?? item?.run_id ?? item?.pending_id ?? "";
+      if (meta) {
+        meta.textContent = `Selected ${queueName} item ${itemId}. Click Continue Selected Item to route into the process flow.`;
+      }
+      if (out) {
+        out.textContent = JSON.stringify(item, null, 2);
+      }
+      if (wrap) {
+        wrap.querySelectorAll("tbody tr").forEach((row) => row.classList.remove("selected"));
+        const selectedRow = wrap.querySelector(`tbody tr[data-idx='${idx}']`);
+        if (selectedRow) selectedRow.classList.add("selected");
+      }
+    }
+
+    function getSelectedOpsQueueItem() {
+      if (!Number.isInteger(selectedOpsQueueItemIndex) || selectedOpsQueueItemIndex < 0) return null;
+      return lastOpsQueueItems[selectedOpsQueueItemIndex] || null;
+    }
+
+    function routeOpsItemToApiRunner(item, options = {}) {
+      const selected = item && typeof item === "object" ? item : null;
+      if (!selected) {
+        throw new Error("Select a queue item first.");
+      }
+
+      const queueName = String(selected.queue || document.getElementById("opsQueueView")?.value || "").trim();
+      const methodEl = document.getElementById("apiRunnerMethod");
+      const pathEl = document.getElementById("apiRunnerPath");
+      const bodyEl = document.getElementById("apiRunnerBody");
+      const strictEl = document.getElementById("apiRunnerStrictConfirm");
+      const adminToken = String(document.getElementById("opsQueueAdminToken")?.value || "").trim();
+
+      let method = "GET";
+      let path = "/api/health";
+      let body = {};
+
+      if (queueName === "booking_reviews") {
+        const reviewId = parsePositiveInt(selected.review_id ?? selected.id);
+        if (!reviewId) throw new Error("Selected booking review has no valid review_id.");
+        method = "GET";
+        path = `/api/accounting/reviews/${reviewId}`;
+        body = {};
+      } else if (queueName === "clarification_threads") {
+        const threadId = parsePositiveInt(selected.thread_id ?? selected.id);
+        if (!threadId) throw new Error("Selected clarification item has no valid thread_id.");
+        method = "GET";
+        path = `/api/interaction/clarification/${threadId}`;
+        body = {};
+      } else if (queueName === "workflow_runs" || queueName === "unfinished_workflows") {
+        const runId = parsePositiveInt(selected.run_id ?? selected.id);
+        if (!runId) throw new Error("Selected workflow run has no valid run_id.");
+        method = "POST";
+        path = `/api/pipeline-runs/${runId}/resume`;
+        body = { user_response: null, doc_refs: [] };
+      } else if (queueName === "workflow_steps") {
+        const runId = parsePositiveInt(selected.run_id || (String(selected.id || "").split("::")[0] || ""));
+        if (!runId) throw new Error("Selected workflow step has no valid run_id.");
+        method = "POST";
+        path = `/api/pipeline-runs/${runId}/resume`;
+        body = {
+          resumed_by: "web:user",
+          user_response: {
+            clarification_note: "Provide required values from selected queue item before running.",
+          },
+          doc_refs: [],
+        };
+      } else if (queueName === "tx_match_pending") {
+        const pendingId = parsePositiveInt(selected.pending_id ?? selected.id);
+        method = "POST";
+        path = "/api/maintenance/tx-match/pending/retry";
+        body = {
+          pending_id: pendingId > 0 ? pendingId : null,
+          statuses: ["pending", "failed"],
+          limit: 1,
+          admin_token: adminToken,
+        };
+      }
+
+      methodEl.value = method;
+      pathEl.value = path;
+      bodyEl.value = JSON.stringify(body, null, 2);
+      if (strictEl) strictEl.value = "true";
+
+      const scrollTarget = document.getElementById("apiRunnerPath");
+      if (scrollTarget && typeof scrollTarget.scrollIntoView === "function") {
+        scrollTarget.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+
+      if (!options.silent) {
+        const status = document.getElementById("opsQueueStatus");
+        showStatus(status, true, "Selected item copied to Generic API Runner.");
+      }
+    }
+
+    async function continueSelectedOpsQueueItem() {
+      const status = document.getElementById("opsQueueStatus");
+      const selected = getSelectedOpsQueueItem();
+      if (!selected) {
+        showStatus(status, false, "Select an item first.");
+        return;
+      }
+
+      const queueName = String(selected.queue || document.getElementById("opsQueueView")?.value || "").trim();
+      if (queueName === "booking_reviews") {
+        const reviewId = parsePositiveInt(selected.review_id ?? selected.id);
+        await loadAccountingReviewById(reviewId, {
+          successMessage: `Loaded review #${reviewId}. Continue with Approve / Post or Cancel Booking.`,
+        });
+        const reviewIdEl = document.getElementById("accountingReviewId");
+        if (reviewIdEl && typeof reviewIdEl.scrollIntoView === "function") {
+          reviewIdEl.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+        const updatesEl = document.getElementById("accountingReviewUpdates");
+        if (updatesEl && typeof updatesEl.focus === "function") {
+          updatesEl.focus();
+        }
+        showStatus(status, true, `Booking review #${reviewId} loaded in Accounting Booking Review.`);
+        return;
+      }
+
+      if (queueName === "clarification_threads") {
+        const threadId = parsePositiveInt(selected.thread_id ?? selected.id);
+        if (!threadId) {
+          showStatus(status, false, "Selected clarification item has no valid thread_id.");
+          return;
+        }
+        const data = await getJson(`/api/interaction/clarification/${threadId}`);
+        const result = data?.result || data || {};
+        setClarificationThreadState(result);
+        document.getElementById("clarOut").textContent = JSON.stringify(data, null, 2);
+        const responseEl = document.getElementById("clarResponseText");
+        const question = String(result?.clarification_question || "").trim();
+        if (responseEl && !String(responseEl.value || "").trim() && question) {
+          responseEl.placeholder = `Reply to clarification #${threadId}: ${question}`;
+        }
+        if (responseEl && typeof responseEl.scrollIntoView === "function") {
+          responseEl.scrollIntoView({ behavior: "smooth", block: "center" });
+          responseEl.focus();
+        }
+        showStatus(status, true, `Clarification thread #${threadId} loaded. Enter user response and submit.`);
+        return;
+      }
+
+      if (queueName === "unfinished_workflows" || queueName === "workflow_runs") {
+        const runId = parsePositiveInt(selected.run_id ?? selected.id);
+        if (!runId) {
+          showStatus(status, false, "Selected workflow item has no valid run_id.");
+          return;
+        }
+
+        const details = await getJson(`/api/pipeline-runs/${runId}`);
+        const run = details?.run || details || {};
+        document.getElementById("opsQueueOut").textContent = JSON.stringify(details, null, 2);
+        if (String(run?.run_status || "").toLowerCase() !== "paused") {
+          showStatus(status, true, `Workflow run #${runId} is ${String(run?.run_status || "unfinished")}; details loaded.`);
+          return;
+        }
+
+        const quickResponse = String(document.getElementById("opsQueueQuickResponse")?.value || "").trim();
+        const confirmed = window.confirm(
+          `Resume paused workflow run #${runId}?${quickResponse ? "\n\nThe quick response will be submitted." : ""}`
+        );
+        if (!confirmed) {
+          showStatus(status, true, "Workflow resume cancelled.");
+          return;
+        }
+
+        const resumed = await postJson(`/api/pipeline-runs/${runId}/resume`, {
+          user_response: quickResponse ? { clarification_note: quickResponse } : null,
+          doc_refs: [],
+        });
+        document.getElementById("opsQueueOut").textContent = JSON.stringify(resumed, null, 2);
+        await loadOpsQueueFromControls({
+          silentLoading: true,
+          successMessage: `Workflow run #${runId} resumed. Unfinished task list refreshed.`,
+        });
+        return;
+      }
+
+      routeOpsItemToApiRunner(selected, { silent: true });
+      showStatus(status, true, "Selected item requires API execution. Prepared Generic API Runner payload.");
+    }
+
+    async function loadOpsQueueFromControls(options = {}) {
+      const status = document.getElementById("opsQueueStatus");
+      const out = document.getElementById("opsQueueOut");
+      const queueView = String(document.getElementById("opsQueueView")?.value || "prioritized_items");
+      const filters = readOpsQueueFilters();
+      const query = {
+        limit: filters.limit,
+        doc_id: filters.doc_id,
+        workflow_key: filters.workflow_key,
+        per_queue_cap: filters.per_queue_cap,
+        admin_token: filters.admin_token,
+      };
+      const path = queueView === "unfinished_workflows"
+        ? appendQueryParams("/api/pipeline-runs/unfinished", {
+          limit: filters.limit,
+          workflow_key: filters.workflow_key,
+        })
+        : appendQueryParams("/api/maintenance/status/pending-dashboard", query);
+
+      if (!options.silentLoading) {
+        showStatus(status, true, String(options.loadingMessage || "Loading pending dashboard..."));
+      }
+
+      const data = await getJson(path);
+      const result = data?.result || data || {};
+      lastOpsDashboard = result;
+      const resolvedRows = resolveOpsQueueItems(result, queueView);
+      const rows = filters.latest_booking_only
+        ? dedupeLatestBookingReviews(resolvedRows, queueView, result)
+        : resolvedRows;
+      renderOpsQueueSummary(result, queueView, rows.length);
+      renderOpsQueueTable(rows, queueView);
+      out.textContent = JSON.stringify(result, null, 2);
+      showStatus(status, true, String(options.successMessage || `Loaded ${rows.length} item(s) from ${queueView}.`));
+      return { result, rows, queueView };
+    }
+
+    async function executeSelectedOpsQueueSafeAction() {
+      const status = document.getElementById("opsQueueStatus");
+      const out = document.getElementById("opsQueueOut");
+      const selected = getSelectedOpsQueueItem();
+      if (!selected) {
+        showStatus(status, false, "Select an item first.");
+        return;
+      }
+
+      const queueName = String(selected.queue || document.getElementById("opsQueueView")?.value || "").trim();
+
+      if (queueName === "clarification_threads") {
+        const threadId = parsePositiveInt(selected.thread_id ?? selected.id);
+        if (!threadId) {
+          showStatus(status, false, "Selected clarification item has no valid thread_id.");
+          return;
+        }
+        const quickResponse = String(document.getElementById("opsQueueQuickResponse")?.value || "").trim();
+        if (!quickResponse) {
+          showStatus(status, false, "Enter a quick response before executing clarification submit.");
+          return;
+        }
+
+        const confirmed = window.confirm(
+          `Submit clarification response for thread #${threadId}?\n\nThis will post your response and continue processing.`
+        );
+        if (!confirmed) {
+          showStatus(status, false, "Safe action cancelled by user.");
+          return;
+        }
+
+        showStatus(status, true, `Submitting clarification for thread #${threadId}...`);
+        const data = await postJson("/api/interaction/clarification/respond", {
+          thread_id: threadId,
+          user_response: quickResponse,
+        });
+        const result = data?.result || data || {};
+        setClarificationThreadState(result);
+        document.getElementById("clarOut").textContent = JSON.stringify(data, null, 2);
+        out.textContent = JSON.stringify(data, null, 2);
+
+        if (String(result?.status || "").toLowerCase() === "pending_clarification") {
+          await loadOpsQueueFromControls({
+            silentLoading: true,
+            successMessage: "Response submitted; clarification still pending. Queue refreshed.",
+          });
+          return;
+        }
+
+        await loadOpsQueueFromControls({
+          silentLoading: true,
+          successMessage: "Clarification submitted and resolved. Queue refreshed.",
+        });
+        return;
+      }
+
+      if (queueName === "tx_match_pending") {
+        const pendingId = parsePositiveInt(selected.pending_id ?? selected.id);
+        const adminToken = String(document.getElementById("opsQueueAdminToken")?.value || "").trim();
+        const confirmed = window.confirm(
+          pendingId > 0
+            ? `Retry tx-match pending item #${pendingId}?`
+            : "Retry one tx-match pending item for selected queue entry?"
+        );
+        if (!confirmed) {
+          showStatus(status, false, "Safe action cancelled by user.");
+          return;
+        }
+
+        showStatus(status, true, "Retrying tx-match pending item...");
+        const data = await postJson("/api/maintenance/tx-match/pending/retry", {
+          pending_id: pendingId > 0 ? pendingId : null,
+          statuses: ["pending", "failed"],
+          limit: 1,
+          admin_token: adminToken,
+        });
+        out.textContent = JSON.stringify(data, null, 2);
+        await loadOpsQueueFromControls({
+          silentLoading: true,
+          successMessage: "TX-match retry submitted. Queue refreshed.",
+        });
+        return;
+      }
+
+      showStatus(
+        status,
+        false,
+        "No safe one-click action is defined for this queue type. Use Continue Selected Item or Open Selected In API Runner."
+      );
+    }
 
     function setClarificationThreadState(resultPayload) {
       const threadEl = document.getElementById("chatClarThreadId");
@@ -4580,6 +5140,43 @@
       }
     });
 
+    document.getElementById("btnOpsQueueLoad").addEventListener("click", async () => {
+      try {
+        await loadOpsQueueFromControls();
+      } catch (err) {
+        const status = document.getElementById("opsQueueStatus");
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnOpsQueueContinue").addEventListener("click", async () => {
+      const status = document.getElementById("opsQueueStatus");
+      try {
+        await continueSelectedOpsQueueItem();
+      } catch (err) {
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnOpsQueueRunner").addEventListener("click", () => {
+      const status = document.getElementById("opsQueueStatus");
+      try {
+        const selected = getSelectedOpsQueueItem();
+        routeOpsItemToApiRunner(selected);
+      } catch (err) {
+        showStatus(status, false, String(err));
+      }
+    });
+
+    document.getElementById("btnOpsQueueExecuteSafe").addEventListener("click", async () => {
+      const status = document.getElementById("opsQueueStatus");
+      try {
+        await executeSelectedOpsQueueSafeAction();
+      } catch (err) {
+        showStatus(status, false, String(err));
+      }
+    });
+
     let actionSentenceQueryInFlight = false;
     let directQueryInFlight = false;
 
@@ -6684,6 +7281,7 @@
       "/api/ingest/reprocess",
       "/api/ingest/system-rules",
       "/api/ingest/maintenance/repair",
+      "/api/maintenance/status/pending-dashboard",
       "/api/ingest/note",
       "/api/business-rules",
       "/api/business-rules/{rule_id}",

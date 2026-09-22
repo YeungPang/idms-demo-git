@@ -256,6 +256,15 @@ class PipelineRunResumeRequest(BaseModel):
     )
 
 
+class PipelineRunUndoRequest(BaseModel):
+    requested_by: str = Field(default="api:user", description="Actor requesting undo execution")
+    dry_run: bool = Field(default=True, description="When true, only plan compensation steps")
+    include_completed_only: bool = Field(
+        default=True,
+        description="When true, only include completed steps; when false include completed/failed/paused for planning",
+    )
+
+
 class PipelineRunStartByKeyRequest(BaseModel):
     workflow_key: str = Field(..., description="Stable workflow key")
     input_context: dict[str, Any] = Field(default_factory=dict, description="Initial context payload passed to all steps")
@@ -453,6 +462,80 @@ def resume_pipeline_run(run_id: int, request: PipelineRunResumeRequest) -> dict[
         raise HTTPException(status_code=status_code, detail=result.get("message", err))
 
     return {"success": True, "run": result}
+
+
+@router.get("/unfinished", summary="List unfinished pipeline tasks")
+def list_unfinished_pipeline_runs(
+    workflow_key: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return pending, running, and paused runs for client-side task recovery."""
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+
+    executor = _get_executor()
+    try:
+        runs = executor.list_unfinished_runs(workflow_key=workflow_key, limit=limit)
+    except Exception as exc:
+        LOGGER.exception("pipeline unfinished runs failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {
+        "success": True,
+        "count": len(runs),
+        "limit": limit,
+        "unfinished_statuses": ["pending", "running", "paused"],
+        "runs": runs,
+    }
+
+
+@router.get("/{run_id}/mutation-journal", summary="List workflow mutation journal entries for a run")
+def get_pipeline_run_mutation_journal(
+    run_id: int,
+    include_undone: bool = True,
+    limit: int = 500,
+) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 5000))
+    with object_db.get_connection() as conn:
+        run = object_db.get_pipeline_run(conn, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"Pipeline run {run_id} not found")
+        rows = object_db.list_workflow_mutation_journal(
+            conn,
+            run_id=run_id,
+            include_undone=bool(include_undone),
+            limit=safe_limit,
+        )
+    return {
+        "success": True,
+        "run_id": int(run_id),
+        "count": len(rows),
+        "limit": safe_limit,
+        "include_undone": bool(include_undone),
+        "journal": rows,
+    }
+
+
+@router.post("/{run_id}/undo-execute", summary="Execute workflow compensation undo for a run")
+def undo_pipeline_run(run_id: int, request: PipelineRunUndoRequest) -> dict[str, Any]:
+    executor = _get_executor()
+    try:
+        result = executor.undo_pipeline_run(
+            run_id=run_id,
+            requested_by=request.requested_by,
+            dry_run=bool(request.dry_run),
+            include_completed_only=bool(request.include_completed_only),
+        )
+    except Exception as exc:
+        LOGGER.exception("pipeline undo failed run_id=%s", run_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if isinstance(result, dict) and result.get("error"):
+        err = result["error"]
+        status_code = 404 if err == "not_found" else 400
+        raise HTTPException(status_code=status_code, detail=result.get("message", err))
+
+    return {"success": True, "result": result}
 
 
 @router.post("/{run_id}/cancel", summary="Cancel a pipeline run")

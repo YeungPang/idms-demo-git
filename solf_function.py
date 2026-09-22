@@ -29,6 +29,7 @@ WORKFLOW_DOMAIN_ALLOWED_OPERATIONS: set[str] = {
     "resolve_accounting_booking_company",
     "db_accounting_ingest",
     "db_accounting_delete",
+    "reverse_accounting_transaction",
     "db_hr_validate_payload",
     "db_hr_ingest",
     "db_hr_delete",
@@ -56,6 +57,51 @@ def _connection_scope() -> tuple[Any, bool]:
     if _ACTIVE_CONNECTION is not None:
         return _ACTIVE_CONNECTION, False
     return object_db.get_connection(), True
+
+
+def _quote_savepoint_name(name: str) -> str:
+    # Postgres identifiers: keep it simple/safe rather than relying on caller input.
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", str(name or "")).strip("_") or "sp"
+    return f"solf_{safe}"
+
+
+def create_savepoint(name: str) -> bool:
+    """Mark a rollback point on the active shared connection before a nested clause call."""
+    if _ACTIVE_CONNECTION is None:
+        return False
+    try:
+        with _ACTIVE_CONNECTION.cursor() as cursor:
+            cursor.execute(f"SAVEPOINT {_quote_savepoint_name(name)}")
+        return True
+    except Exception:
+        LOGGER.exception("SOLF create_savepoint failed name=%r", name)
+        return False
+
+
+def release_savepoint(name: str) -> bool:
+    """Discard a savepoint marker while keeping its writes in the open transaction."""
+    if _ACTIVE_CONNECTION is None:
+        return False
+    try:
+        with _ACTIVE_CONNECTION.cursor() as cursor:
+            cursor.execute(f"RELEASE SAVEPOINT {_quote_savepoint_name(name)}")
+        return True
+    except Exception:
+        LOGGER.exception("SOLF release_savepoint failed name=%r", name)
+        return False
+
+
+def rollback_to_savepoint(name: str) -> bool:
+    """Undo only the SQL executed since the named savepoint, keeping earlier writes intact."""
+    if _ACTIVE_CONNECTION is None:
+        return False
+    try:
+        with _ACTIVE_CONNECTION.cursor() as cursor:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {_quote_savepoint_name(name)}")
+        return True
+    except Exception:
+        LOGGER.exception("SOLF rollback_to_savepoint failed name=%r", name)
+        return False
 
 
 def _entity_name_tokens(value: Any) -> list[str]:
@@ -240,6 +286,7 @@ def _normalize_entity_payload(payload: Any) -> dict[str, Any]:
 
 def _build_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     metadata = dict(payload.get("attributes") or {})
+    query_categories = payload.get("query_categories") if isinstance(payload.get("query_categories"), list) else []
     metadata.update(
         {
             "entity_id": payload.get("entity_id"),
@@ -249,6 +296,7 @@ def _build_metadata(payload: dict[str, Any]) -> dict[str, Any]:
             "effective_from": payload.get("effective_from"),
             "effective_until": payload.get("effective_until"),
             "recorded_on": payload.get("recorded_on"),
+            "query_categories": [str(item).strip().lower() for item in query_categories if str(item).strip()],
         }
     )
 
@@ -520,7 +568,6 @@ def _sync_temporal_attribute_with_arbitration(
                     "UPDATE attribute SET valid_until = %s WHERE attr_id = %s AND (valid_until IS NULL OR valid_until > %s)",
                     (start_date, int(existing["attr_id"]), start_date),
                 )
-        connection.commit()
         return {
             "attr_id": None,
             "src_id": int(row["object_id"]),
@@ -1454,8 +1501,6 @@ def _sync_temporal_attributes(connection: Any, row: dict[str, Any], payload: dic
         if resolved is not None:
             rows.append(resolved)
 
-    if rows:
-        connection.commit()
     return rows
 
 
@@ -1537,6 +1582,8 @@ def db_ingest(payload: Any) -> dict[str, Any] | bool:
         row["ingest_action"] = "updated" if existing else "created"
         row["exists_before"] = bool(existing)
         row["temporal_attributes_written"] = len(temporal_rows)
+        if owns_connection:
+            connection.commit()
         return row
     except Exception:
         LOGGER.exception("db_ingest failed for %s/%s", class_name, object_name)
@@ -1603,6 +1650,8 @@ def db_update(payload: Any) -> dict[str, Any] | bool:
         row["update_action"] = "updated" if existing else "created"
         row["exists_before"] = bool(existing)
         row["temporal_attributes_written"] = len(temporal_rows)
+        if owns_connection:
+            connection.commit()
         return row
     except Exception:
         LOGGER.exception("db_update failed for %s/%s", class_name, object_name)
@@ -1646,7 +1695,8 @@ def db_delete(payload: Any) -> dict[str, Any] | bool:
                 )
 
             row = cursor.fetchone()
-        connection.commit()
+        if owns_connection:
+            connection.commit()
 
         if not row:
             return {"deleted": False, "object_name": object_name, "class_name": class_name}
@@ -1675,6 +1725,56 @@ def update(payload: Any) -> dict[str, Any] | bool:
 
 def delete(payload: Any) -> dict[str, Any] | bool:
     return db_delete(payload)
+
+
+def db_ingest_undo(payload: Any) -> dict[str, Any] | bool:
+    """Compensating action for db_ingest.
+
+    If the forward call created a brand-new object (ingest_action='created'), undo means
+    deleting that object. If it updated an existing object, undo means restoring the
+    attribute values captured beforehand in `previous_snapshot`.
+    """
+    entity = _normalize_entity_payload(payload)
+    ingest_action = str(entity.get("ingest_action") or "").strip().lower()
+    previous_snapshot = entity.get("previous_snapshot") if isinstance(entity.get("previous_snapshot"), dict) else None
+
+    if ingest_action == "updated" and previous_snapshot:
+        restore_payload = dict(previous_snapshot)
+        restore_payload.setdefault("object_id", entity.get("object_id"))
+        restore_payload.setdefault("object_name", entity.get("object_name"))
+        restore_payload.setdefault("class_name", entity.get("class_name"))
+        return db_update(restore_payload)
+
+    return db_delete(entity)
+
+
+def db_update_undo(payload: Any) -> dict[str, Any] | bool:
+    """Compensating action for db_update: restore the attribute snapshot captured before
+    the forward update ran (payload must include `previous_snapshot`)."""
+    entity = _normalize_entity_payload(payload)
+    previous_snapshot = entity.get("previous_snapshot") if isinstance(entity.get("previous_snapshot"), dict) else None
+    if not previous_snapshot:
+        raise ValueError("previous_snapshot is required for db_update_undo")
+
+    restore_payload = dict(previous_snapshot)
+    restore_payload.setdefault("object_id", entity.get("object_id"))
+    restore_payload.setdefault("object_name", entity.get("object_name"))
+    restore_payload.setdefault("class_name", entity.get("class_name"))
+    return db_update(restore_payload)
+
+
+def db_delete_undo(payload: Any) -> dict[str, Any] | bool:
+    """Compensating action for db_delete: re-ingest the entity snapshot captured before
+    the forward delete ran (payload must include `previous_snapshot`)."""
+    entity = _normalize_entity_payload(payload)
+    previous_snapshot = entity.get("previous_snapshot") if isinstance(entity.get("previous_snapshot"), dict) else None
+    if not previous_snapshot:
+        raise ValueError("previous_snapshot is required for db_delete_undo")
+
+    restore_payload = dict(previous_snapshot)
+    restore_payload.setdefault("object_name", entity.get("object_name"))
+    restore_payload.setdefault("class_name", entity.get("class_name"))
+    return db_ingest(restore_payload)
 
 
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1740,6 +1840,98 @@ def _render_prompt_template(template: str, variables: dict[str, Any]) -> str:
         return str(template or "").format_map(_PromptVarDict(variables or {}))
     except Exception:
         return str(template or "")
+
+
+# --- Clause generation templates -------------------------------------------------
+# Built-in templates used by workflow_generate_schema_and_solf(). Each value is a
+# str.format_map-style template; unresolved placeholders are left as literal text
+# (via _PromptVarDict) so a template only needs to reference the variables it cares
+# about. Available variables: class_name, table_name, schema_name, attribute_lines.
+_DEFAULT_CLAUSE_TEMPLATES: dict[str, str] = {
+    "ingest": "ingest: ⦃db_ingest(_entity_payload)⦄",
+    "update": "update: ⦃db_update(_entity_payload)⦄",
+    "delete": "delete: ⦃db_delete(_entity_payload)⦄",
+    "ingest_undo": "ingest_undo: ⦃db_ingest_undo(_entity_payload)⦄",
+    "update_undo": "update_undo: ⦃db_update_undo(_entity_payload)⦄",
+    "delete_undo": "delete_undo: ⦃db_delete_undo(_entity_payload)⦄",
+    "input_map": (
+        "{class_name}_input_map(_payload) ⦃\n"
+        "    ↲({{ class_name: {class_name}, object_name: _payload[name], attributes: _payload }})\n"
+        "⦄"
+    ),
+    "output_map": (
+        "{class_name}_output_map(_result) ⦃\n"
+        "    ↲({{ class_name: {class_name}, status: _result[status], object_id: _result[object_id], object_name: _result[object_name] }})\n"
+        "⦄"
+    ),
+}
+
+# User-registered templates persist here so they survive process restarts without
+# requiring a schema migration; built-ins above are always available as a fallback.
+_CUSTOM_CLAUSE_TEMPLATES_PATH = Path("generated") / "clause_generation_templates.json"
+_CUSTOM_CLAUSE_TEMPLATES: dict[str, str] = {}
+_CUSTOM_CLAUSE_TEMPLATES_LOADED = False
+
+
+def _load_custom_clause_templates() -> dict[str, str]:
+    """Load user-registered clause templates from disk (cached after first read)."""
+    global _CUSTOM_CLAUSE_TEMPLATES, _CUSTOM_CLAUSE_TEMPLATES_LOADED
+    if _CUSTOM_CLAUSE_TEMPLATES_LOADED:
+        return _CUSTOM_CLAUSE_TEMPLATES
+    _CUSTOM_CLAUSE_TEMPLATES_LOADED = True
+    try:
+        if _CUSTOM_CLAUSE_TEMPLATES_PATH.exists():
+            loaded = json.loads(_CUSTOM_CLAUSE_TEMPLATES_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                _CUSTOM_CLAUSE_TEMPLATES = {str(k): str(v) for k, v in loaded.items()}
+    except Exception:
+        LOGGER.exception("Failed to load custom clause templates from %s", _CUSTOM_CLAUSE_TEMPLATES_PATH)
+    return _CUSTOM_CLAUSE_TEMPLATES
+
+
+def list_clause_templates() -> dict[str, str]:
+    """Effective template registry: built-ins overridden/extended by user-registered ones."""
+    merged = dict(_DEFAULT_CLAUSE_TEMPLATES)
+    merged.update(_load_custom_clause_templates())
+    return merged
+
+
+def register_clause_template(name: Any, template: Any, persist: bool = True) -> dict[str, Any]:
+    """Register (or override) a named clause-generation template, callable from SOLF or Python.
+
+    `template` is a str.format_map-style string; workflow_generate_schema_and_solf() supplies
+    class_name/table_name/schema_name/attribute_lines when rendering. Registering a name that
+    matches a built-in (ingest/update/delete/*_undo/input_map/output_map) overrides it for all
+    future generations; persist=True (default) writes the registry to disk so it survives restarts.
+    """
+    template_name = str(name or "").strip()
+    if not template_name or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", template_name):
+        raise ValueError(f"Invalid clause template name: {name!r}")
+    template_text = str(template or "")
+    if not template_text.strip():
+        raise ValueError("template must not be empty")
+
+    _load_custom_clause_templates()
+    _CUSTOM_CLAUSE_TEMPLATES[template_name] = template_text
+
+    if persist:
+        try:
+            _CUSTOM_CLAUSE_TEMPLATES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _CUSTOM_CLAUSE_TEMPLATES_PATH.write_text(
+                json.dumps(_CUSTOM_CLAUSE_TEMPLATES, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist custom clause template %s", template_name)
+
+    return {"ok": True, "name": template_name, "persisted": bool(persist)}
+
+
+def _render_clause_template(name: str, variables: dict[str, Any]) -> str:
+    template_text = list_clause_templates().get(name)
+    if not template_text:
+        raise ValueError(f"Unknown clause template: {name}")
+    return _render_prompt_template(template_text, variables)
 
 
 def _load_domain_function_module() -> Any | None:
@@ -1851,26 +2043,38 @@ def workflow_generate_schema_and_solf(payload: Any) -> dict[str, Any] | bool:
         )
 
         attribute_lines = "\n".join(f"    {col['name']}: Ø," for col in columns)
+        template_vars = {
+            "class_name": class_name,
+            "table_name": table_name,
+            "schema_name": schema_name,
+            "attribute_lines": attribute_lines,
+        }
+
+        forward_fields = [
+            _render_clause_template(kind, template_vars) for kind in ("ingest", "update", "delete")
+        ]
+        undo_fields = {
+            kind: _render_clause_template(f"{kind}_undo", template_vars) for kind in ("ingest", "update", "delete")
+        }
+        class_body_lines = ",\n".join(f"    {line}" for line in forward_fields + list(undo_fields.values()))
         solf_class = (
             f"{class_name} ≔ {{\n"
             f"    objectType: class,\n"
             f"{attribute_lines}\n"
-            f"    ingest: ⦃db_ingest(_entity_payload)⦄,\n"
-            f"    update: ⦃db_update(_entity_payload)⦄,\n"
-            f"    delete: ⦃db_delete(_entity_payload)⦄\n"
+            f"{class_body_lines}\n"
             f"}}"
         )
 
-        input_map_clause = (
-            f"{class_name}_input_map(_payload) ⦃\n"
-            f"    ↲({{ class_name: {class_name}, object_name: _payload[name], attributes: _payload }})\n"
-            f"⦄"
-        )
-        output_map_clause = (
-            f"{class_name}_output_map(_result) ⦃\n"
-            f"    ↲({{ class_name: {class_name}, status: _result[status], object_id: _result[object_id], object_name: _result[object_name] }})\n"
-            f"⦄"
-        )
+        input_map_clause = _render_clause_template("input_map", template_vars)
+        output_map_clause = _render_clause_template("output_map", template_vars)
+
+        # Maps each forward action to the undo clause a workflow step should register as
+        # its compensation_clause (see workflow_pipeline_executor.undo_pipeline_run).
+        compensation_map = {
+            "ingest": f"{class_name}_ingest_undo",
+            "update": f"{class_name}_update_undo",
+            "delete": f"{class_name}_delete_undo",
+        }
 
         executed = False
         class_registered = False
@@ -1906,7 +2110,8 @@ def workflow_generate_schema_and_solf(payload: Any) -> dict[str, Any] | bool:
                             ),
                         )
                         class_registered = True
-                connection.commit()
+                if owns_connection:
+                    connection.commit()
             finally:
                 if owns_connection:
                     connection.close()
@@ -1921,6 +2126,8 @@ def workflow_generate_schema_and_solf(payload: Any) -> dict[str, Any] | bool:
             "solf_class": solf_class,
             "solf_input_map_clause": input_map_clause,
             "solf_output_map_clause": output_map_clause,
+            "solf_undo_fields": undo_fields,
+            "compensation_map": compensation_map,
             "executed": executed,
             "class_registered": class_registered,
         }
@@ -1935,7 +2142,7 @@ def workflow_domain_operation(payload: Any) -> dict[str, Any] | bool:
     Payload:
       - operation: one of
         db_validate_ledger_payload, resolve_accounting_booking_company,
-        db_accounting_ingest, db_accounting_delete,
+        db_accounting_ingest, db_accounting_delete, reverse_accounting_transaction,
         db_hr_validate_payload, db_hr_ingest, db_hr_delete
       - operation_payload: dict (optional, defaults to payload)
     """

@@ -3,6 +3,7 @@ import json
 import re
 import tempfile
 import zipfile
+import uuid
 from datetime import date, datetime
 from collections import defaultdict
 from io import TextIOWrapper
@@ -45,6 +46,49 @@ def _canonical_person_full_name(value: Any) -> str:
     text = re.sub(r"[.,;:_\-]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def normalize_semantic_term_for_compare(value: Any) -> str:
+    """Normalize semantic alias text to a stable comparison key."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = text.replace("&", " and ")
+    text = re.sub(r"[\-/]+", " ", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.replace(" ", "_")
+
+
+def _load_seeded_business_terms_from_file() -> list[dict[str, Any]]:
+    """Return the canonical seeded registry used by schema sync and query-time matching."""
+    seed_path = Path(__file__).resolve().parent / "seeded_business_terms.json"
+    try:
+        payload = json.loads(seed_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for canonical_name, aliases in payload.items():
+        if not isinstance(aliases, list):
+            continue
+        for alias in aliases:
+            alias_text = str(alias or "").strip()
+            if not alias_text:
+                continue
+            rows.append(
+                {
+                    "kind": "category",
+                    "canonical_name": str(canonical_name).strip(),
+                    "term_text": alias_text,
+                    "language": "en",
+                    "source_type": "seeded",
+                    "metadata": {"source": "seed_file"},
+                }
+            )
+    return rows
 
 
 _RELATIONSHIP_CANONICAL_MAP = {
@@ -351,6 +395,58 @@ CREATE INDEX IF NOT EXISTS idx_doc_table_cell_metadata_gin ON document_table_cel
 """
 
 
+create_document_geographic_facet_table = """
+CREATE TABLE IF NOT EXISTS document_geographic_facet (
+    facet_id              BIGSERIAL PRIMARY KEY,
+    doc_id                BIGINT NOT NULL REFERENCES document(doc_id) ON DELETE CASCADE,
+    raw_name              VARCHAR(512) NOT NULL,
+    canonical_name        VARCHAR(512) NOT NULL,
+    place_kind            VARCHAR(32) NOT NULL DEFAULT 'unknown'
+                         CHECK (place_kind IN ('country','region','city','address','venue','unknown')),
+    country_code          VARCHAR(8),
+    role_name             VARCHAR(64) NOT NULL DEFAULT 'document_subject'
+                         CHECK (role_name IN ('incident_location','issuer_location','sender_address','recipient_address','document_subject','service_location','jurisdiction','unknown')),
+    confidence            NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (doc_id, canonical_name, place_kind, country_code, role_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_geo_facet_doc ON document_geographic_facet(doc_id);
+CREATE INDEX IF NOT EXISTS idx_doc_geo_facet_canonical ON document_geographic_facet(LOWER(canonical_name));
+CREATE INDEX IF NOT EXISTS idx_doc_geo_facet_country ON document_geographic_facet(country_code);
+CREATE INDEX IF NOT EXISTS idx_doc_geo_facet_role ON document_geographic_facet(role_name);
+"""
+
+
+create_document_action_item_table = """
+CREATE TABLE IF NOT EXISTS document_action_item (
+    action_item_id        BIGSERIAL PRIMARY KEY,
+    doc_id                BIGINT NOT NULL REFERENCES document(doc_id) ON DELETE CASCADE,
+    action_type           VARCHAR(128) NOT NULL DEFAULT 'general_action',
+    instruction           TEXT NOT NULL,
+    subject_name          VARCHAR(512),
+    assignee_name         VARCHAR(512),
+    due_date              DATE,
+    priority              VARCHAR(32) NOT NULL DEFAULT 'medium'
+                         CHECK (priority IN ('low','medium','high','urgent')),
+    status                VARCHAR(32) NOT NULL DEFAULT 'open'
+                         CHECK (status IN ('open','in_progress','completed','cancelled','superseded')),
+    confidence            NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (doc_id, action_type, instruction)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_action_doc ON document_action_item(doc_id);
+CREATE INDEX IF NOT EXISTS idx_doc_action_status_due ON document_action_item(status, due_date);
+CREATE INDEX IF NOT EXISTS idx_doc_action_subject_lower ON document_action_item(LOWER(subject_name));
+CREATE INDEX IF NOT EXISTS idx_doc_action_type ON document_action_item(action_type);
+CREATE INDEX IF NOT EXISTS idx_doc_action_metadata_gin ON document_action_item USING GIN(metadata);
+"""
+
+
 # Extended attribute table variant supporting class/object/relationship in addition to graph types
 create_attribute_table = """
 CREATE TABLE IF NOT EXISTS attribute (
@@ -498,7 +594,7 @@ CREATE INDEX IF NOT EXISTS idx_pattern_synonyms_semantic_distance ON pattern_syn
 create_semantic_terms_table = """
 CREATE TABLE IF NOT EXISTS semantic_terms (
     term_id              BIGSERIAL PRIMARY KEY,
-    kind                 VARCHAR(32) NOT NULL CHECK (kind IN ('attribute','relationship')),
+    kind                 VARCHAR(32) NOT NULL CHECK (kind IN ('attribute','relationship','entity_type','category')),
     canonical_name       VARCHAR(256) NOT NULL,
     term_text            VARCHAR(512) NOT NULL,
     language             VARCHAR(32) NOT NULL DEFAULT 'und',
@@ -523,7 +619,7 @@ CREATE TABLE IF NOT EXISTS query_term_alias (
     alias_id              BIGSERIAL PRIMARY KEY,
     alias_text            VARCHAR(512) NOT NULL,
     canonical_name        VARCHAR(256) NOT NULL,
-    kind                  VARCHAR(32) NOT NULL CHECK (kind IN ('attribute','relationship','entity_type')),
+    kind                  VARCHAR(32) NOT NULL CHECK (kind IN ('attribute','relationship','entity_type','category')),
     language              VARCHAR(32) NOT NULL DEFAULT 'und',
     priority              INTEGER NOT NULL DEFAULT 100,
     source_type           VARCHAR(64) NOT NULL DEFAULT 'manual',
@@ -542,6 +638,184 @@ CREATE INDEX IF NOT EXISTS idx_query_term_alias_kind ON query_term_alias(kind);
 CREATE INDEX IF NOT EXISTS idx_query_term_alias_is_active ON query_term_alias(is_active);
 CREATE INDEX IF NOT EXISTS idx_query_term_alias_priority ON query_term_alias(priority);
 CREATE INDEX IF NOT EXISTS idx_query_term_alias_metadata_gin ON query_term_alias USING GIN(metadata);
+"""
+
+
+create_query_alias_candidate_table = """
+CREATE TABLE IF NOT EXISTS query_alias_candidate (
+    candidate_id          BIGSERIAL PRIMARY KEY,
+    alias_text            VARCHAR(512) NOT NULL,
+    canonical_name        VARCHAR(256) NOT NULL,
+    kind                  VARCHAR(32) NOT NULL CHECK (kind IN ('attribute','relationship','entity_type','category','document_hint')),
+    language              VARCHAR(32) NOT NULL DEFAULT 'und',
+    confidence            NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    occurrence_count      INTEGER NOT NULL DEFAULT 1,
+    first_seen_doc_id     BIGINT REFERENCES document(doc_id) ON DELETE SET NULL,
+    last_seen_doc_id      BIGINT REFERENCES document(doc_id) ON DELETE SET NULL,
+    status                VARCHAR(32) NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','approved','rejected')),
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    modified_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (alias_text, canonical_name, kind, language)
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_alias_candidate_status ON query_alias_candidate(status);
+CREATE INDEX IF NOT EXISTS idx_query_alias_candidate_kind ON query_alias_candidate(kind);
+CREATE INDEX IF NOT EXISTS idx_query_alias_candidate_occurrence ON query_alias_candidate(occurrence_count DESC);
+"""
+
+
+create_source_schema_taxonomy_table = """
+CREATE TABLE IF NOT EXISTS source_schema_taxonomy (
+    taxonomy_id           BIGSERIAL PRIMARY KEY,
+    source_id             BIGINT NOT NULL REFERENCES source_database_registry(source_id) ON DELETE CASCADE,
+    schema_name           VARCHAR(256) NOT NULL,
+    table_name            VARCHAR(256) NOT NULL,
+    column_name           VARCHAR(256),
+    category_name         VARCHAR(256) NOT NULL,
+    role_name             VARCHAR(64) NOT NULL DEFAULT 'entity_candidate'
+                         CHECK (role_name IN ('entity_candidate','identity','attribute','filter','measure','temporal','relationship_key')),
+    confidence            NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    modified_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_id, schema_name, table_name, column_name, category_name, role_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_schema_taxonomy_source ON source_schema_taxonomy(source_id);
+CREATE INDEX IF NOT EXISTS idx_source_schema_taxonomy_category ON source_schema_taxonomy(category_name);
+CREATE INDEX IF NOT EXISTS idx_source_schema_taxonomy_role ON source_schema_taxonomy(role_name);
+CREATE INDEX IF NOT EXISTS idx_source_schema_taxonomy_lookup ON source_schema_taxonomy(category_name, role_name, is_active);
+CREATE INDEX IF NOT EXISTS idx_source_schema_taxonomy_metadata_gin ON source_schema_taxonomy USING GIN(metadata);
+"""
+
+
+create_category_registry_table = """
+CREATE TABLE IF NOT EXISTS category_registry (
+    category_id           BIGSERIAL PRIMARY KEY,
+    category_name         VARCHAR(256) NOT NULL,
+    source_scope          VARCHAR(32) NOT NULL CHECK (source_scope IN ('internal', 'external', 'document_kb')),
+    access_method         VARCHAR(32) NOT NULL CHECK (access_method IN ('sql', 'semantic_lookup', 'rag', 'document_facet')),
+    source_id             BIGINT,
+    schema_name           VARCHAR(256),
+    table_name            VARCHAR(256),
+    column_name           VARCHAR(256),
+    entity_types          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    attributes            JSONB NOT NULL DEFAULT '[]'::jsonb,
+    document_types        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    confidence            NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    modified_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (category_name, source_scope, access_method, source_id, schema_name, table_name, column_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_category_registry_name ON category_registry(category_name);
+CREATE INDEX IF NOT EXISTS idx_category_registry_scope_method ON category_registry(source_scope, access_method);
+CREATE INDEX IF NOT EXISTS idx_category_registry_source ON category_registry(source_id);
+CREATE INDEX IF NOT EXISTS idx_category_registry_entity_types ON category_registry USING GIN(entity_types);
+CREATE INDEX IF NOT EXISTS idx_category_registry_attributes ON category_registry USING GIN(attributes);
+CREATE INDEX IF NOT EXISTS idx_category_registry_document_types ON category_registry USING GIN(document_types);
+CREATE INDEX IF NOT EXISTS idx_category_registry_metadata ON category_registry USING GIN(metadata);
+"""
+
+
+create_categories_table = """
+CREATE TABLE IF NOT EXISTS categories (
+    category_id           BIGSERIAL PRIMARY KEY,
+    name                  VARCHAR(256) NOT NULL UNIQUE,
+    description           TEXT,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    modified_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
+CREATE INDEX IF NOT EXISTS idx_categories_metadata ON categories USING GIN(metadata);
+"""
+
+
+create_category_sources_table = """
+CREATE TABLE IF NOT EXISTS category_sources (
+    category_source_id    BIGSERIAL PRIMARY KEY,
+    category_id           BIGINT NOT NULL REFERENCES categories(category_id) ON DELETE CASCADE,
+    source_type           VARCHAR(32) NOT NULL CHECK (source_type IN ('internal_db', 'external_db', 'documents')),
+    source_id             BIGINT REFERENCES source_database_registry(source_id) ON DELETE CASCADE,
+    access_method         VARCHAR(32) NOT NULL CHECK (access_method IN ('sql', 'semantic_lookup', 'rag', 'document_facet')),
+    priority              INTEGER NOT NULL DEFAULT 100,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    modified_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_category_sources_identity
+ON category_sources(category_id, source_type, COALESCE(source_id, 0), access_method);
+CREATE INDEX IF NOT EXISTS idx_category_sources_category ON category_sources(category_id);
+CREATE INDEX IF NOT EXISTS idx_category_sources_source ON category_sources(source_id);
+"""
+
+
+create_category_entities_table = """
+CREATE TABLE IF NOT EXISTS category_entities (
+    category_entity_id    BIGSERIAL PRIMARY KEY,
+    category_source_id    BIGINT NOT NULL REFERENCES category_sources(category_source_id) ON DELETE CASCADE,
+    entity_type           VARCHAR(256) NOT NULL,
+    source_table          VARCHAR(256),
+    source_column         VARCHAR(256),
+    role_name             VARCHAR(64) NOT NULL DEFAULT 'entity_candidate',
+    confidence            NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_category_entities_identity
+ON category_entities(category_source_id, entity_type, COALESCE(source_table, ''), COALESCE(source_column, ''), role_name);
+CREATE INDEX IF NOT EXISTS idx_category_entities_type ON category_entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_category_entities_source ON category_entities(category_source_id);
+"""
+
+
+create_category_attributes_table = """
+CREATE TABLE IF NOT EXISTS category_attributes (
+    category_attribute_id BIGSERIAL PRIMARY KEY,
+    category_source_id    BIGINT NOT NULL REFERENCES category_sources(category_source_id) ON DELETE CASCADE,
+    attribute_name        VARCHAR(256) NOT NULL,
+    canonical_name        VARCHAR(256) NOT NULL,
+    source_table          VARCHAR(256),
+    source_column         VARCHAR(256),
+    role_name             VARCHAR(64) NOT NULL DEFAULT 'attribute',
+    confidence            NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_category_attributes_identity
+ON category_attributes(category_source_id, canonical_name, COALESCE(source_table, ''), COALESCE(source_column, ''), role_name);
+CREATE INDEX IF NOT EXISTS idx_category_attributes_canonical ON category_attributes(canonical_name);
+CREATE INDEX IF NOT EXISTS idx_category_attributes_source ON category_attributes(category_source_id);
+"""
+
+
+create_query_pattern_registry_table = """
+CREATE TABLE IF NOT EXISTS query_pattern_registry (
+    pattern_id            BIGSERIAL PRIMARY KEY,
+    pattern_key           VARCHAR(128) NOT NULL UNIQUE,
+    display_name          VARCHAR(256) NOT NULL,
+    intent_key            VARCHAR(128) NOT NULL,
+    description           TEXT,
+    allowed_source_scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    allowed_access_methods JSONB NOT NULL DEFAULT '[]'::jsonb,
+    priority              INTEGER NOT NULL DEFAULT 100,
+    is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    modified_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_pattern_registry_intent ON query_pattern_registry(intent_key);
+CREATE INDEX IF NOT EXISTS idx_query_pattern_registry_active ON query_pattern_registry(is_active);
 """
 
 
@@ -744,6 +1018,66 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_doc_link_metadata_gin ON workflow_pipeli
 """
 
 
+create_workflow_mutation_journal_table = """
+CREATE TABLE IF NOT EXISTS workflow_mutation_journal (
+    journal_id            BIGSERIAL PRIMARY KEY,
+    run_id                BIGINT REFERENCES workflow_pipeline_run(run_id) ON DELETE CASCADE,
+    workflow_version_id   BIGINT REFERENCES solf_workflow_versions(workflow_version_id) ON DELETE SET NULL,
+    workflow_key          VARCHAR(256),
+    step_key              VARCHAR(256),
+    step_order            INTEGER,
+    operation_kind        VARCHAR(64) NOT NULL,
+    target_store          VARCHAR(32) NOT NULL DEFAULT 'sql',
+    target_entity         VARCHAR(128) NOT NULL DEFAULT 'workflow_context',
+    mutation_key          VARCHAR(256),
+    business_key          VARCHAR(256),
+    business_key_type     VARCHAR(64),
+    before_state          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    after_state           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    inverse_action        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status                VARCHAR(32) NOT NULL DEFAULT 'applied',
+    applied_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    undone_at             TIMESTAMPTZ,
+    undone_by             VARCHAR(128),
+    undo_error            TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_mutation_run_id ON workflow_mutation_journal(run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_mutation_step ON workflow_mutation_journal(run_id, step_order, step_key);
+CREATE INDEX IF NOT EXISTS idx_workflow_mutation_status ON workflow_mutation_journal(status);
+CREATE INDEX IF NOT EXISTS idx_workflow_mutation_applied_at ON workflow_mutation_journal(applied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workflow_mutation_business_key ON workflow_mutation_journal(business_key);
+CREATE INDEX IF NOT EXISTS idx_workflow_mutation_target_entity ON workflow_mutation_journal(target_entity);
+"""
+
+
+create_action_resolution_plan_table = """
+CREATE TABLE IF NOT EXISTS action_resolution_plan (
+    plan_id                UUID PRIMARY KEY,
+    request_text           TEXT NOT NULL,
+    action_object          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    workflow_snapshot      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    execution_plan         JSONB NOT NULL DEFAULT '[]'::jsonb,
+    parameters             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    missing_parameters     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status                 VARCHAR(32) NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending','awaiting_input','confirmed','executing','completed','rejected','expired')),
+    requested_by           VARCHAR(128) NOT NULL DEFAULT 'api:user',
+    expires_at             TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes'),
+    confirmed_at           TIMESTAMPTZ,
+    completed_at           TIMESTAMPTZ,
+    result                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    modified_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_resolution_plan_status ON action_resolution_plan(status);
+CREATE INDEX IF NOT EXISTS idx_action_resolution_plan_expires ON action_resolution_plan(expires_at);
+CREATE INDEX IF NOT EXISTS idx_action_resolution_plan_created ON action_resolution_plan(created_at DESC);
+"""
+
+
 create_business_rule_workflow_links_table = """
 CREATE TABLE IF NOT EXISTS business_rule_workflow_links (
     link_id               BIGSERIAL PRIMARY KEY,
@@ -870,6 +1204,29 @@ CREATE INDEX IF NOT EXISTS idx_workflow_extension_attachment_version_id ON workf
 CREATE INDEX IF NOT EXISTS idx_workflow_extension_attachment_tenant_scope ON workflow_extension_attachment(tenant_scope);
 CREATE INDEX IF NOT EXISTS idx_workflow_extension_attachment_active ON workflow_extension_attachment(is_active);
 CREATE INDEX IF NOT EXISTS idx_workflow_extension_attachment_metadata_gin ON workflow_extension_attachment USING GIN(metadata);
+"""
+
+
+create_document_removal_log_table = """
+CREATE TABLE IF NOT EXISTS document_removal_log (
+    removal_id            BIGSERIAL PRIMARY KEY,
+    doc_id                BIGINT NOT NULL,
+    removed_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    removed_by            VARCHAR(128),
+    reason                TEXT,
+    document_row          JSONB NOT NULL,
+    part_rows             JSONB NOT NULL DEFAULT '[]'::jsonb,
+    table_cell_rows       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    restored_at           TIMESTAMPTZ,
+    restored_by           VARCHAR(128),
+    restore_status        VARCHAR(32) NOT NULL DEFAULT 'pending',
+    restore_error         TEXT,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_removal_log_doc_id ON document_removal_log(doc_id);
+CREATE INDEX IF NOT EXISTS idx_document_removal_log_removed_at ON document_removal_log(removed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_document_removal_log_restore_status ON document_removal_log(restore_status);
 """
 
 
@@ -1291,6 +1648,186 @@ def search_documents_by_key(
     ]
 
 
+def replace_document_geographic_facets(
+    connection: psycopg2.extensions.connection,
+    doc_id: int,
+    facets: list[dict[str, Any]],
+) -> int:
+    """Replace extracted geographic facets for one document."""
+    allowed_kinds = {"country", "region", "city", "address", "venue", "unknown"}
+    allowed_roles = {"incident_location", "issuer_location", "sender_address", "recipient_address", "document_subject", "service_location", "jurisdiction", "unknown"}
+    rows: list[tuple[Any, ...]] = []
+    for item in facets:
+        if not isinstance(item, dict):
+            continue
+        raw_name = str(item.get("raw_name") or item.get("name") or "").strip()
+        canonical_name = str(item.get("canonical_name") or raw_name).strip()
+        place_kind = str(item.get("place_kind") or item.get("kind") or "unknown").strip().lower()
+        role_name = str(item.get("role_name") or item.get("role") or "document_subject").strip().lower()
+        if not raw_name or not canonical_name or place_kind not in allowed_kinds or role_name not in allowed_roles:
+            continue
+        confidence = max(0.0, min(1.0, float(item.get("confidence") or 0.5)))
+        rows.append((int(doc_id), raw_name, canonical_name, place_kind, str(item.get("country_code") or "").strip().upper() or None, role_name, confidence, Json(item.get("metadata") if isinstance(item.get("metadata"), dict) else {})))
+
+    with connection.cursor() as cursor:
+        cursor.execute(create_document_geographic_facet_table)
+        cursor.execute("DELETE FROM document_geographic_facet WHERE doc_id = %s", (int(doc_id),))
+        if rows:
+            cursor.executemany(
+                """
+                INSERT INTO document_geographic_facet (
+                    doc_id, raw_name, canonical_name, place_kind, country_code, role_name, confidence, metadata
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (doc_id, canonical_name, place_kind, country_code, role_name)
+                DO UPDATE SET raw_name = EXCLUDED.raw_name, confidence = EXCLUDED.confidence,
+                              metadata = COALESCE(document_geographic_facet.metadata, '{}'::jsonb) || EXCLUDED.metadata
+                """,
+                rows,
+            )
+    connection.commit()
+    return len(rows)
+
+
+def search_documents_by_geography(
+    connection: psycopg2.extensions.connection,
+    location: str,
+    country_code: str | None = None,
+    role_name: str | None = None,
+    doc_type: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    normalized_location = str(location or "").strip()
+    normalized_country = str(country_code or "").strip().upper()
+    if not normalized_location and not normalized_country:
+        return []
+    conditions = ["d.status = 'active'"]
+    params: list[Any] = []
+    if normalized_location:
+        conditions.append("(f.canonical_name ILIKE %s OR f.raw_name ILIKE %s)")
+        params.extend([normalized_location, normalized_location])
+    if normalized_country:
+        conditions.append("f.country_code = %s")
+        params.append(normalized_country)
+    if str(role_name or "").strip():
+        conditions.append("f.role_name = %s")
+        params.append(str(role_name).strip().lower())
+    if str(doc_type or "").strip():
+        conditions.append("d.doc_type = %s")
+        params.append(str(doc_type).strip().lower())
+    params.append(max(1, min(int(limit), 200)))
+    with connection.cursor() as cursor:
+        cursor.execute(create_document_geographic_facet_table)
+        cursor.execute(
+            f"""
+            SELECT d.doc_id, d.doc_key, d.doc_name, d.doc_type, d.doc_date,
+                   f.raw_name, f.canonical_name, f.place_kind, f.country_code, f.role_name, f.confidence
+            FROM document_geographic_facet f
+            JOIN document d ON d.doc_id = f.doc_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY d.doc_date DESC NULLS LAST, f.confidence DESC, d.doc_id DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cursor.fetchall() or []
+    return [
+        {"doc_id": int(row[0]), "doc_key": row[1], "doc_name": row[2], "doc_type": row[3], "doc_date": str(row[4]) if row[4] else None,
+         "raw_name": row[5], "canonical_name": row[6], "place_kind": row[7], "country_code": row[8], "role_name": row[9], "confidence": float(row[10])}
+        for row in rows
+    ]
+
+
+def replace_document_action_items(
+    connection: psycopg2.extensions.connection,
+    doc_id: int,
+    action_items: list[dict[str, Any]],
+) -> int:
+    """Replace extracted action items for one document without creating operational tasks."""
+    allowed_priorities = {"low", "medium", "high", "urgent"}
+    allowed_statuses = {"open", "in_progress", "completed", "cancelled", "superseded"}
+    rows: list[tuple[Any, ...]] = []
+    for item in action_items:
+        if not isinstance(item, dict):
+            continue
+        instruction = str(item.get("instruction") or item.get("action") or "").strip()
+        action_type = str(item.get("action_type") or "general_action").strip().lower() or "general_action"
+        priority = str(item.get("priority") or "medium").strip().lower()
+        status = str(item.get("status") or "open").strip().lower()
+        if not instruction or priority not in allowed_priorities or status not in allowed_statuses:
+            continue
+        confidence = max(0.0, min(1.0, float(item.get("confidence") or 0.5)))
+        rows.append((
+            int(doc_id), action_type, instruction,
+            str(item.get("subject_name") or item.get("subject") or "").strip() or None,
+            str(item.get("assignee_name") or item.get("assignee") or "").strip() or None,
+            item.get("due_date") or None, priority, status, confidence,
+            Json(item.get("metadata") if isinstance(item.get("metadata"), dict) else {}),
+        ))
+    with connection.cursor() as cursor:
+        cursor.execute(create_document_action_item_table)
+        cursor.execute("DELETE FROM document_action_item WHERE doc_id = %s", (int(doc_id),))
+        if rows:
+            cursor.executemany(
+                """
+                INSERT INTO document_action_item (
+                    doc_id, action_type, instruction, subject_name, assignee_name,
+                    due_date, priority, status, confidence, metadata
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                rows,
+            )
+    connection.commit()
+    return len(rows)
+
+
+def search_document_action_items(
+    connection: psycopg2.extensions.connection,
+    subject_query: str | None = None,
+    document_query: str | None = None,
+    status: str | None = "open",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    conditions = ["d.status = 'active'"]
+    params: list[Any] = []
+    subject = str(subject_query or "").strip()
+    document = str(document_query or "").strip()
+    if subject:
+        conditions.append("(a.subject_name ILIKE %s OR a.instruction ILIKE %s)")
+        params.extend([f"%{subject}%", f"%{subject}%"])
+    if document:
+        conditions.append("(d.doc_key ILIKE %s OR d.doc_name ILIKE %s OR d.doc_type ILIKE %s OR d.doc_desc ILIKE %s)")
+        params.extend([f"%{document}%"] * 4)
+    if str(status or "").strip():
+        conditions.append("a.status = %s")
+        params.append(str(status).strip().lower())
+    params.append(max(1, min(int(limit), 200)))
+    with connection.cursor() as cursor:
+        cursor.execute(create_document_action_item_table)
+        cursor.execute(
+            f"""
+            SELECT a.action_item_id, a.action_type, a.instruction, a.subject_name, a.assignee_name,
+                   a.due_date, a.priority, a.status, a.confidence, a.metadata,
+                   d.doc_id, d.doc_key, d.doc_name, d.doc_type, d.doc_date
+            FROM document_action_item a
+            JOIN document d ON d.doc_id = a.doc_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY a.due_date ASC NULLS LAST,
+                     CASE a.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+                     d.doc_date DESC NULLS LAST, a.action_item_id DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cursor.fetchall() or []
+    return [
+        {"action_item_id": int(row[0]), "action_type": row[1], "instruction": row[2], "subject_name": row[3],
+         "assignee_name": row[4], "due_date": str(row[5]) if row[5] else None, "priority": row[6], "status": row[7],
+         "confidence": float(row[8]), "metadata": row[9] if isinstance(row[9], dict) else {}, "doc_id": int(row[10]),
+         "doc_key": row[11], "doc_name": row[12], "doc_type": row[13], "doc_date": str(row[14]) if row[14] else None}
+        for row in rows
+    ]
+
+
 def get_document_brief_by_id(
     connection: psycopg2.extensions.connection,
     doc_id: int,
@@ -1518,6 +2055,308 @@ def select_document_ids_for_table_provenance_backfill(
             )
         rows = cursor.fetchall() or []
     return [int(row[0]) for row in rows if row and int(row[0]) > 0]
+
+
+def _rows_to_dicts(cursor: psycopg2.extensions.cursor, rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    columns = [str(col[0]) for col in list(cursor.description or [])]
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        out.append({columns[idx]: row[idx] for idx in range(len(columns))})
+    return out
+
+
+def _set_serial_sequence_to_max(
+    connection: psycopg2.extensions.connection,
+    table_name: str,
+    id_column: str,
+) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_get_serial_sequence(%s, %s)", (table_name, id_column))
+        row = cursor.fetchone()
+        sequence_name = str(row[0] or "").strip() if row else ""
+        if not sequence_name:
+            return
+        cursor.execute(
+            f"SELECT setval(%s, COALESCE((SELECT MAX({id_column}) FROM {table_name}), 1), true)",
+            (sequence_name,),
+        )
+
+
+def log_document_removal_snapshot(
+    connection: psycopg2.extensions.connection,
+    doc_id: int,
+    removed_by: str | None = None,
+    reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Persist a full document-removal snapshot before deletion for undo support."""
+    with connection.cursor() as cursor:
+        cursor.execute(create_document_removal_log_table)
+        cursor.execute(
+            """
+            SELECT doc_id, doc_name, doc_key, doc_path, markdown_path, doc_cat, doc_type,
+                   doc_date, doc_desc, doc_theme, keyword_text, identifiers_kv, metadata,
+                   status, valid_from, valid_until, entry_date
+            FROM document
+            WHERE doc_id = %s
+            """,
+            (int(doc_id),),
+        )
+        doc_row = cursor.fetchone()
+        if doc_row is None:
+            return None
+        doc_columns = [str(col[0]) for col in list(cursor.description or [])]
+        document_payload = {doc_columns[idx]: doc_row[idx] for idx in range(len(doc_columns))}
+
+        cursor.execute(
+            """
+            SELECT part_id, doc_id, part_key, class_id, object_id, relationship_id, metadata, entry_date
+            FROM part
+            WHERE doc_id = %s
+            ORDER BY part_id
+            """,
+            (int(doc_id),),
+        )
+        part_rows = _rows_to_dicts(cursor, cursor.fetchall() or [])
+
+        cursor.execute(
+            """
+            SELECT cell_id, doc_id, table_index, row_index, row_label, column_index,
+                   column_label, cell_value, source_kind, metadata, created_at
+            FROM document_table_cell
+            WHERE doc_id = %s
+            ORDER BY cell_id
+            """,
+            (int(doc_id),),
+        )
+        table_cell_rows = _rows_to_dicts(cursor, cursor.fetchall() or [])
+
+        cursor.execute(
+            """
+            INSERT INTO document_removal_log (
+                doc_id, removed_by, reason, document_row, part_rows, table_cell_rows, metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING removal_id, removed_at
+            """,
+            (
+                int(doc_id),
+                str(removed_by or "").strip() or None,
+                str(reason or "").strip() or None,
+                Json(document_payload),
+                Json(part_rows),
+                Json(table_cell_rows),
+                Json(metadata or {}),
+            ),
+        )
+        inserted = cursor.fetchone()
+        removal_id = int(inserted[0]) if inserted else 0
+        removed_at = inserted[1] if inserted else None
+
+    return {
+        "removal_id": removal_id,
+        "doc_id": int(doc_id),
+        "removed_at": removed_at,
+        "removed_by": str(removed_by or "").strip() or None,
+        "reason": str(reason or "").strip() or None,
+        "part_row_count": len(part_rows),
+        "table_cell_row_count": len(table_cell_rows),
+    }
+
+
+def get_latest_document_removal_snapshot(
+    connection: psycopg2.extensions.connection,
+    doc_id: int,
+) -> dict[str, Any] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(create_document_removal_log_table)
+        cursor.execute(
+            """
+            SELECT removal_id, doc_id, removed_at, removed_by, reason, document_row,
+                   part_rows, table_cell_rows, restored_at, restored_by, restore_status,
+                   restore_error, metadata
+            FROM document_removal_log
+            WHERE doc_id = %s
+            ORDER BY removal_id DESC
+            LIMIT 1
+            """,
+            (int(doc_id),),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "removal_id": int(row[0]),
+        "doc_id": int(row[1]),
+        "removed_at": row[2],
+        "removed_by": row[3],
+        "reason": row[4],
+        "document_row": row[5] if isinstance(row[5], dict) else {},
+        "part_rows": row[6] if isinstance(row[6], list) else [],
+        "table_cell_rows": row[7] if isinstance(row[7], list) else [],
+        "restored_at": row[8],
+        "restored_by": row[9],
+        "restore_status": row[10],
+        "restore_error": row[11],
+        "metadata": row[12] if isinstance(row[12], dict) else {},
+    }
+
+
+def restore_document_from_removal_log(
+    connection: psycopg2.extensions.connection,
+    removal_id: int,
+    restored_by: str | None = None,
+) -> dict[str, Any]:
+    with connection.cursor() as cursor:
+        cursor.execute(create_document_removal_log_table)
+        cursor.execute(
+            """
+            SELECT removal_id, doc_id, document_row, part_rows, table_cell_rows,
+                   restore_status, restored_at
+            FROM document_removal_log
+            WHERE removal_id = %s
+            FOR UPDATE
+            """,
+            (int(removal_id),),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        raise ValueError(f"Removal snapshot {int(removal_id)} not found")
+
+    snapshot_doc_id = int(row[1])
+    document_row = row[2] if isinstance(row[2], dict) else {}
+    part_rows = row[3] if isinstance(row[3], list) else []
+    table_cell_rows = row[4] if isinstance(row[4], list) else []
+    restore_status = str(row[5] or "").strip().lower()
+    restored_at = row[6]
+
+    if restore_status == "restored" and restored_at is not None:
+        return {
+            "restored": False,
+            "reason": "already_restored",
+            "removal_id": int(removal_id),
+            "doc_id": snapshot_doc_id,
+        }
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM document WHERE doc_id = %s", (snapshot_doc_id,))
+        if cursor.fetchone() is not None:
+            raise ValueError(f"Document {snapshot_doc_id} already exists; cannot restore snapshot")
+
+        cursor.execute(
+            """
+            INSERT INTO document (
+                doc_id, doc_name, doc_key, doc_path, markdown_path, doc_cat, doc_type,
+                doc_date, doc_desc, doc_theme, keyword_text, identifiers_kv, metadata,
+                status, valid_from, valid_until, entry_date
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                int(document_row.get("doc_id") or snapshot_doc_id),
+                document_row.get("doc_name"),
+                document_row.get("doc_key"),
+                document_row.get("doc_path"),
+                document_row.get("markdown_path"),
+                document_row.get("doc_cat"),
+                document_row.get("doc_type"),
+                document_row.get("doc_date"),
+                document_row.get("doc_desc"),
+                document_row.get("doc_theme"),
+                document_row.get("keyword_text"),
+                Json(document_row.get("identifiers_kv") if isinstance(document_row.get("identifiers_kv"), dict) else {}),
+                Json(document_row.get("metadata") if isinstance(document_row.get("metadata"), dict) else {}),
+                document_row.get("status") or "active",
+                document_row.get("valid_from"),
+                document_row.get("valid_until"),
+                document_row.get("entry_date"),
+            ),
+        )
+
+        restored_parts = 0
+        for part in part_rows:
+            if not isinstance(part, dict):
+                continue
+            cursor.execute(
+                """
+                INSERT INTO part (
+                    part_id, doc_id, part_key, class_id, object_id, relationship_id, metadata, entry_date
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (part_id)
+                DO NOTHING
+                """,
+                (
+                    part.get("part_id"),
+                    int(part.get("doc_id") or snapshot_doc_id),
+                    part.get("part_key"),
+                    part.get("class_id"),
+                    part.get("object_id"),
+                    part.get("relationship_id"),
+                    Json(part.get("metadata") if isinstance(part.get("metadata"), dict) else {}),
+                    part.get("entry_date"),
+                ),
+            )
+            restored_parts += int(cursor.rowcount or 0)
+
+        restored_cells = 0
+        for cell in table_cell_rows:
+            if not isinstance(cell, dict):
+                continue
+            cursor.execute(
+                """
+                INSERT INTO document_table_cell (
+                    cell_id, doc_id, table_index, row_index, row_label, column_index,
+                    column_label, cell_value, source_kind, metadata, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (cell_id)
+                DO NOTHING
+                """,
+                (
+                    cell.get("cell_id"),
+                    int(cell.get("doc_id") or snapshot_doc_id),
+                    int(cell.get("table_index") or 0),
+                    int(cell.get("row_index") or 0),
+                    cell.get("row_label"),
+                    int(cell.get("column_index") or 0),
+                    cell.get("column_label"),
+                    cell.get("cell_value"),
+                    str(cell.get("source_kind") or "document").strip().lower() or "document",
+                    Json(cell.get("metadata") if isinstance(cell.get("metadata"), dict) else {}),
+                    cell.get("created_at"),
+                ),
+            )
+            restored_cells += int(cursor.rowcount or 0)
+
+        cursor.execute(
+            """
+            UPDATE document_removal_log
+            SET restored_at = NOW(),
+                restored_by = %s,
+                restore_status = 'restored',
+                restore_error = NULL
+            WHERE removal_id = %s
+            """,
+            (str(restored_by or "").strip() or "api:user", int(removal_id)),
+        )
+
+    _set_serial_sequence_to_max(connection, "document", "doc_id")
+    _set_serial_sequence_to_max(connection, "part", "part_id")
+    _set_serial_sequence_to_max(connection, "document_table_cell", "cell_id")
+    _set_serial_sequence_to_max(connection, "document_removal_log", "removal_id")
+
+    connection.commit()
+    return {
+        "restored": True,
+        "removal_id": int(removal_id),
+        "doc_id": snapshot_doc_id,
+        "parts_restored": int(restored_parts),
+        "table_cells_restored": int(restored_cells),
+    }
 
 
 def _normalize_date_key(value: Any) -> int | None:
@@ -2064,6 +2903,7 @@ def upsert_semantic_terms(
     source_type_aliases = {
         "ingest_llm_alias": "llm_generated",
     }
+    allowed_kinds = {"attribute", "relationship", "entity_type", "category"}
     for item in terms:
         if not isinstance(item, dict):
             continue
@@ -2077,7 +2917,7 @@ def upsert_semantic_terms(
             source_type = "ingest"
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
 
-        if kind not in {"attribute", "relationship"}:
+        if kind not in allowed_kinds:
             continue
         if not canonical_name or not term_text:
             continue
@@ -2102,6 +2942,718 @@ def upsert_semantic_terms(
         )
     connection.commit()
     return len(rows)
+
+
+def upsert_query_term_alias(
+    connection: psycopg2.extensions.connection,
+    aliases: list[dict[str, Any]],
+) -> int:
+    """Upsert query-time alias rows for canonical terms and general business categories."""
+    if not aliases:
+        return 0
+
+    rows: list[tuple[str, str, str, str, int, str, Any]] = []
+    allowed_kinds = {"attribute", "relationship", "entity_type", "category"}
+    allowed_source_types = {"manual", "ingest", "seeded", "solf_clause", "llm_generated"}
+    for item in aliases:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        alias_text = str(item.get("alias_text") or "").strip()
+        canonical_name = str(item.get("canonical_name") or "").strip().lower()
+        language = str(item.get("language") or "und").strip().lower() or "und"
+        source_type = str(item.get("source_type") or "manual").strip().lower() or "manual"
+        priority = int(item.get("priority") or 100)
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+
+        if kind not in allowed_kinds:
+            continue
+        if source_type not in allowed_source_types:
+            source_type = "manual"
+        if not alias_text or not canonical_name:
+            continue
+
+        rows.append((alias_text, canonical_name, kind, language, priority, source_type, Json(metadata)))
+
+    if not rows:
+        return 0
+
+    with connection.cursor() as cursor:
+        cursor.executemany(
+            """
+            INSERT INTO query_term_alias (alias_text, canonical_name, kind, language, priority, source_type, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (alias_text, kind, language)
+            DO UPDATE SET
+                canonical_name = EXCLUDED.canonical_name,
+                priority = EXCLUDED.priority,
+                source_type = EXCLUDED.source_type,
+                metadata = COALESCE(query_term_alias.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb),
+                is_active = TRUE,
+                modified_at = NOW()
+            """,
+            rows,
+        )
+    connection.commit()
+    return len(rows)
+
+
+def upsert_query_alias_candidates(
+    connection: psycopg2.extensions.connection,
+    candidates: list[dict[str, Any]],
+) -> int:
+    """Record learned aliases for review; this never activates query routing aliases."""
+    rows: list[tuple[Any, ...]] = []
+    allowed_kinds = {"attribute", "relationship", "entity_type", "category", "document_hint"}
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        alias_text = str(item.get("alias_text") or item.get("term_text") or "").strip().lower()
+        canonical_name = str(item.get("canonical_name") or "").strip().lower()
+        kind = str(item.get("kind") or "").strip().lower()
+        if not alias_text or not canonical_name or kind not in allowed_kinds or alias_text == canonical_name:
+            continue
+        rows.append((
+            alias_text, canonical_name, kind, str(item.get("language") or "und").strip().lower() or "und",
+            max(0.0, min(1.0, float(item.get("confidence") or 0.5))),
+            int(item.get("doc_id") or 0) or None, Json(item.get("metadata") if isinstance(item.get("metadata"), dict) else {}),
+        ))
+    if not rows:
+        return 0
+    with connection.cursor() as cursor:
+        cursor.execute(create_query_alias_candidate_table)
+        cursor.executemany(
+            """
+            INSERT INTO query_alias_candidate (alias_text, canonical_name, kind, language, confidence, first_seen_doc_id, last_seen_doc_id, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (alias_text, canonical_name, kind, language)
+            DO UPDATE SET occurrence_count = query_alias_candidate.occurrence_count + 1,
+                          last_seen_doc_id = EXCLUDED.last_seen_doc_id,
+                          confidence = GREATEST(query_alias_candidate.confidence, EXCLUDED.confidence),
+                          metadata = COALESCE(query_alias_candidate.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                          modified_at = NOW()
+            """,
+            [(a, c, k, l, confidence, doc_id, doc_id, metadata) for a, c, k, l, confidence, doc_id, metadata in rows],
+        )
+    connection.commit()
+    return len(rows)
+
+
+def promote_query_alias_candidate(
+    connection: psycopg2.extensions.connection,
+    candidate_id: int,
+    approved_by: str = "api:user",
+) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute(create_query_alias_candidate_table)
+        cursor.execute(
+            "SELECT alias_text, canonical_name, kind, language, confidence, metadata FROM query_alias_candidate WHERE candidate_id = %s AND status = 'proposed'",
+            (int(candidate_id),),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return False
+        alias_kind = "category" if row[2] == "document_hint" else row[2]
+        upsert_query_term_alias(connection, [{"alias_text": row[0], "canonical_name": row[1], "kind": alias_kind, "language": row[3], "priority": 90, "source_type": "llm_generated", "metadata": {**(row[5] or {}), "approved_by": approved_by, "candidate_id": int(candidate_id)}}])
+        cursor.execute("UPDATE query_alias_candidate SET status = 'approved', modified_at = NOW() WHERE candidate_id = %s", (int(candidate_id),))
+    connection.commit()
+    return True
+
+
+def list_query_alias_candidates(
+    connection: psycopg2.extensions.connection,
+    status: str | None = "proposed",
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    with connection.cursor() as cursor:
+        cursor.execute(create_query_alias_candidate_table)
+        cursor.execute(
+            """
+            SELECT candidate_id, alias_text, canonical_name, kind, language, confidence,
+                   occurrence_count, first_seen_doc_id, last_seen_doc_id, status, metadata,
+                   created_at, modified_at
+            FROM query_alias_candidate
+            WHERE (%s IS NULL OR status = %s)
+            ORDER BY confidence DESC, occurrence_count DESC, candidate_id DESC
+            LIMIT %s
+            """,
+            (str(status).strip().lower() if status else None, str(status).strip().lower() if status else None, max(1, min(int(limit), 1000))),
+        )
+        rows = cursor.fetchall() or []
+    return [
+        {"candidate_id": int(row[0]), "alias_text": row[1], "canonical_name": row[2], "kind": row[3],
+         "language": row[4], "confidence": float(row[5]), "occurrence_count": int(row[6]),
+         "first_seen_doc_id": int(row[7]) if row[7] is not None else None, "last_seen_doc_id": int(row[8]) if row[8] is not None else None,
+         "status": row[9], "metadata": row[10] or {}, "created_at": row[11], "modified_at": row[12]}
+        for row in rows
+    ]
+
+
+def upsert_source_schema_taxonomy(
+    connection: psycopg2.extensions.connection,
+    rows: list[dict[str, Any]],
+) -> int:
+    """Upsert semantic source-schema classifications without syncing source rows."""
+    if not rows:
+        return 0
+
+    values: list[tuple[Any, ...]] = []
+    allowed_roles = {"entity_candidate", "identity", "attribute", "filter", "measure", "temporal", "relationship_key"}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        source_id = int(item.get("source_id") or 0)
+        schema_name = str(item.get("schema_name") or "").strip()
+        table_name = str(item.get("table_name") or "").strip()
+        category_name = str(item.get("category_name") or "").strip().lower()
+        role_name = str(item.get("role_name") or "entity_candidate").strip().lower()
+        if source_id <= 0 or not schema_name or not table_name or not category_name or role_name not in allowed_roles:
+            continue
+        confidence = max(0.0, min(1.0, float(item.get("confidence") or 0.5)))
+        values.append(
+            (
+                source_id,
+                schema_name,
+                table_name,
+                str(item.get("column_name") or "").strip() or None,
+                category_name,
+                role_name,
+                confidence,
+                Json(item.get("metadata") if isinstance(item.get("metadata"), dict) else {}),
+            )
+        )
+    if not values:
+        return 0
+
+    with connection.cursor() as cursor:
+        cursor.execute(create_source_schema_taxonomy_table)
+        cursor.executemany(
+            """
+            INSERT INTO source_schema_taxonomy (
+                source_id, schema_name, table_name, column_name, category_name,
+                role_name, confidence, metadata, is_active, modified_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW())
+            ON CONFLICT (source_id, schema_name, table_name, column_name, category_name, role_name)
+            DO UPDATE SET confidence = EXCLUDED.confidence,
+                          metadata = COALESCE(source_schema_taxonomy.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                          is_active = TRUE,
+                          modified_at = NOW()
+            """,
+            values,
+        )
+    connection.commit()
+    return len(values)
+
+
+def find_source_schema_taxonomy(
+    connection: psycopg2.extensions.connection,
+    category_name: str | None = None,
+    role_name: str | None = None,
+    source_id: int | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    conditions = ["t.is_active = TRUE"]
+    params: list[Any] = []
+    if str(category_name or "").strip():
+        conditions.append("t.category_name = %s")
+        params.append(str(category_name).strip().lower())
+    if str(role_name or "").strip():
+        conditions.append("t.role_name = %s")
+        params.append(str(role_name).strip().lower())
+    if source_id is not None:
+        conditions.append("t.source_id = %s")
+        params.append(int(source_id))
+    params.append(max(1, min(int(limit), 1000)))
+
+    with connection.cursor() as cursor:
+        cursor.execute(create_source_schema_taxonomy_table)
+        cursor.execute(
+            f"""
+            SELECT t.taxonomy_id, t.source_id, r.source_key, t.schema_name, t.table_name,
+                   t.column_name, t.category_name, t.role_name, t.confidence, t.metadata
+            FROM source_schema_taxonomy t
+            JOIN source_database_registry r ON r.source_id = t.source_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY t.confidence DESC, r.source_key, t.schema_name, t.table_name, t.column_name NULLS FIRST
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        results = cursor.fetchall() or []
+    return [
+        {
+            "taxonomy_id": int(row[0]), "source_id": int(row[1]), "source_key": row[2],
+            "schema_name": row[3], "table_name": row[4], "column_name": row[5],
+            "category_name": row[6], "role_name": row[7], "confidence": float(row[8]),
+            "metadata": row[9] if isinstance(row[9], dict) else {},
+        }
+        for row in results
+    ]
+
+
+def upsert_category_registry_rows(
+    connection: psycopg2.extensions.connection,
+    rows: list[dict[str, Any]],
+) -> int:
+    """Upsert unified category coverage projections from internal or external metadata."""
+    allowed_scopes = {"internal", "external", "document_kb"}
+    allowed_methods = {"sql", "semantic_lookup", "rag", "document_facet"}
+    values: list[tuple[Any, ...]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        category_name = str(item.get("category_name") or "").strip().lower()
+        source_scope = str(item.get("source_scope") or "").strip().lower()
+        access_method = str(item.get("access_method") or "").strip().lower()
+        if not category_name or source_scope not in allowed_scopes or access_method not in allowed_methods:
+            continue
+        confidence = max(0.0, min(1.0, float(item.get("confidence") or 0.5)))
+        values.append((
+            category_name, source_scope, access_method,
+            int(item["source_id"]) if item.get("source_id") is not None else None,
+            str(item.get("schema_name") or "").strip() or None,
+            str(item.get("table_name") or "").strip() or None,
+            str(item.get("column_name") or "").strip() or None,
+            Json(sorted({str(v).strip().lower() for v in item.get("entity_types") or [] if str(v).strip()})),
+            Json(sorted({str(v).strip().lower() for v in item.get("attributes") or [] if str(v).strip()})),
+            Json(sorted({str(v).strip().lower() for v in item.get("document_types") or [] if str(v).strip()})),
+            Json(item.get("metadata") if isinstance(item.get("metadata"), dict) else {}),
+            confidence,
+        ))
+    if not values:
+        return 0
+    with connection.cursor() as cursor:
+        cursor.execute(create_category_registry_table)
+        cursor.executemany(
+            """
+            INSERT INTO category_registry (
+                category_name, source_scope, access_method, source_id, schema_name, table_name,
+                column_name, entity_types, attributes, document_types, metadata, confidence
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (category_name, source_scope, access_method, source_id, schema_name, table_name, column_name)
+            DO UPDATE SET entity_types = EXCLUDED.entity_types,
+                          attributes = EXCLUDED.attributes,
+                          document_types = EXCLUDED.document_types,
+                          metadata = COALESCE(category_registry.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                          confidence = EXCLUDED.confidence,
+                          is_active = TRUE,
+                          modified_at = NOW()
+            """,
+            values,
+        )
+    connection.commit()
+    return len(values)
+
+
+def resolve_category_registry(
+    connection: psycopg2.extensions.connection,
+    category_name: str,
+    entity_type: str | None = None,
+    attribute_name: str | None = None,
+    document_type: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Resolve a query concept to ranked locations and access methods."""
+    normalized = str(category_name or "").strip().lower()
+    if not normalized:
+        return []
+    conditions = ["is_active = TRUE", "(category_name = %s OR category_name ILIKE %s)"]
+    params: list[Any] = [normalized, f"%{normalized}%"]
+    for column, value in (("entity_types", entity_type), ("attributes", attribute_name), ("document_types", document_type)):
+        if str(value or "").strip():
+            conditions.append(f"{column} @> %s::jsonb")
+            params.append(json.dumps([str(value).strip().lower()]))
+    params.append(max(1, min(int(limit), 200)))
+    with connection.cursor() as cursor:
+        cursor.execute(create_category_registry_table)
+        cursor.execute(
+            f"""
+            SELECT category_id, category_name, source_scope, access_method, source_id,
+                   schema_name, table_name, column_name, entity_types, attributes,
+                   document_types, metadata, confidence
+            FROM category_registry
+            WHERE {' AND '.join(conditions)}
+            ORDER BY confidence DESC, category_id
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cursor.fetchall() or []
+    return [
+        {"category_id": int(row[0]), "category_name": row[1], "source_scope": row[2], "access_method": row[3],
+         "source_id": int(row[4]) if row[4] is not None else None, "schema_name": row[5], "table_name": row[6],
+         "column_name": row[7], "entity_types": row[8] or [], "attributes": row[9] or [],
+         "document_types": row[10] or [], "metadata": row[11] or {}, "confidence": float(row[12])}
+        for row in rows
+    ]
+
+
+def upsert_category_definition(
+    connection: psycopg2.extensions.connection,
+    *,
+    name: str,
+    source_type: str,
+    access_method: str,
+    source_id: int | None = None,
+    description: str | None = None,
+    entity_mappings: list[dict[str, Any]] | None = None,
+    attribute_mappings: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
+    priority: int = 100,
+) -> dict[str, int]:
+    """Persist category mappings while referencing, rather than copying, source credentials."""
+    category_name = str(name or "").strip().lower()
+    normalized_source_type = str(source_type or "").strip().lower()
+    normalized_access = str(access_method or "").strip().lower()
+    if not category_name:
+        raise ValueError("category name is required")
+    if normalized_source_type not in {"internal_db", "external_db", "documents"}:
+        raise ValueError("invalid category source_type")
+    if normalized_access not in {"sql", "semantic_lookup", "rag", "document_facet"}:
+        raise ValueError("invalid category access_method")
+    if normalized_source_type == "external_db" and source_id is None:
+        raise ValueError("external_db category source requires source_id")
+
+    with connection.cursor() as cursor:
+        cursor.execute(create_categories_table)
+        cursor.execute(create_category_sources_table)
+        cursor.execute(create_category_entities_table)
+        cursor.execute(create_category_attributes_table)
+        cursor.execute(
+            """
+            INSERT INTO categories (name, description, metadata, is_active, modified_at)
+            VALUES (%s, %s, %s, TRUE, NOW())
+            ON CONFLICT (name) DO UPDATE SET
+                description = COALESCE(EXCLUDED.description, categories.description),
+                metadata = COALESCE(categories.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                is_active = TRUE, modified_at = NOW()
+            RETURNING category_id
+            """,
+            (category_name, str(description or "").strip() or None, Json(metadata or {})),
+        )
+        category_id = int(cursor.fetchone()[0])
+        cursor.execute(
+            """
+            INSERT INTO category_sources (category_id, source_type, source_id, access_method, priority, metadata, is_active, modified_at)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW())
+            ON CONFLICT (category_id, source_type, COALESCE(source_id, 0), access_method) DO UPDATE SET
+                priority = EXCLUDED.priority,
+                metadata = COALESCE(category_sources.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                is_active = TRUE, modified_at = NOW()
+            RETURNING category_source_id
+            """,
+            (category_id, normalized_source_type, int(source_id) if source_id is not None else None, normalized_access, int(priority), Json(metadata or {})),
+        )
+        category_source_id = int(cursor.fetchone()[0])
+
+        entity_count = 0
+        for item in entity_mappings or []:
+            if not isinstance(item, dict):
+                continue
+            entity_type = str(item.get("entity_type") or "").strip().lower()
+            if not entity_type:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO category_entities (category_source_id, entity_type, source_table, source_column, role_name, confidence, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (category_source_id, entity_type, COALESCE(source_table, ''), COALESCE(source_column, ''), role_name)
+                DO UPDATE SET confidence = EXCLUDED.confidence,
+                              metadata = COALESCE(category_entities.metadata, '{}'::jsonb) || EXCLUDED.metadata
+                """,
+                (category_source_id, entity_type, item.get("source_table"), item.get("source_column"), str(item.get("role_name") or "entity_candidate").strip().lower(), max(0.0, min(1.0, float(item.get("confidence") or 0.5))), Json(item.get("metadata") if isinstance(item.get("metadata"), dict) else {})),
+            )
+            entity_count += 1
+
+        attribute_count = 0
+        for item in attribute_mappings or []:
+            if not isinstance(item, dict):
+                continue
+            attribute_name = str(item.get("attribute_name") or item.get("canonical_name") or "").strip().lower()
+            canonical_name = str(item.get("canonical_name") or attribute_name).strip().lower()
+            if not attribute_name or not canonical_name:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO category_attributes (category_source_id, attribute_name, canonical_name, source_table, source_column, role_name, confidence, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (category_source_id, canonical_name, COALESCE(source_table, ''), COALESCE(source_column, ''), role_name)
+                DO UPDATE SET attribute_name = EXCLUDED.attribute_name,
+                              confidence = EXCLUDED.confidence,
+                              metadata = COALESCE(category_attributes.metadata, '{}'::jsonb) || EXCLUDED.metadata
+                """,
+                (category_source_id, attribute_name, canonical_name, item.get("source_table"), item.get("source_column"), str(item.get("role_name") or "attribute").strip().lower(), max(0.0, min(1.0, float(item.get("confidence") or 0.5))), Json(item.get("metadata") if isinstance(item.get("metadata"), dict) else {})),
+            )
+            attribute_count += 1
+    connection.commit()
+    return {"category_id": category_id, "category_source_id": category_source_id, "entity_mappings": entity_count, "attribute_mappings": attribute_count}
+
+
+_UNIVERSAL_QUERY_PATTERNS = [
+    ("identity", "Identity query", "identity_lookup", ["internal", "external", "document_kb"], ["semantic_lookup", "sql", "rag"]),
+    ("attribute", "Attribute lookup", "attribute_lookup", ["internal", "external", "document_kb"], ["semantic_lookup", "sql", "rag", "document_facet"]),
+    ("relationship", "Relationship query", "relationship_lookup", ["internal", "external", "document_kb"], ["semantic_lookup", "sql", "rag"]),
+    ("collection", "Collection query", "collection_retrieval", ["external", "internal", "document_kb"], ["sql", "semantic_lookup", "rag"]),
+    ("conditional_collection", "Conditional collection query", "conditional_collection", ["external", "internal", "document_kb"], ["sql", "semantic_lookup", "rag"]),
+    ("document_reference", "Document reference query", "document_retrieval", ["document_kb"], ["rag", "document_facet"]),
+    ("document_attribute", "Document-derived attribute query", "document_attribute", ["document_kb"], ["rag", "document_facet"]),
+    ("amount", "Amount query", "numeric_value", ["external", "internal", "document_kb"], ["sql", "semantic_lookup", "rag"]),
+    ("duration", "Duration query", "duration_value", ["internal", "external"], ["semantic_lookup", "sql"]),
+    ("responsibility", "Responsibility routing query", "responsibility_routing", ["internal", "document_kb"], ["semantic_lookup", "rag"]),
+    ("status", "Status query", "status_lookup", ["external", "internal"], ["sql", "semantic_lookup"]),
+    ("workflow_action", "Workflow action query", "workflow_execution", ["internal"], ["semantic_lookup"]),
+    ("location", "Location query", "location_lookup", ["document_kb", "internal", "external"], ["document_facet", "semantic_lookup", "sql"]),
+    ("time", "Time query", "time_lookup", ["internal", "external", "document_kb"], ["semantic_lookup", "sql", "rag"]),
+]
+
+
+def seed_query_pattern_registry(connection: psycopg2.extensions.connection) -> int:
+    with connection.cursor() as cursor:
+        cursor.execute(create_query_pattern_registry_table)
+        cursor.executemany(
+            """
+            INSERT INTO query_pattern_registry (
+                pattern_key, display_name, intent_key, allowed_source_scopes, allowed_access_methods, priority, metadata
+            ) VALUES (%s, %s, %s, %s, %s, 100, %s)
+            ON CONFLICT (pattern_key) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                intent_key = EXCLUDED.intent_key,
+                allowed_source_scopes = EXCLUDED.allowed_source_scopes,
+                allowed_access_methods = EXCLUDED.allowed_access_methods,
+                is_active = TRUE,
+                modified_at = NOW()
+            """,
+            [
+                (key, label, intent, Json(scopes), Json(methods), Json({"source": "universal_query_patterns"}))
+                for key, label, intent, scopes, methods in _UNIVERSAL_QUERY_PATTERNS
+            ],
+        )
+    connection.commit()
+    return len(_UNIVERSAL_QUERY_PATTERNS)
+
+
+def get_query_pattern_definition(
+    connection: psycopg2.extensions.connection,
+    pattern_key: str,
+) -> dict[str, Any] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(create_query_pattern_registry_table)
+        cursor.execute(
+            """
+            SELECT pattern_key, display_name, intent_key, description, allowed_source_scopes,
+                   allowed_access_methods, priority, metadata
+            FROM query_pattern_registry
+            WHERE pattern_key = %s AND is_active = TRUE
+            """,
+            (str(pattern_key or "").strip().lower(),),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    return {"pattern_key": row[0], "display_name": row[1], "intent_key": row[2], "description": row[3],
+            "allowed_source_scopes": row[4] or [], "allowed_access_methods": row[5] or [],
+            "priority": int(row[6]), "metadata": row[7] or {}}
+
+
+def list_query_pattern_definitions(connection: psycopg2.extensions.connection) -> list[dict[str, Any]]:
+    seed_query_pattern_registry(connection)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT pattern_key, display_name, intent_key, allowed_source_scopes, allowed_access_methods, priority FROM query_pattern_registry WHERE is_active = TRUE ORDER BY priority, pattern_key"
+        )
+        rows = cursor.fetchall() or []
+    return [{"pattern_key": row[0], "display_name": row[1], "intent_key": row[2], "allowed_source_scopes": row[3] or [], "allowed_access_methods": row[4] or [], "priority": int(row[5])} for row in rows]
+
+
+def resolve_category_registry_for_query(
+    connection: psycopg2.extensions.connection,
+    entity_type: str | None = None,
+    attribute_names: list[str] | None = None,
+    document_type: str | None = None,
+    category_names: list[str] | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return ranked category locations for a parsed query without executing retrieval."""
+    predicates: list[str] = ["is_active = TRUE"]
+    params: list[Any] = []
+    concepts = [str(item).strip().lower() for item in (category_names or []) if str(item).strip()]
+    if concepts:
+        predicates.append("(" + " OR ".join(["category_name = %s", "category_name ILIKE %s"] * len(concepts)) + ")")
+        for concept in concepts:
+            params.extend([concept, f"%{concept}%"])
+
+    coverage_predicates: list[str] = []
+    normalized_entity = str(entity_type or "").strip().lower()
+    if normalized_entity:
+        coverage_predicates.append("entity_types @> %s::jsonb")
+        params.append(json.dumps([normalized_entity]))
+    for attribute in attribute_names or []:
+        normalized_attribute = str(attribute or "").strip().lower()
+        if normalized_attribute:
+            coverage_predicates.append("attributes @> %s::jsonb")
+            params.append(json.dumps([normalized_attribute]))
+    normalized_document_type = str(document_type or "").strip().lower()
+    if normalized_document_type:
+        coverage_predicates.append("document_types @> %s::jsonb")
+        params.append(json.dumps([normalized_document_type]))
+    if coverage_predicates:
+        predicates.append("(" + " OR ".join(coverage_predicates) + ")")
+    params.append(max(1, min(int(limit), 500)))
+
+    with connection.cursor() as cursor:
+        cursor.execute(create_category_registry_table)
+        cursor.execute(
+            f"""
+            SELECT category_id, category_name, source_scope, access_method, source_id,
+                   schema_name, table_name, column_name, entity_types, attributes,
+                   document_types, metadata, confidence
+            FROM category_registry
+            WHERE {' AND '.join(predicates)}
+            ORDER BY CASE source_scope WHEN 'external' THEN 1 WHEN 'document_kb' THEN 2 ELSE 3 END,
+                     confidence DESC, category_id
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cursor.fetchall() or []
+    return [
+        {"category_id": int(row[0]), "category_name": row[1], "source_scope": row[2], "access_method": row[3],
+         "source_id": int(row[4]) if row[4] is not None else None, "schema_name": row[5], "table_name": row[6],
+         "column_name": row[7], "entity_types": row[8] or [], "attributes": row[9] or [],
+         "document_types": row[10] or [], "metadata": row[11] or {}, "confidence": float(row[12])}
+        for row in rows
+    ]
+
+
+def rebuild_internal_category_registry(
+    connection: psycopg2.extensions.connection,
+) -> dict[str, int]:
+    """Project current internal KB and document coverage into the unified category registry."""
+    marker = "category_registry_internal_backfill"
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM category_registry WHERE metadata->>'source' = %s", (marker,))
+        cursor.execute(
+            """
+            SELECT oi.class_name, array_agg(DISTINCT a.attr_type) FILTER (WHERE a.attr_type IS NOT NULL)
+            FROM object_instance oi
+            LEFT JOIN attribute a ON a.src_type = 'object' AND a.src_id = oi.object_id
+            WHERE COALESCE(oi.status, 'active') = 'active'
+            GROUP BY oi.class_name
+            """
+        )
+        class_rows = cursor.fetchall() or []
+        cursor.execute(
+            """
+            SELECT d.doc_cat, d.doc_type,
+                   array_agg(DISTINCT facet.place_kind) FILTER (WHERE facet.place_kind IS NOT NULL),
+                   array_agg(DISTINCT action.action_type) FILTER (WHERE action.action_type IS NOT NULL)
+            FROM document d
+            LEFT JOIN document_geographic_facet facet ON facet.doc_id = d.doc_id
+            LEFT JOIN document_action_item action ON action.doc_id = d.doc_id
+            WHERE COALESCE(d.status, 'active') = 'active'
+            GROUP BY d.doc_cat, d.doc_type
+            """
+        )
+        document_rows = cursor.fetchall() or []
+    connection.commit()
+
+    registry_rows: list[dict[str, Any]] = []
+    for class_name, attribute_names in class_rows:
+        entity_type = str(class_name or "").strip().lower()
+        if not entity_type:
+            continue
+        attributes = [str(value).strip().lower() for value in attribute_names or [] if str(value).strip()]
+        registry_rows.append(
+            {
+                "category_name": entity_type,
+                "source_scope": "internal",
+                "access_method": "semantic_lookup",
+                "entity_types": [entity_type],
+                "attributes": attributes,
+                "metadata": {"source": marker},
+                "confidence": 0.9,
+            }
+        )
+        upsert_category_definition(
+            connection,
+            name=entity_type,
+            source_type="internal_db",
+            access_method="semantic_lookup",
+            entity_mappings=[{"entity_type": entity_type, "source_table": "object_instance", "confidence": 0.9}],
+            attribute_mappings=[
+                {"attribute_name": attribute, "canonical_name": attribute, "source_table": "attribute", "confidence": 0.9}
+                for attribute in attributes
+            ],
+            metadata={"source": marker},
+        )
+
+    for doc_cat, doc_type, place_kinds, action_types in document_rows:
+        categories = {str(doc_cat or "").strip().lower(), str(doc_type or "").strip().lower()} - {""}
+        document_type = str(doc_type or "").strip().lower()
+        attributes = [str(value).strip().lower() for value in place_kinds or [] if str(value).strip()]
+        attributes.extend(str(value).strip().lower() for value in action_types or [] if str(value).strip())
+        for category in categories:
+            registry_rows.append(
+                {
+                    "category_name": category,
+                    "source_scope": "document_kb",
+                    "access_method": "rag",
+                    "document_types": [document_type] if document_type else [],
+                    "attributes": sorted(set(attributes)),
+                    "metadata": {"source": marker},
+                    "confidence": 0.85,
+                }
+            )
+            upsert_category_definition(
+                connection,
+                name=category,
+                source_type="documents",
+                access_method="rag",
+                attribute_mappings=[
+                    {"attribute_name": attribute, "canonical_name": attribute, "source_table": "document", "confidence": 0.85}
+                    for attribute in sorted(set(attributes))
+                ],
+                metadata={"source": marker, "document_type": document_type},
+            )
+
+    written = upsert_category_registry_rows(connection, registry_rows)
+    return {"internal_classes": len(class_rows), "document_categories": len(document_rows), "rows_written": written}
+
+
+def list_category_definitions(
+    connection: psycopg2.extensions.connection,
+    name: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    conditions = ["c.is_active = TRUE"]
+    params: list[Any] = []
+    if str(name or "").strip():
+        conditions.append("c.name ILIKE %s")
+        params.append(f"%{str(name).strip().lower()}%")
+    params.append(max(1, min(int(limit), 500)))
+    with connection.cursor() as cursor:
+        cursor.execute(create_categories_table)
+        cursor.execute(create_category_sources_table)
+        cursor.execute(
+            f"""
+            SELECT c.category_id, c.name, c.description, c.metadata,
+                   cs.category_source_id, cs.source_type, cs.source_id, cs.access_method, cs.priority, cs.metadata
+            FROM categories c
+            JOIN category_sources cs ON cs.category_id = c.category_id AND cs.is_active = TRUE
+            WHERE {' AND '.join(conditions)}
+            ORDER BY c.name, cs.priority, cs.category_source_id
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cursor.fetchall() or []
+    return [
+        {"category_id": int(row[0]), "name": row[1], "description": row[2], "metadata": row[3] or {},
+         "category_source_id": int(row[4]), "source_type": row[5], "source_id": int(row[6]) if row[6] is not None else None,
+         "access_method": row[7], "priority": int(row[8]), "source_metadata": row[9] or {}}
+        for row in rows
+    ]
 
 
 def get_semantic_terms(
@@ -2138,6 +3690,47 @@ def get_semantic_terms(
         }
         for row in rows
     ]
+
+
+def get_semantic_terms_by_kind(
+    connection: psycopg2.extensions.connection | str | None = None,
+    kind: str | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Fetch semantic terms for a single kind, including category aliases.
+
+    Accepts either get_semantic_terms_by_kind(kind="category") or
+    get_semantic_terms_by_kind(connection, "category").
+    """
+    if isinstance(connection, str) and kind is None:
+        kind = connection
+        connection = None
+    if kind is None and isinstance(connection, str):
+        kind = connection
+        connection = None
+
+    if connection is None:
+        seed_rows = _load_seeded_business_terms_from_file()
+        if kind:
+            seed_rows = [row for row in seed_rows if str(row.get("kind") or "").lower() == str(kind).strip().lower()]
+        if seed_rows:
+            return seed_rows[:limit]
+
+    db_conn = connection if connection is not None else get_connection()
+    try:
+        rows = get_semantic_terms(connection=db_conn, kind=kind, limit=limit)
+        if rows:
+            return rows
+        if kind is None:
+            return []
+        seed_rows = _load_seeded_business_terms_from_file()
+        return [row for row in seed_rows if str(row.get("kind") or "").lower() == str(kind).strip().lower()][:limit]
+    finally:
+        if connection is None:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
 
 
 def upsert_business_rule(
@@ -5016,6 +6609,8 @@ def create_tables(connection: psycopg2.extensions.connection, recreate: bool = F
         create_extensions,
         create_document_table,
         create_document_table_cell_table,
+        create_document_geographic_facet_table,
+        create_document_action_item_table,
         create_class_table,
         create_object_table,
         create_relationship_table,
@@ -5028,6 +6623,9 @@ def create_tables(connection: psycopg2.extensions.connection, recreate: bool = F
         create_pattern_synonyms_table,
         create_semantic_terms_table,
         create_query_term_alias_table,
+        create_query_alias_candidate_table,
+        create_category_registry_table,
+        create_query_pattern_registry_table,
         create_solf_clauses_table,
         create_business_rules_table,
         create_solf_workflow_registry_table,
@@ -5038,6 +6636,9 @@ def create_tables(connection: psycopg2.extensions.connection, recreate: bool = F
         create_workflow_extension_tables,
         create_workflow_pipeline_run_tables,
         create_workflow_pipeline_run_document_links_table,
+        create_workflow_mutation_journal_table,
+        create_action_resolution_plan_table,
+        create_document_removal_log_table,
     ]
 
     drop_statements = [
@@ -5049,6 +6650,7 @@ def create_tables(connection: psycopg2.extensions.connection, recreate: bool = F
         "DROP TABLE IF EXISTS workflow_extension_rule CASCADE;",
         "DROP TABLE IF EXISTS workflow_extension_version CASCADE;",
         "DROP TABLE IF EXISTS workflow_extension_pack CASCADE;",
+        "DROP TABLE IF EXISTS workflow_mutation_journal CASCADE;",
         "DROP TABLE IF EXISTS workflow_pipeline_run_document_link CASCADE;",
         "DROP TABLE IF EXISTS workflow_resource_alias CASCADE;",
         "DROP TABLE IF EXISTS pattern_synonyms CASCADE;",
@@ -5060,6 +6662,7 @@ def create_tables(connection: psycopg2.extensions.connection, recreate: bool = F
         "DROP TABLE IF EXISTS object_alias CASCADE;",
         "DROP TABLE IF EXISTS resolution_ambiguity_queue CASCADE;",
         "DROP TABLE IF EXISTS tx_match_index_pending CASCADE;",
+        "DROP TABLE IF EXISTS document_removal_log CASCADE;",
         "DROP TABLE IF EXISTS document_table_cell CASCADE;",
         "DROP TABLE IF EXISTS part CASCADE;",
         "DROP TABLE IF EXISTS object_relationship CASCADE;",
@@ -5095,6 +6698,7 @@ def create_tables(connection: psycopg2.extensions.connection, recreate: bool = F
                     """
                 )
         connection.commit()
+        seed_query_pattern_registry(connection)
         logging.info("Object schema tables created successfully")
     except Exception:
         connection.rollback()
@@ -5227,6 +6831,47 @@ def list_pipeline_runs(
             LIMIT %s
             """,
             (run_status, run_status, workflow_key, workflow_key, int(limit)),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "run_id": int(r[0]),
+            "workflow_version_id": r[1],
+            "workflow_key": r[2],
+            "run_status": r[3],
+            "paused_at_step_key": r[4],
+            "input_context": r[5] or {},
+            "current_context": r[6] or {},
+            "output_context": r[7] or {},
+            "started_by": r[8],
+            "started_at": r[9],
+            "finished_at": r[10],
+            "created_at": r[11],
+            "modified_at": r[12],
+        }
+        for r in rows
+    ]
+
+
+def list_unfinished_pipeline_runs(
+    connection: psycopg2.extensions.connection,
+    workflow_key: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """List runs that still require execution or user action."""
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT run_id, workflow_version_id, workflow_key, run_status, paused_at_step_key,
+                   input_context, current_context, output_context, started_by,
+                   started_at, finished_at, created_at, modified_at
+            FROM workflow_pipeline_run
+            WHERE run_status IN ('pending', 'running', 'paused')
+              AND (%s IS NULL OR workflow_key = %s)
+            ORDER BY created_at DESC, run_id DESC
+            LIMIT %s
+            """,
+            (workflow_key, workflow_key, int(limit)),
         )
         rows = cur.fetchall()
     return [
@@ -5529,6 +7174,379 @@ def list_pipeline_run_document_links(
         }
         for row in rows
     ]
+
+
+def _ensure_workflow_mutation_journal_table(cursor: Any) -> None:
+    cursor.execute(create_workflow_mutation_journal_table)
+    cursor.execute("ALTER TABLE workflow_mutation_journal ADD COLUMN IF NOT EXISTS business_key VARCHAR(256)")
+    cursor.execute("ALTER TABLE workflow_mutation_journal ADD COLUMN IF NOT EXISTS business_key_type VARCHAR(64)")
+    cursor.execute("ALTER TABLE workflow_mutation_journal ALTER COLUMN run_id DROP NOT NULL")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workflow_mutation_business_key ON workflow_mutation_journal(business_key)"
+    )
+
+
+def append_workflow_mutation_journal(
+    connection: psycopg2.extensions.connection,
+    *,
+    run_id: int | None = None,
+    step_key: str,
+    step_order: int,
+    operation_kind: str,
+    before_state: dict[str, Any] | None = None,
+    after_state: dict[str, Any] | None = None,
+    inverse_action: dict[str, Any] | None = None,
+    target_store: str = "sql",
+    target_entity: str = "workflow_context",
+    mutation_key: str | None = None,
+    business_key: str | None = None,
+    business_key_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    with connection.cursor() as cur:
+        _ensure_workflow_mutation_journal_table(cur)
+
+        workflow_version_id = None
+        workflow_key = None
+        if run_id is not None:
+            cur.execute(
+                """
+                SELECT workflow_version_id, workflow_key
+                FROM workflow_pipeline_run
+                WHERE run_id = %s
+                """,
+                (int(run_id),),
+            )
+            run_row = cur.fetchone()
+            workflow_version_id = run_row[0] if run_row else None
+            workflow_key = run_row[1] if run_row else None
+
+        cur.execute(
+            """
+            INSERT INTO workflow_mutation_journal (
+                run_id, workflow_version_id, workflow_key, step_key, step_order,
+                operation_kind, target_store, target_entity, mutation_key,
+                business_key, business_key_type,
+                before_state, after_state, inverse_action, metadata, status, applied_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'applied', NOW())
+            RETURNING journal_id
+            """,
+            (
+                int(run_id) if run_id is not None else None,
+                int(workflow_version_id) if workflow_version_id is not None else None,
+                workflow_key,
+                str(step_key or "").strip() or None,
+                int(step_order),
+                str(operation_kind or "").strip() or "unknown",
+                str(target_store or "sql").strip().lower() or "sql",
+                str(target_entity or "workflow_context").strip() or "workflow_context",
+                str(mutation_key or "").strip() or None,
+                str(business_key or "").strip() or None,
+                str(business_key_type or "").strip() or None,
+                Json(before_state or {}),
+                Json(after_state or {}),
+                Json(inverse_action or {}),
+                Json(metadata or {}),
+            ),
+        )
+        journal_id = int(cur.fetchone()[0])
+
+    connection.commit()
+    return journal_id
+
+
+_WORKFLOW_MUTATION_JOURNAL_COLUMNS = """
+    journal_id, run_id, workflow_version_id, workflow_key, step_key, step_order,
+    operation_kind, target_store, target_entity, mutation_key,
+    business_key, business_key_type,
+    before_state, after_state, inverse_action, metadata,
+    status, applied_at, undone_at, undone_by, undo_error
+"""
+
+
+def _map_workflow_mutation_journal_row(r: Any) -> dict[str, Any]:
+    return {
+        "journal_id": int(r[0]),
+        "run_id": int(r[1]) if r[1] is not None else None,
+        "workflow_version_id": int(r[2]) if r[2] is not None else None,
+        "workflow_key": r[3],
+        "step_key": r[4],
+        "step_order": int(r[5]) if r[5] is not None else None,
+        "operation_kind": r[6],
+        "target_store": r[7],
+        "target_entity": r[8],
+        "mutation_key": r[9],
+        "business_key": r[10],
+        "business_key_type": r[11],
+        "before_state": r[12] or {},
+        "after_state": r[13] or {},
+        "inverse_action": r[14] or {},
+        "metadata": r[15] or {},
+        "status": r[16],
+        "applied_at": r[17],
+        "undone_at": r[18],
+        "undone_by": r[19],
+        "undo_error": r[20],
+    }
+
+
+def list_workflow_mutation_journal(
+    connection: psycopg2.extensions.connection,
+    run_id: int,
+    include_undone: bool = True,
+    limit: int = 2000,
+) -> list[dict[str, Any]]:
+    with connection.cursor() as cur:
+        _ensure_workflow_mutation_journal_table(cur)
+        status_filter = "" if include_undone else "AND status <> 'undone'"
+        cur.execute(
+            f"""
+            SELECT {_WORKFLOW_MUTATION_JOURNAL_COLUMNS}
+            FROM workflow_mutation_journal
+            WHERE run_id = %s
+              {status_filter}
+            ORDER BY journal_id DESC
+            LIMIT %s
+            """,
+            (int(run_id), int(limit)),
+        )
+        rows = cur.fetchall() or []
+
+    return [_map_workflow_mutation_journal_row(r) for r in rows]
+
+
+def find_workflow_mutation_journal(
+    connection: psycopg2.extensions.connection,
+    business_key: str | None = None,
+    business_key_type: str | None = None,
+    target_entity: str | None = None,
+    operation_kind: str | None = None,
+    include_undone: bool = True,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Resolve journal entries by business identifier (e.g. an invoice/transaction id)."""
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    normalized_business_key = str(business_key or "").strip()
+    if normalized_business_key:
+        conditions.append("business_key ILIKE %s")
+        params.append(f"%{normalized_business_key}%")
+
+    for column, value in (
+        ("business_key_type", business_key_type),
+        ("target_entity", target_entity),
+        ("operation_kind", operation_kind),
+    ):
+        normalized = str(value or "").strip()
+        if normalized:
+            conditions.append(f"{column} = %s")
+            params.append(normalized)
+
+    if not include_undone:
+        conditions.append("status <> 'undone'")
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(max(1, min(int(limit), 2000)))
+
+    with connection.cursor() as cur:
+        _ensure_workflow_mutation_journal_table(cur)
+        cur.execute(
+            f"""
+            SELECT {_WORKFLOW_MUTATION_JOURNAL_COLUMNS}
+            FROM workflow_mutation_journal
+            {where_sql}
+            ORDER BY journal_id DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall() or []
+
+    return [_map_workflow_mutation_journal_row(r) for r in rows]
+
+
+def get_workflow_mutation_journal_entry(
+    connection: psycopg2.extensions.connection,
+    journal_id: int,
+) -> dict[str, Any] | None:
+    with connection.cursor() as cur:
+        _ensure_workflow_mutation_journal_table(cur)
+        cur.execute(
+            f"""
+            SELECT {_WORKFLOW_MUTATION_JOURNAL_COLUMNS}
+            FROM workflow_mutation_journal
+            WHERE journal_id = %s
+            LIMIT 1
+            """,
+            (int(journal_id),),
+        )
+        row = cur.fetchone()
+
+    return _map_workflow_mutation_journal_row(row) if row is not None else None
+
+
+def mark_workflow_mutation_undone(
+    connection: psycopg2.extensions.connection,
+    journal_id: int,
+    undone_by: str,
+    undo_error: str | None = None,
+    status: str = "undone",
+) -> bool:
+    normalized_status = str(status or "undone").strip().lower() or "undone"
+    with connection.cursor() as cur:
+        _ensure_workflow_mutation_journal_table(cur)
+        cur.execute(
+            """
+            UPDATE workflow_mutation_journal
+            SET status = %s,
+                undone_at = NOW(),
+                undone_by = %s,
+                undo_error = %s
+            WHERE journal_id = %s
+            """,
+            (
+                normalized_status,
+                str(undone_by or "").strip() or "api:user",
+                str(undo_error or "").strip() or None,
+                int(journal_id),
+            ),
+        )
+        updated = int(cur.rowcount or 0)
+
+    connection.commit()
+    return updated > 0
+
+
+def _ensure_action_resolution_plan_table(connection: Any) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(create_action_resolution_plan_table)
+    connection.commit()
+
+
+def create_action_resolution_plan(
+    connection: Any,
+    *,
+    request_text: str,
+    action_object: dict[str, Any],
+    workflow_snapshot: dict[str, Any] | None = None,
+    execution_plan: list[dict[str, Any]] | None = None,
+    parameters: dict[str, Any] | None = None,
+    missing_parameters: list[dict[str, Any]] | None = None,
+    requested_by: str = "api:user",
+    ttl_minutes: int = 30,
+) -> dict[str, Any]:
+    """Persist a registry/version-grounded plan without executing it."""
+    plan_id = uuid.uuid4()
+    status = "awaiting_input" if missing_parameters else "pending"
+    with connection.cursor() as cursor:
+        cursor.execute(create_action_resolution_plan_table)
+        cursor.execute(
+            """
+            INSERT INTO action_resolution_plan (
+                plan_id, request_text, action_object, workflow_snapshot,
+                execution_plan, parameters, missing_parameters, status,
+                requested_by, expires_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    NOW() + (%s * INTERVAL '1 minute'))
+            """,
+            (
+                plan_id,
+                str(request_text or "").strip(),
+                Json(action_object or {}),
+                Json(workflow_snapshot or {}),
+                Json(execution_plan or []),
+                Json(parameters or {}),
+                Json(missing_parameters or []),
+                status,
+                str(requested_by or "api:user").strip() or "api:user",
+                max(1, min(int(ttl_minutes), 10080)),
+            ),
+        )
+    connection.commit()
+    return get_action_resolution_plan(connection, plan_id) or {"plan_id": str(plan_id), "status": status}
+
+
+def get_action_resolution_plan(connection: Any, plan_id: Any) -> dict[str, Any] | None:
+    try:
+        normalized_id = uuid.UUID(str(plan_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(create_action_resolution_plan_table)
+        cursor.execute(
+            """
+            SELECT plan_id, request_text, action_object, workflow_snapshot,
+                   execution_plan, parameters, missing_parameters, status,
+                   requested_by, expires_at, confirmed_at, completed_at,
+                   result, created_at, modified_at
+            FROM action_resolution_plan
+            WHERE plan_id = %s
+            LIMIT 1
+            """,
+            (normalized_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        if row[7] in {"pending", "awaiting_input", "confirmed"}:
+            cursor.execute(
+                """
+                UPDATE action_resolution_plan
+                SET status = 'expired', modified_at = NOW()
+                WHERE plan_id = %s AND expires_at <= NOW()
+                RETURNING status
+                """,
+                (normalized_id,),
+            )
+            if cursor.fetchone():
+                row = list(row)
+                row[7] = "expired"
+    return {
+        "plan_id": str(row[0]),
+        "request_text": row[1],
+        "action_object": row[2] or {},
+        "workflow_snapshot": row[3] or {},
+        "execution_plan": row[4] or [],
+        "parameters": row[5] or {},
+        "missing_parameters": row[6] or [],
+        "status": row[7],
+        "requested_by": row[8],
+        "expires_at": row[9],
+        "confirmed_at": row[10],
+        "completed_at": row[11],
+        "result": row[12] or {},
+        "created_at": row[13],
+        "modified_at": row[14],
+    }
+
+
+def confirm_action_resolution_plan(connection: Any, plan_id: Any) -> dict[str, Any] | None:
+    try:
+        normalized_id = uuid.UUID(str(plan_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(create_action_resolution_plan_table)
+        cursor.execute(
+            """
+            UPDATE action_resolution_plan
+            SET status = 'confirmed', confirmed_at = NOW(), modified_at = NOW()
+            WHERE plan_id = %s
+              AND status = 'pending'
+              AND expires_at > NOW()
+              AND jsonb_array_length(missing_parameters) = 0
+            RETURNING plan_id
+            """,
+            (normalized_id,),
+        )
+        if cursor.fetchone() is None:
+            connection.rollback()
+            return get_action_resolution_plan(connection, normalized_id)
+    connection.commit()
+    return get_action_resolution_plan(connection, normalized_id)
 
 
 def list_pipeline_runs_by_document(

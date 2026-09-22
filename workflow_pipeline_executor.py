@@ -396,6 +396,9 @@ class _StepOutcome:
     missing_data_desc: str | None = None
     required_doc_types: list[str] = field(default_factory=list)
     error_message: str | None = None
+    handled_exception: bool = False
+    next_step_key: str | None = None
+    applied_clause: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +594,142 @@ class WorkflowPipelineExecutor:
         with self.db_connection_fn() as conn:
             return object_db.list_pipeline_runs(conn, run_status=run_status, workflow_key=workflow_key, limit=limit)
 
+    def list_unfinished_runs(
+        self,
+        workflow_key: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self.db_connection_fn() as conn:
+            return object_db.list_unfinished_pipeline_runs(conn, workflow_key=workflow_key, limit=limit)
+
+    def undo_pipeline_run(
+        self,
+        run_id: int,
+        requested_by: str = "api:user",
+        dry_run: bool = False,
+        include_completed_only: bool = True,
+    ) -> dict[str, Any]:
+        with self.db_connection_fn() as conn:
+            run = object_db.get_pipeline_run(conn, run_id)
+            if run is None:
+                return {"error": "not_found", "message": f"Pipeline run {run_id} not found"}
+
+            steps = object_db.get_pipeline_run_steps(conn, run_id)
+            workflow_version_id = int(run.get("workflow_version_id") or 0)
+            version_steps = object_db.list_solf_workflow_steps(conn, workflow_version_id=workflow_version_id) if workflow_version_id > 0 else []
+
+        step_by_key = {
+            str(step.get("step_key") or "").strip(): step
+            for step in version_steps
+            if str(step.get("step_key") or "").strip()
+        }
+
+        eligible = [
+            step for step in steps
+            if (step.get("step_status") == "completed" if include_completed_only else step.get("step_status") in {"completed", "failed", "paused"})
+        ]
+        eligible.sort(key=lambda item: int(item.get("step_order") or 0), reverse=True)
+
+        actions: list[dict[str, Any]] = []
+        context = dict(run.get("current_context") or {})
+
+        for step_state in eligible:
+            step_key = str(step_state.get("step_key") or "").strip()
+            step_order = int(step_state.get("step_order") or 0)
+            step_def = step_by_key.get(step_key, {})
+            step_config = step_def.get("config") if isinstance(step_def.get("config"), dict) else {}
+            compensation_clause = str(step_config.get("compensation_clause") or "").strip()
+
+            if not compensation_clause:
+                actions.append(
+                    {
+                        "step_key": step_key,
+                        "step_order": step_order,
+                        "status": "skipped",
+                        "reason": "no_compensation_clause",
+                    }
+                )
+                continue
+
+            before_ctx = dict(context)
+            if dry_run:
+                actions.append(
+                    {
+                        "step_key": step_key,
+                        "step_order": step_order,
+                        "status": "planned",
+                        "compensation_clause": compensation_clause,
+                    }
+                )
+                continue
+
+            outcome = self._execute_clause_by_name(
+                clause_name=compensation_clause,
+                context=context,
+                config=step_config,
+            )
+
+            if outcome.success and isinstance(outcome.output, dict):
+                context.update(outcome.output)
+                with self.db_connection_fn() as conn:
+                    object_db.append_workflow_mutation_journal(
+                        conn,
+                        run_id=run_id,
+                        step_key=step_key,
+                        step_order=step_order,
+                        operation_kind="compensation_execute",
+                        before_state=before_ctx,
+                        after_state=dict(context),
+                        inverse_action={"kind": "compensation_clause", "clause_name": compensation_clause},
+                        target_store="sql",
+                        target_entity="workflow_context",
+                        mutation_key=f"run:{run_id}:step:{step_key}:compensation",
+                        metadata={
+                            "requested_by": str(requested_by or "api:user"),
+                            "origin_step_status": step_state.get("step_status"),
+                        },
+                    )
+                actions.append(
+                    {
+                        "step_key": step_key,
+                        "step_order": step_order,
+                        "status": "compensated",
+                        "compensation_clause": compensation_clause,
+                    }
+                )
+            else:
+                actions.append(
+                    {
+                        "step_key": step_key,
+                        "step_order": step_order,
+                        "status": "failed",
+                        "compensation_clause": compensation_clause,
+                        "error": outcome.error_message or "compensation clause failed",
+                    }
+                )
+
+        if not dry_run:
+            with self.db_connection_fn() as conn:
+                object_db.update_pipeline_run_status(
+                    conn,
+                    run_id,
+                    run.get("run_status") or "completed",
+                    current_context=context,
+                )
+
+        return {
+            "run_id": run_id,
+            "dry_run": bool(dry_run),
+            "requested_by": str(requested_by or "api:user"),
+            "actions": actions,
+            "summary": {
+                "planned": len([a for a in actions if a.get("status") == "planned"]),
+                "compensated": len([a for a in actions if a.get("status") == "compensated"]),
+                "skipped": len([a for a in actions if a.get("status") == "skipped"]),
+                "failed": len([a for a in actions if a.get("status") == "failed"]),
+            },
+        }
+
     # ------------------------------------------------------------------
     # Internal execution loop
     # ------------------------------------------------------------------
@@ -606,7 +745,15 @@ class WorkflowPipelineExecutor:
         with self.db_connection_fn() as conn:
             object_db.update_pipeline_run_status(conn, run_id, "running", current_context=context)
 
-        for step in steps:
+        step_key_to_idx = {
+            str(step.get("step_key") or "").strip(): idx
+            for idx, step in enumerate(steps)
+            if str(step.get("step_key") or "").strip()
+        }
+
+        idx = 0
+        while idx < len(steps):
+            step = steps[idx]
             step_key = step["step_key"]
             step_order = int(step.get("step_order") or 0)
             step_kind = str(step.get("step_kind") or "clause")
@@ -679,6 +826,59 @@ class WorkflowPipelineExecutor:
                 return run
 
             if not outcome.success:
+                handled = self._handle_step_exception_flow(
+                    run_id=run_id,
+                    step=step,
+                    step_context=step_context,
+                    context=context,
+                    error_message=outcome.error_message or "step failed",
+                )
+                if handled.get("handled"):
+                    branch_output = handled.get("output") if isinstance(handled.get("output"), dict) else {}
+                    if branch_output:
+                        context.update(branch_output)
+                    with self.db_connection_fn() as conn:
+                        object_db.upsert_pipeline_run_step(
+                            conn,
+                            run_id=run_id,
+                            step_key=step_key,
+                            step_order=step_order,
+                            step_status="completed",
+                            output_snapshot={
+                                "exception_handled": True,
+                                "error_message": outcome.error_message,
+                                "exception_clause": handled.get("exception_clause"),
+                                "exception_output": branch_output,
+                            },
+                        )
+                        object_db.append_workflow_mutation_journal(
+                            conn,
+                            run_id=run_id,
+                            step_key=step_key,
+                            step_order=step_order,
+                            operation_kind="exception_clause_execute",
+                            before_state=step_context,
+                            after_state=dict(context),
+                            inverse_action={
+                                "kind": "context_restore",
+                                "context": step_context,
+                            },
+                            target_store="sql",
+                            target_entity="workflow_context",
+                            mutation_key=f"run:{run_id}:step:{step_key}:exception",
+                            metadata={
+                                "error_message": outcome.error_message,
+                                "next_step_key": handled.get("next_step_key"),
+                            },
+                        )
+
+                    next_step_key = str(handled.get("next_step_key") or "").strip()
+                    if next_step_key and next_step_key in step_key_to_idx:
+                        idx = int(step_key_to_idx[next_step_key])
+                    else:
+                        idx += 1
+                    continue
+
                 error_msg = outcome.error_message or "step failed"
                 with self.db_connection_fn() as conn:
                     object_db.upsert_pipeline_run_step(
@@ -696,9 +896,19 @@ class WorkflowPipelineExecutor:
                     )
 
                 LOGGER.error("pipeline_run failed run_id=%s step=%s error=%s", run_id, step_key, error_msg)
+
+                on_failure_policy = str(context.get("on_failure_policy") or "").strip().lower()
+                if on_failure_policy == "undo_all":
+                    LOGGER.info("pipeline_run auto-undo triggered run_id=%s policy=on_failure_policy=undo_all", run_id)
+                    auto_undo_result = self.undo_pipeline_run(run_id, requested_by="system:on_failure_policy")
+                else:
+                    auto_undo_result = None
+
                 with self.db_connection_fn() as conn:
                     run = object_db.get_pipeline_run(conn, run_id)
                     run["steps"] = object_db.get_pipeline_run_steps(conn, run_id)
+                if auto_undo_result is not None:
+                    run["auto_undo"] = auto_undo_result
                 return run
 
             # Step succeeded — merge outputs into running context
@@ -714,6 +924,29 @@ class WorkflowPipelineExecutor:
                     step_status="completed",
                     output_snapshot=outcome.output or {},
                 )
+                object_db.append_workflow_mutation_journal(
+                    conn,
+                    run_id=run_id,
+                    step_key=step_key,
+                    step_order=step_order,
+                    operation_kind="step_output_merge",
+                    before_state=step_context,
+                    after_state=dict(context),
+                    inverse_action={
+                        "kind": "context_restore",
+                        "context": step_context,
+                    },
+                    target_store="sql",
+                    target_entity="workflow_context",
+                    mutation_key=f"run:{run_id}:step:{step_key}:merge",
+                    metadata={"step_kind": step_kind},
+                )
+
+            next_step_key = str(outcome.next_step_key or "").strip()
+            if next_step_key and next_step_key in step_key_to_idx:
+                idx = int(step_key_to_idx[next_step_key])
+            else:
+                idx += 1
 
         # All steps completed
         with self.db_connection_fn() as conn:
@@ -727,6 +960,65 @@ class WorkflowPipelineExecutor:
             run = object_db.get_pipeline_run(conn, run_id)
             run["steps"] = object_db.get_pipeline_run_steps(conn, run_id)
         return run
+
+    def _execute_clause_by_name(self, clause_name: str, context: dict[str, Any], config: dict[str, Any] | None = None) -> _StepOutcome:
+        cfg = dict(config or {})
+        pseudo_step = {
+            "step_key": f"clause::{clause_name}",
+            "step_kind": "clause",
+            "clause_name": str(clause_name or "").strip(),
+            "config": cfg,
+        }
+        return self._execute_clause_step(pseudo_step, context, cfg)
+
+    def _handle_step_exception_flow(
+        self,
+        *,
+        run_id: int,
+        step: dict[str, Any],
+        step_context: dict[str, Any],
+        context: dict[str, Any],
+        error_message: str,
+    ) -> dict[str, Any]:
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        exception_clause = str(config.get("exception_clause") or "").strip()
+        next_step_key = str(config.get("on_failure_step_key") or "").strip() or None
+        if not exception_clause and not next_step_key:
+            return {"handled": False}
+
+        if not exception_clause:
+            return {
+                "handled": True,
+                "output": {
+                    "exception_handled": True,
+                    "exception_mode": "branch_only",
+                    "source_step": step.get("step_key"),
+                    "error_message": error_message,
+                },
+                "exception_clause": None,
+                "next_step_key": next_step_key,
+            }
+
+        exception_context = dict(step_context)
+        exception_context["_failure"] = {
+            "run_id": int(run_id),
+            "step_key": str(step.get("step_key") or "").strip(),
+            "error_message": str(error_message or "").strip(),
+        }
+
+        outcome = self._execute_clause_by_name(exception_clause, exception_context, config)
+        if not outcome.success:
+            return {"handled": False}
+
+        output = outcome.output if isinstance(outcome.output, dict) else {}
+        if output:
+            context.update(output)
+        return {
+            "handled": True,
+            "output": output,
+            "exception_clause": exception_clause,
+            "next_step_key": next_step_key,
+        }
 
     def _execute_step(self, step: dict[str, Any], context: dict[str, Any], run_id: int | None = None) -> _StepOutcome:
         step_kind = str(step.get("step_kind") or "clause")

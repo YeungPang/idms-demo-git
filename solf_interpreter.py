@@ -358,6 +358,8 @@ class SOLFInterpreter:
         self._failed_clause_signatures = set()
         self._successful_clause_results = {}
         self._exist_choice_offsets = {}
+        # Monotonic id so nested/backtracked clause attempts each get a unique SAVEPOINT name.
+        self._savepoint_seq = 0
         # NOTE: A flag like `use_builtin_clause_solver` could be used in the future
         # to allow callers to plug in a deterministic built-in solver for any named
         # clause, keeping the interpreter generic.  The river_crossing-specific
@@ -2957,6 +2959,14 @@ class SOLFInterpreter:
                     else copy.deepcopy(self.variables)
                 )
 
+                self._savepoint_seq += 1
+                savepoint_name = f"{clause_name}_{current_depth}_{self._savepoint_seq}"
+                solf_function_module = self._load_python_extension_module("solf_function")
+                has_savepoint = bool(
+                    solf_function_module is not None
+                    and solf_function_module.create_savepoint(savepoint_name)
+                )
+
                 try:
                     clause_meta = clause_def.get('parsed_meta')
                     if self._active_debugger is not None and clause_meta is None:
@@ -2978,6 +2988,9 @@ class SOLFInterpreter:
                         any_success = True
                         last_success_result = result
 
+                        if has_savepoint:
+                            solf_function_module.release_savepoint(savepoint_name)
+
                         # Propagate selected callee variable updates back into caller scope.
                         # This allows calls like save_crossing(_cbank, _crossing) to write
                         # the updated _cbank value back to the caller when names match.
@@ -2998,6 +3011,9 @@ class SOLFInterpreter:
                     else:
                         last_fail_indices = new_clause.last_failed_indices or list(new_clause.execution_indices)
                         self._internal_log(f"[FAIL] clause={clause_name} execution_indices={last_fail_indices}")
+                        if has_savepoint:
+                            solf_function_module.rollback_to_savepoint(savepoint_name)
+                            solf_function_module.release_savepoint(savepoint_name)
                         if caller_clause:
                             caller_clause.restore_state(caller_state)
                         else:
@@ -3009,6 +3025,9 @@ class SOLFInterpreter:
                     import traceback
                     if self.debug_enabled:
                         traceback.print_exc()
+                    if has_savepoint:
+                        solf_function_module.rollback_to_savepoint(savepoint_name)
+                        solf_function_module.release_savepoint(savepoint_name)
                     if caller_clause:
                         caller_clause.restore_state(caller_state)
                     else:
